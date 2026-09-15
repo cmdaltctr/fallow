@@ -1389,3 +1389,125 @@ fn write_workspace(root: &Path, relative: &str, name: &str) {
 fn write_json(path: PathBuf, json: &str) {
     std::fs::write(path, json).expect("json file");
 }
+
+/// Project with one unused export under `src/ui` and one under `src/lib`,
+/// optionally scoping `unused-exports` off for `src/ui/**`.
+fn rule_override_project(with_override: bool) -> tempfile::TempDir {
+    let project = tempfile::tempdir().expect("temp dir");
+    let root = project.path();
+    std::fs::create_dir_all(root.join("src/ui")).expect("ui dir");
+    std::fs::create_dir_all(root.join("src/lib")).expect("lib dir");
+    write_json(
+        root.join("package.json"),
+        r#"{"name":"api-rule-overrides","main":"src/index.ts"}"#,
+    );
+    std::fs::write(
+        root.join("src/index.ts"),
+        "import './ui/kit';\nimport './lib/util';\nexport const entry = 1;\nconsole.log(entry);\n",
+    )
+    .expect("entry");
+    std::fs::write(root.join("src/ui/kit.ts"), "export const uiDead = 1;\n").expect("kit");
+    std::fs::write(root.join("src/lib/util.ts"), "export const libDead = 1;\n").expect("util");
+
+    let mut config = serde_json::json!({ "rules": { "unused-exports": "warn" } });
+    if with_override {
+        config["overrides"] = serde_json::json!([{
+            "files": ["src/ui/**"],
+            "rules": { "unused-exports": "off" }
+        }]);
+    }
+    write_json(
+        root.join(".fallowrc.json"),
+        &serde_json::to_string(&config).expect("serialize config"),
+    );
+    project
+}
+
+fn unused_export_paths(run: &DeadCodeProgrammaticOutput) -> Vec<PathBuf> {
+    run.results()
+        .unused_exports
+        .iter()
+        .map(|finding| finding.export.path.clone())
+        .collect()
+}
+
+#[test]
+fn run_dead_code_honors_per_path_rule_overrides() {
+    let project = rule_override_project(true);
+
+    let run = run_dead_code(&DeadCodeOptions {
+        analysis: analysis_at(project.path()),
+        ..DeadCodeOptions::default()
+    })
+    .expect("dead-code succeeds");
+    let paths = unused_export_paths(&run);
+
+    assert!(
+        paths.iter().any(|path| path.ends_with("lib/util.ts")),
+        "the control finding outside the override must stay reported: {paths:?}"
+    );
+    assert!(
+        paths.iter().all(|path| !path.ends_with("ui/kit.ts")),
+        "a path whose override turns the rule off must not be reported: {paths:?}"
+    );
+}
+
+/// The decision surface judges the base revision by the head configuration,
+/// as the CLI's base worktree pass does, so the severity pass must take the
+/// configuration it is handed over the one the base session loaded from disk.
+#[test]
+fn decision_analysis_resolves_severity_against_the_given_config() {
+    let project = rule_override_project(true);
+    let resolved = resolve_programmatic_analysis_context(&analysis_at(project.path()))
+        .expect("context resolves");
+
+    let own = super::decision_surface::run_decision_analysis(&resolved, None, None)
+        .expect("analysis with the session's own config");
+    let own_paths: Vec<PathBuf> = own
+        .results
+        .unused_exports
+        .iter()
+        .map(|finding| finding.export.path.clone())
+        .collect();
+    assert!(
+        own_paths.iter().all(|path| !path.ends_with("ui/kit.ts")),
+        "the session's own override turns the rule off for ui/: {own_paths:?}"
+    );
+
+    let mut head_config = own.config;
+    head_config.overrides.clear();
+    let judged =
+        super::decision_surface::run_decision_analysis(&resolved, None, Some(&head_config))
+            .expect("analysis judged by another config");
+    let judged_paths: Vec<PathBuf> = judged
+        .results
+        .unused_exports
+        .iter()
+        .map(|finding| finding.export.path.clone())
+        .collect();
+    assert!(
+        judged_paths.iter().any(|path| path.ends_with("ui/kit.ts")),
+        "the configuration handed in must win over the session's own: {judged_paths:?}"
+    );
+}
+
+#[test]
+fn run_dead_code_without_overrides_is_unchanged() {
+    let project = rule_override_project(false);
+
+    let run = run_dead_code(&DeadCodeOptions {
+        analysis: analysis_at(project.path()),
+        ..DeadCodeOptions::default()
+    })
+    .expect("dead-code succeeds");
+    let paths = unused_export_paths(&run);
+
+    assert!(
+        paths.iter().any(|path| path.ends_with("lib/util.ts")),
+        "default configuration must keep every unused export: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|path| path.ends_with("ui/kit.ts")),
+        "default configuration must keep every unused export: {paths:?}"
+    );
+}
