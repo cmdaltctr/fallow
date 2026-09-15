@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.26.0] - 2026-09-15
+
 ### Added
 
 - **Expo Router's `SuspenseFallback`, `getNavOptions` and `generateMetadata`
@@ -14,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LoadedRoute` type alongside `ErrorBoundary` and `unstable_settings`, and
   `SuspenseFallback` is the customizable Suspense fallback added in SDK 56. A
   route file exporting any of them was reported as an unused export until now.
+  Thanks [@tilgovi](https://github.com/tilgovi) for the `SuspenseFallback`
+  patch in [#2618](https://github.com/fallow-rs/fallow/pull/2618).
+
+- **Oxfmt is a built-in plugin.** `oxfmt.config.ts` and its sibling config
+  file names are marked always-used and static imports from those TypeScript
+  configs are credited, mirroring the Oxlint plugin, and the migration report
+  lists oxfmt sections as auto-detected
+  (Closes [#2614](https://github.com/fallow-rs/fallow/issues/2614)). Thanks
+  [@uzosrc](https://github.com/uzosrc) for the request.
 
 - **`dead-code --baseline` warns when the saved baseline has gone stale.** A
   dead-code baseline is only as good as the findings it still describes, but
@@ -101,7 +112,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into a flat, file-indexed lookup instead of walking the whole workspace list
   for every package-usage entry and import site. On a repository with about
   18,000 files and 800 workspaces the check went from roughly 30 seconds to
-  6 seconds, and findings are unchanged.
+  6 seconds, and findings are unchanged. Thanks
+  [@Freakazo](https://github.com/Freakazo) for the patch in
+  [#2624](https://github.com/fallow-rs/fallow/pull/2624).
 
 - **The built-in `build` exclusion now matches at any depth.** The default
   discovery ignore list carried `build/**`, which is anchored at the project
@@ -154,6 +167,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fallow audit` no longer hangs on sparse checkouts of large monorepos.**
+  The raw object materialization added in 3.4.2 read every blob in the base
+  commit, so on a blobless partial clone each out-of-cone blob triggered a lazy
+  promisor fetch and CI runs hit their timeout. The committed tree is now
+  filtered through the sparse cone and the analysis subdirectory before any
+  blob is touched, so only in-cone blobs are fetched and the audit output is
+  unchanged (Closes [#2615](https://github.com/fallow-rs/fallow/issues/2615)).
+  Thanks [@AndranikSimonian](https://github.com/AndranikSimonian) for the
+  report and the reproduction.
+
 - **The graph cache is reused again on projects where a dynamic-import pattern
   matches no files.** A pattern built from a runtime expression, such as
   ``import(`./locales/${lang}.json`)``, that matched zero discovered files or
@@ -161,7 +184,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fewer rows than patterns. Cache restoration detected the mismatch and
   rejected the whole project's resolver output on every run, so imports were
   re-resolved from scratch each time. Every pattern now keeps one row, empty or
-  not, and an empty row still contributes no graph edges.
+  not, and an empty row still contributes no graph edges. Thanks
+  [@Freakazo](https://github.com/Freakazo) for the patch in
+  [#2626](https://github.com/fallow-rs/fallow/pull/2626).
 
 - **The config JSON Schema now advertises the JSONC dialect fallow parses.**
   `.fallowrc.json` and `.fallowrc.jsonc` have always accepted comments and
@@ -8899,6 +8924,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
 [unreleased]: https://github.com/fallow-rs/fallow/compare/v3.25.0...HEAD
+[3.26.0]: https://github.com/fallow-rs/fallow/compare/v3.25.0...v3.26.0
 [3.25.0]: https://github.com/fallow-rs/fallow/compare/v3.24.1...v3.25.0
 [3.24.1]: https://github.com/fallow-rs/fallow/compare/v3.24.0...v3.24.1
 [3.24.0]: https://github.com/fallow-rs/fallow/compare/v3.23.0...v3.24.0
