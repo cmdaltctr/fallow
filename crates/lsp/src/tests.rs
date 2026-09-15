@@ -4682,7 +4682,7 @@ async fn config_change_through_watched_files_republishes_diagnostics() {
     use tower_lsp_server::jsonrpc::Response;
 
     let dir = tempfile::tempdir().expect("temp dir");
-    let root = dir.path().canonicalize().expect("canonical root");
+    let root = canonicalize_for_lsp(dir.path());
     std::fs::create_dir_all(root.join("src/ui")).expect("create src dir");
     std::fs::write(
         root.join("package.json"),
