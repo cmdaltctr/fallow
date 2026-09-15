@@ -417,7 +417,7 @@ fn compile_ignore_patterns(ignore_patterns: &[String]) -> GlobSet {
     let default_ignores = [
         "**/node_modules/**",
         "**/dist/**",
-        "build/**",
+        "**/build/**",
         "**/.git/**",
         "**/coverage/**",
         "**/*.min.js",
@@ -1448,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_default_ignores_root_build_only() {
+    fn resolve_default_ignores_build_at_any_depth() {
         let resolved = make_config(false).resolve(
             PathBuf::from("/project"),
             OutputFormat::Human,
@@ -1462,8 +1462,89 @@ mod tests {
             "root build/ should be ignored"
         );
         assert!(
-            !resolved.ignore_patterns.is_match("src/build/helper.ts"),
-            "nested build/ should NOT be ignored by default"
+            resolved.ignore_patterns.is_match("src/build/helper.ts"),
+            "nested build/ should be ignored, like dist/ and coverage/"
+        );
+        assert!(
+            resolved
+                .ignore_patterns
+                .is_match("projects/app/build/index.js"),
+            "build/ inside a workspace package should be ignored"
+        );
+    }
+
+    #[test]
+    fn resolve_default_ignores_match_build_only_as_a_whole_segment() {
+        let resolved = make_config(false).resolve(
+            PathBuf::from("/project"),
+            OutputFormat::Human,
+            1,
+            true,
+            true,
+            None,
+        );
+        assert!(!resolved.ignore_patterns.is_match("src/build.ts"));
+        assert!(!resolved.ignore_patterns.is_match("src/rebuild/helper.ts"));
+        assert!(!resolved.ignore_patterns.is_match("src/buildings/a.ts"));
+        assert!(!resolved.ignore_patterns.is_match("src/prebuild/a.ts"));
+    }
+
+    /// A workspace package directory named `build` keeps its entry in workspace
+    /// discovery, because a declared member holding a manifest survives
+    /// `ignorePatterns`, but everything inside it is filtered out: the source
+    /// files never reach the walker in `crates/core/src/discover/walk.rs`, and
+    /// the manifest never reaches the dependency filter in
+    /// `crates/core/src/analyze/unused_deps.rs`. Both consumers read this one
+    /// globset, so pin both paths here and keep the consequence a deliberate
+    /// choice rather than a documentation guess.
+    #[test]
+    fn resolve_default_ignores_cover_a_workspace_package_named_build() {
+        let resolved = make_config(false).resolve(
+            PathBuf::from("/project"),
+            OutputFormat::Human,
+            1,
+            true,
+            true,
+            None,
+        );
+        assert!(
+            resolved
+                .ignore_patterns
+                .is_match("packages/build/package.json"),
+            "the manifest stops contributing unused-dependency findings"
+        );
+        assert!(
+            resolved
+                .ignore_patterns
+                .is_match("packages/build/src/index.ts"),
+            "the package's source stops being analyzed entirely"
+        );
+        assert!(
+            resolved
+                .ignore_patterns
+                .is_match("packages/build/src/nested/deep.ts"),
+            "including source below the package's own subdirectories"
+        );
+    }
+
+    /// A framework config inside a nested `build/` directory is filtered out of
+    /// discovery with everything else under the segment, so the path aliases it
+    /// declares are lost and imports through them are reported as unlisted
+    /// dependencies. Pinned so that consequence is a recorded choice.
+    #[test]
+    fn resolve_default_ignores_cover_a_framework_config_inside_build() {
+        let resolved = make_config(false).resolve(
+            PathBuf::from("/project"),
+            OutputFormat::Human,
+            1,
+            true,
+            true,
+            None,
+        );
+        assert!(
+            resolved
+                .ignore_patterns
+                .is_match("app/build/webpack.config.js")
         );
     }
 
