@@ -2587,3 +2587,461 @@ fn partially_stale_baseline_leaves_json_output_unchanged() {
         json["baseline"]
     );
 }
+
+/// Write a project whose only source outside `src/` sits under a directory a
+/// built-in discovery ignore pattern matches, with no `.gitignore` to hide it
+/// first (issue #2638).
+fn default_ignore_exclusion_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"issue-2638-default-ignore-exclusions","private":true,"main":"src/index.ts"}"#,
+    )
+    .expect("write package.json");
+    std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+    std::fs::write(dir.path().join("src/index.ts"), "export const value = 1;\n")
+        .expect("write source");
+    std::fs::create_dir_all(dir.path().join("packages/web/build/src"))
+        .expect("create excluded tree");
+    for name in ["a.ts", "b.ts"] {
+        std::fs::write(
+            dir.path().join("packages/web/build/src").join(name),
+            "export const excluded = 1;\n",
+        )
+        .expect("write excluded source");
+    }
+    dir
+}
+
+/// Issue #2638 (R3): `--explain-skipped` now reaches discovery, so the run says
+/// which built-in pattern removed files and where they were.
+#[test]
+fn explain_skipped_names_the_built_in_pattern_that_excluded_source_files() {
+    let dir = default_ignore_exclusion_project();
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+    let output = run_fallow_raw(&[
+        "dead-code",
+        "--root",
+        root,
+        "--no-cache",
+        "--explain-skipped",
+    ]);
+
+    assert!(
+        output
+            .stderr
+            .contains("note: skipped 2 source files matching fallow's built-in discovery ignores:"),
+        "the note header carries the total: {}",
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("    2  **/build/**  packages/web/build"),
+        "the row carries the count, the pattern, and the directory: {}",
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("analyze that directory on its own: fallow --root <dir>"),
+        "a directory-shaped pattern gets the remedy that works: {}",
+        output.stderr
+    );
+}
+
+/// Issue #2638: the `--root` remedy is true for a directory-shaped built-in
+/// only. A file-name glob matches at every root, so the note must not hand the
+/// reader a command that re-excludes the same file.
+#[test]
+fn a_file_shaped_built_in_pattern_is_not_offered_the_root_remedy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"issue-2638-file-shaped","private":true,"main":"src/index.ts"}"#,
+    )
+    .expect("write package.json");
+    std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+    std::fs::write(dir.path().join("src/index.ts"), "export const value = 1;\n")
+        .expect("write source");
+    std::fs::create_dir_all(dir.path().join("vendor")).expect("create vendor");
+    std::fs::write(dir.path().join("vendor/lib.min.js"), "var a=1;\n").expect("write bundle");
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+
+    let output = run_fallow_raw(&[
+        "dead-code",
+        "--root",
+        root,
+        "--no-cache",
+        "--explain-skipped",
+    ]);
+    assert!(
+        output.stderr.contains("**/*.min.js"),
+        "the note still names the pattern: {}",
+        output.stderr
+    );
+    assert!(
+        !output.stderr.contains("fallow --root <dir>"),
+        "re-rooting re-excludes the same file: {}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("rename first-party source"),
+        "the note names the remedy that does work: {}",
+        output.stderr
+    );
+}
+
+/// Issue #2638, the headline case: the whole source tree sat under a matched
+/// directory, so the run analyzed nothing. That run says why on stderr without
+/// any flag, because a green "No issues found" is the misleading answer.
+#[test]
+fn a_run_whose_whole_source_tree_was_excluded_says_so_by_default() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"issue-2638-all-excluded","private":true}"#,
+    )
+    .expect("write package.json");
+    std::fs::create_dir_all(dir.path().join("build/src")).expect("create excluded tree");
+    for name in ["a.ts", "b.ts", "c.ts"] {
+        std::fs::write(
+            dir.path().join("build/src").join(name),
+            "export const excluded = 1;\n",
+        )
+        .expect("write excluded source");
+    }
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+
+    let output = run_fallow_raw(&["dead-code", "--root", root, "--no-cache"]);
+    assert!(
+        output.stderr.contains(
+            "No source files were analyzed. The built-in ignore pattern '**/build/**' excluded \
+             3 files; run with --explain-skipped for the breakdown."
+        ),
+        "the default run states the outcome and the measured exclusion: {}",
+        output.stderr
+    );
+}
+
+/// The unflagged line fires whenever a run discovered nothing, and a built-in
+/// exclusion is not always why. `--production` drops test-only source AFTER the
+/// ignore check, so the tally never sees it: here the project is all tests and
+/// the run would analyze nothing with or without `dist/`. The sentence must
+/// still be true, which means it reports two facts and blames neither.
+#[test]
+fn a_production_run_with_no_source_left_states_facts_without_naming_a_cause() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"issue-2638-production","private":true}"#,
+    )
+    .expect("write package.json");
+    std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+    std::fs::write(
+        dir.path().join("src/app.test.ts"),
+        "export const spec = 1;\n",
+    )
+    .expect("write test source");
+    std::fs::create_dir_all(dir.path().join("dist")).expect("create dist");
+    std::fs::write(dir.path().join("dist/gen.ts"), "export const gen = 1;\n")
+        .expect("write generated source");
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+
+    let output = run_fallow_raw(&["dead-code", "--root", root, "--no-cache", "--production"]);
+    assert!(
+        output.stderr.contains(
+            "No source files were analyzed. The built-in ignore pattern '**/dist/**' excluded \
+             1 file; run with --explain-skipped for the breakdown."
+        ),
+        "two measured facts, joined by a period: {}",
+        output.stderr
+    );
+    assert!(
+        !output.stderr.contains("were analyzed:"),
+        "production mode emptied the file list here, so a causal colon would name the wrong \
+         reason: {}",
+        output.stderr
+    );
+}
+
+/// Issue #2638: the anchor the note prints is the directory the `--root`
+/// remedy names, so running that command has to recover the files. A nested
+/// match is the case that proves it: anchoring at the outer `build` leaves the
+/// inner one in the relative path and the built-in matches again.
+#[test]
+fn the_anchor_a_nested_match_reports_is_the_directory_that_recovers_the_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"issue-2638-nested","private":true,"main":"src/index.ts"}"#,
+    )
+    .expect("write package.json");
+    std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+    std::fs::write(dir.path().join("src/index.ts"), "export const value = 1;\n")
+        .expect("write source");
+    std::fs::create_dir_all(dir.path().join("build/tools/build")).expect("create nested tree");
+    std::fs::write(
+        dir.path().join("build/tools/build/gen.ts"),
+        "export const gen = 1;\n",
+    )
+    .expect("write excluded source");
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+
+    let json = parse_json(&run_fallow_raw(&[
+        "dead-code",
+        "--root",
+        root,
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]));
+    let reported = combined_root_diagnostics_of_kind(&json, "excluded-by-default-ignore");
+    assert_eq!(reported.len(), 1, "{}", json["workspace_diagnostics"]);
+    assert_eq!(
+        reported[0]["path"], "build/tools/build",
+        "the anchor is the deepest matched segment: {}",
+        reported[0]
+    );
+
+    let anchor = dir.path().join("build/tools/build");
+    let listed = parse_json(&run_fallow_raw(&[
+        "list",
+        "--files",
+        "--root",
+        anchor.to_str().expect("temp path is UTF-8"),
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]));
+    assert_eq!(
+        listed["file_count"], 1,
+        "the advertised remedy has to recover the files in one hop: {listed}"
+    );
+}
+
+/// The guard that keeps the line above off every healthy project: a run that
+/// discovered even one source file goes back to saying nothing by default.
+#[test]
+fn a_run_that_discovered_source_stays_silent_about_exclusions_by_default() {
+    let dir = default_ignore_exclusion_project();
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+    let output = run_fallow_raw(&["dead-code", "--root", root, "--no-cache"]);
+
+    assert!(
+        !output.stderr.contains("No source files were analyzed"),
+        "one discovered file is enough to have something to report: {}",
+        output.stderr
+    );
+}
+
+/// Issue #2638 (AC4): the default run gains no noise. The note is a
+/// presentation choice the flag owns, not a warning the walk emits.
+#[test]
+fn a_default_run_says_nothing_about_built_in_ignore_exclusions() {
+    let dir = default_ignore_exclusion_project();
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+    let output = run_fallow_raw(&["dead-code", "--root", root, "--no-cache"]);
+
+    assert!(
+        !output.stderr.contains("built-in ignore"),
+        "no default stderr note: {}",
+        output.stderr
+    );
+    assert!(
+        !output.stderr.contains("**/build/**"),
+        "no default stderr note: {}",
+        output.stderr
+    );
+}
+
+/// Issue #2638 (AC5): `--quiet` suppresses the note even with the flag.
+#[test]
+fn quiet_suppresses_the_built_in_ignore_exclusion_note() {
+    let dir = default_ignore_exclusion_project();
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+    let output = run_fallow_raw(&[
+        "dead-code",
+        "--root",
+        root,
+        "--no-cache",
+        "--explain-skipped",
+        "--quiet",
+    ]);
+
+    assert!(
+        !output.stderr.contains("**/build/**"),
+        "--quiet suppresses the note: {}",
+        output.stderr
+    );
+}
+
+/// Issue #2638 (R4, AC6): the typed entry is unconditional in JSON, with or
+/// without the flag, and carries a project-relative forward-slash path.
+#[test]
+fn dead_code_json_carries_the_excluded_by_default_ignore_diagnostic() {
+    let dir = default_ignore_exclusion_project();
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+    for extra in [Vec::new(), vec!["--explain-skipped"]] {
+        let mut args = vec![
+            "dead-code",
+            "--root",
+            root,
+            "--format",
+            "json",
+            "--quiet",
+            "--no-cache",
+        ];
+        args.extend(extra.iter().copied());
+        let json = parse_json(&run_fallow_raw(&args));
+
+        let reported = combined_root_diagnostics_of_kind(&json, "excluded-by-default-ignore");
+        assert_eq!(
+            reported.len(),
+            1,
+            "one entry per excluding pattern: {}",
+            json["workspace_diagnostics"]
+        );
+        assert_eq!(reported[0]["pattern"], "**/build/**");
+        assert_eq!(reported[0]["file_count"], 2);
+        assert_eq!(reported[0]["directory_count"], 1);
+        assert_eq!(reported[0]["path"], "packages/web/build");
+    }
+}
+
+/// Issue #2638: a built-in that matched a file sitting directly at the analysis
+/// root anchors at the root, and `root.join("")` is the root itself. The
+/// analysis envelopes' post-serialisation strip only removes a
+/// `root + separator` prefix, so an absolute host path would reach JSON here.
+#[test]
+fn a_root_anchored_exclusion_reports_a_relative_path_and_a_real_location() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"issue-2638-root-anchored","private":true,"main":"src/index.ts"}"#,
+    )
+    .expect("write package.json");
+    std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+    std::fs::write(dir.path().join("src/index.ts"), "export const value = 1;\n")
+        .expect("write source");
+    std::fs::write(dir.path().join("app.min.js"), "var a=1;\n").expect("write bundle");
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+
+    let json = parse_json(&run_fallow_raw(&[
+        "dead-code",
+        "--root",
+        root,
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]));
+    let reported = combined_root_diagnostics_of_kind(&json, "excluded-by-default-ignore");
+    assert_eq!(reported.len(), 1, "{}", json["workspace_diagnostics"]);
+    assert_eq!(
+        reported[0]["path"], ".",
+        "the contract is project-root-relative: {}",
+        reported[0]
+    );
+    let message = reported[0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("Skipped 1 source file under '.'"),
+        "an empty string is not a location: {message}"
+    );
+    assert!(
+        !message.contains(root),
+        "no host path reaches the message either: {message}"
+    );
+}
+
+/// Issue #2638 (AC6): combined mode's per-analysis config reloads must not wipe
+/// the entry before the root envelope is built.
+#[test]
+fn combined_json_root_carries_the_excluded_by_default_ignore_diagnostic() {
+    let dir = default_ignore_exclusion_project();
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+    let json = parse_json(&run_fallow_raw(&[
+        "--root",
+        root,
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]));
+
+    let reported = combined_root_diagnostics_of_kind(&json, "excluded-by-default-ignore");
+    assert_eq!(
+        reported.len(),
+        1,
+        "the combined root reports the exclusion once: {}",
+        json["workspace_diagnostics"]
+    );
+}
+
+/// Issue #2638 (AC7): this is an advisory about project layout, not a finding.
+/// Giving it a rule id would put it in a reviewer's annotations on every
+/// monorepo, so the CI report formats must stay silent about it.
+#[test]
+fn ci_report_formats_say_nothing_about_built_in_ignore_exclusions() {
+    let dir = default_ignore_exclusion_project();
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+    for format in ["sarif", "codeclimate"] {
+        let output = run_fallow_raw(&[
+            "dead-code",
+            "--root",
+            root,
+            "--format",
+            format,
+            "--quiet",
+            "--no-cache",
+        ]);
+        assert!(
+            !output.stdout.contains("excluded-by-default-ignore"),
+            "{format} output must not carry the discovery advisory: {}",
+            output.stdout
+        );
+    }
+}
+
+/// Issue #2638 (AC8): the exclusions are designed behavior, not a degraded run.
+/// A caveat here would fire on nearly every project and make `fallow fix`
+/// withhold `delete-file` and `remove-export` project-wide.
+#[test]
+fn a_built_in_ignore_exclusion_raises_no_reachability_caveat() {
+    let dir = default_ignore_exclusion_project();
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+    let json = parse_json(&run_fallow_raw(&[
+        "dead-code",
+        "--root",
+        root,
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]));
+
+    assert!(
+        !combined_root_diagnostics_of_kind(&json, "excluded-by-default-ignore").is_empty(),
+        "fixture must actually trigger the diagnostic: {}",
+        json["workspace_diagnostics"]
+    );
+    let caveated: Vec<&serde_json::Value> = json["unused_files"]
+        .as_array()
+        .map(|files| {
+            files
+                .iter()
+                .filter(|file| {
+                    file["reachability_caveats"]
+                        .as_array()
+                        .is_some_and(|caveats| !caveats.is_empty())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        caveated.is_empty(),
+        "no finding may inherit a caveat from this advisory: {caveated:?}"
+    );
+}

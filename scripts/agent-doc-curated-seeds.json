@@ -1266,7 +1266,7 @@
       "section": "flags:global",
       "row": "--explain-skipped",
       "column": "Description",
-      "seed": "Show a per-pattern breakdown for default duplicate ignores"
+      "seed": "Show per-pattern counts for skipped files: default duplicate ignores on dupes and audit, built-in discovery ignores on check, dead-code, audit and the default run"
     },
     {
       "section": "flags:global",

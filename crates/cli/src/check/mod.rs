@@ -372,6 +372,10 @@ pub struct CheckOptions<'a> {
     /// `audit --base` pass so revision-specific diagnostics name the base
     /// revision instead of reading as a current-configuration defect.
     pub analysis_snapshot: fallow_config::AnalysisSnapshot,
+    /// Expand the skipped-file notes: with this set, a human run also reports
+    /// which built-in discovery ignore patterns removed candidate source files
+    /// (issue #2638). The typed diagnostics reach JSON either way.
+    pub explain_skipped: bool,
 }
 
 /// Result of executing check analysis without printing.
@@ -401,6 +405,11 @@ pub struct CheckResult {
     /// same combined run re-walks the project and clears the source-discovery
     /// entries this walk recorded (issue #2366).
     pub workspace_diagnostics: Vec<fallow_config::WorkspaceDiagnostic>,
+    /// Source files this run's walk discovered. Zero plus a non-empty
+    /// `excluded-by-default-ignore` tally is the one shape that earns a
+    /// default stderr line: the run analyzed nothing and a built-in ignore
+    /// pattern is the reason (issue #2638).
+    pub discovered_file_count: usize,
     /// Pre-refinement dead-code audit keys captured immediately before the
     /// type-aware pass mutated `results`. `None` when type-aware analysis was
     /// not enabled. The audit gate uses this identity-independent set to fall
@@ -455,6 +464,11 @@ pub struct CheckResult {
     pub package_importers:
         Option<rustc_hash::FxHashMap<String, fallow_engine::module_graph::PackageImporters>>,
     pub workspaces: Vec<WorkspaceInfo>,
+    /// Whether this run asked for the expanded skipped-file notes
+    /// (`--explain-skipped`), carried on the result the way `DupesResult`
+    /// carries it so every human-output site reads one owned value instead of
+    /// re-plumbing the flag (issue #2638).
+    pub explain_skipped: bool,
     retained_files: Option<Vec<DiscoveredFile>>,
 }
 
@@ -466,6 +480,7 @@ struct CheckAnalysisData {
     retained_files: Option<Vec<DiscoveredFile>>,
     workspaces: Vec<WorkspaceInfo>,
     workspace_diagnostics: Vec<fallow_config::WorkspaceDiagnostic>,
+    discovered_file_count: usize,
     script_used_packages: rustc_hash::FxHashSet<String>,
 }
 
@@ -481,6 +496,7 @@ fn check_data_from_artifacts(
         retained_files: output.files,
         workspaces: session.workspaces().to_vec(),
         workspace_diagnostics: session.current_workspace_diagnostics(),
+        discovered_file_count: session.files().len(),
         script_used_packages: output.script_used_packages,
     }
 }
@@ -497,6 +513,7 @@ fn check_data_from_plain_artifacts(
         retained_files: None,
         workspaces: session.workspaces().to_vec(),
         workspace_diagnostics: session.current_workspace_diagnostics(),
+        discovered_file_count: session.files().len(),
         script_used_packages: output.script_used_packages,
     }
 }
@@ -921,6 +938,7 @@ fn complete_check_execution(input: CheckCompletionInput<'_>) -> CheckResult {
         mut retained_files,
         workspaces,
         workspace_diagnostics,
+        discovered_file_count,
         script_used_packages,
     } = data;
 
@@ -981,6 +999,8 @@ fn complete_check_execution(input: CheckCompletionInput<'_>) -> CheckResult {
         type_coupling,
         type_aware_warnings,
         workspace_diagnostics,
+        discovered_file_count,
+        explain_skipped: opts.explain_skipped,
         syntactic_dead_code_keys,
         impact_closure: None,
         public_api_keys: None,
@@ -1231,6 +1251,7 @@ pub fn benchmark_dead_code_json(
         retain_modules_for_health: false,
         defer_performance: false,
         analysis_snapshot: fallow_config::AnalysisSnapshot::Current,
+        explain_skipped: false,
     })?;
     let rendered = report::render_check_json(&report::CheckJsonRenderInput {
         results: &result.results,
@@ -1551,6 +1572,20 @@ pub fn run_check(opts: &CheckOptions<'_>) -> ExitCode {
     if !opts.quiet && matches!(opts.output, OutputFormat::Human) {
         crate::combined::print_entry_point_summary(&result.results);
     }
+    crate::discovery_note::print_all_source_excluded_warning(
+        &result.workspace_diagnostics,
+        result.discovered_file_count,
+        result.explain_skipped,
+        opts.quiet,
+        opts.output,
+    );
+    crate::discovery_note::print_default_ignore_exclusion_note(
+        opts.root,
+        &result.workspace_diagnostics,
+        result.explain_skipped,
+        opts.quiet,
+        opts.output,
+    );
 
     let resolver = match crate::build_ownership_resolver(
         opts.group_by,

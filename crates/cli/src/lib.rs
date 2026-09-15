@@ -50,6 +50,7 @@ pub use fallow_engine::codeowners;
 mod combined;
 mod config;
 mod coverage;
+mod discovery_note;
 mod doctor;
 mod dupes;
 mod exit_codes;
@@ -455,7 +456,8 @@ struct Cli {
     #[arg(hide_short_help = true, long, global = true)]
     explain: bool,
 
-    /// Show a per-pattern breakdown for default duplicate ignores.
+    /// Show per-pattern counts for skipped files: default duplicate ignores on dupes
+    /// and audit, built-in discovery ignores on check, dead-code, audit and the default run.
     #[arg(hide_short_help = true, long, global = true)]
     explain_skipped: bool,
 
@@ -5602,6 +5604,7 @@ fn dispatch_check(dispatch: &DispatchContext<'_>, args: &CheckDispatchArgs) -> E
         retain_modules_for_health: false,
         defer_performance: false,
         analysis_snapshot: fallow_config::AnalysisSnapshot::Current,
+        explain_skipped: cli.explain_skipped,
     })
 }
 
