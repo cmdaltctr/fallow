@@ -2902,6 +2902,214 @@ fn audit_dependency_location_change_is_introduced() {
     );
 }
 
+/// An audit fixture whose dead-code baseline is saved on `main` and then
+/// rotted on `feature`, so a whole-project comparison calls the baseline stale
+/// while every audit run sees only the changed slice.
+fn rotted_audit_baseline_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = create_audit_baseline_fixture();
+    let baseline_path = tmp.path().join(".fallow-dead-code-baseline.json");
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(tmp.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .expect("git command failed")
+    };
+    git(&["checkout", "main"]);
+    run_fallow_raw(&[
+        "dead-code",
+        "--root",
+        tmp.path().to_str().unwrap(),
+        "--save-baseline",
+        baseline_path.to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    assert!(
+        baseline_path.exists(),
+        "baseline file should have been written"
+    );
+    git(&["checkout", "feature"]);
+    // Drop most of what the baseline described, so a whole-project comparison
+    // would call it stale.
+    fs::write(
+        tmp.path().join("src/legacy.ts"),
+        "export const used = 1;\nexport const unusedA = 'a';\n",
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&["-c", "commit.gpgsign=false", "commit", "-m", "prune legacy"]);
+    (tmp, baseline_path)
+}
+
+/// The control for [`audit_says_why_the_stale_baseline_gate_cannot_run`]: the
+/// same baseline on the same worktree really is stale, so audit's stand-down
+/// reports a suppression and not a fresh baseline. Without this the other test
+/// would stay green if the stand-down were deleted and the gate simply never
+/// had anything to fire on.
+#[test]
+fn a_whole_project_run_judges_the_baseline_audit_stands_down_on() {
+    let (tmp, baseline_path) = rotted_audit_baseline_fixture();
+    let output = run_fallow_raw(&[
+        "dead-code",
+        "--root",
+        tmp.path().to_str().unwrap(),
+        "--baseline",
+        baseline_path.to_str().unwrap(),
+        "--fail-on-stale-baseline",
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    assert!(
+        output.stderr.contains("Baseline gate failed"),
+        "a whole-project run judges the same baseline stale: {}",
+        output.stderr
+    );
+    assert_eq!(
+        output.code, 1,
+        "the control run must fail on the same baseline: {}\n{}",
+        output.stdout, output.stderr
+    );
+}
+
+/// `audit` always analyzes a changed-code slice, so a whole-project baseline
+/// legitimately matches less of it and the opt-in gate can never judge it.
+/// The run has to say so: a job that passes the flag and gets a silent green
+/// would believe it is gating when it never was.
+/// `decision-surface` renders the brief through a path that owns no exit
+/// gates, so `--fail-on-stale-baseline` cannot fire there. A config-provided
+/// audit baseline is the one way a baseline reaches that command, and the
+/// opted-in gate must say it stood down rather than exit 0 in silence.
+#[test]
+fn decision_surface_says_the_stale_baseline_gate_stood_down() {
+    let (tmp, baseline_path) = rotted_audit_baseline_fixture();
+    let dir = tmp.path();
+    fs::write(
+        dir.join(".fallowrc.json"),
+        format!(
+            "{{\"audit\": {{\"deadCodeBaseline\": \"{}\"}}}}",
+            baseline_path.file_name().unwrap().to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let output = run_fallow_raw(&[
+        "decision-surface",
+        "--root",
+        dir.to_str().unwrap(),
+        "--base",
+        "main",
+        "--fail-on-stale-baseline",
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+
+    assert!(
+        !output.stderr.contains("Baseline gate failed"),
+        "the brief owns no gates, so nothing may fail: {}",
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("--fail-on-stale-baseline did not run"),
+        "the run must say the gate stood down: {}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("renders a brief without exit gates"),
+        "the reason must name the brief: {}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains(".fallow-dead-code-baseline.json"),
+        "the note must name the baseline that was not judged: {}",
+        output.stderr
+    );
+    assert_eq!(
+        output.code, 0,
+        "decision-surface never fails on the gate: {}\n{}",
+        output.stdout, output.stderr
+    );
+}
+
+#[test]
+fn audit_says_why_the_stale_baseline_gate_cannot_run() {
+    let (tmp, baseline_path) = rotted_audit_baseline_fixture();
+    let dir = tmp.path();
+
+    let output = run_fallow_raw(&[
+        "audit",
+        "--root",
+        dir.to_str().unwrap(),
+        "--base",
+        "main",
+        "--dead-code-baseline",
+        baseline_path.to_str().unwrap(),
+        "--fail-on-stale-baseline",
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+
+    assert!(
+        !output.stderr.contains("Baseline gate failed"),
+        "a changed-code run cannot judge a whole-project baseline: {}",
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("--fail-on-stale-baseline did not run"),
+        "the run must name the reason the gate stood down: {}",
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("analyzes only the files that changed against its base"),
+        "the reason must be audit's changed-code scope: {}",
+        output.stderr
+    );
+    assert_eq!(
+        output.code, 0,
+        "the gate must stay usable in review jobs: {}\n{}",
+        output.stdout, output.stderr
+    );
+    // The note is stderr only: `--format json` stdout stays parseable.
+    let _ = parse_json(&output);
+
+    // Without a baseline there is nothing to stand down from, so the flag
+    // stays silent rather than explaining itself on every audit run.
+    let no_baseline = run_fallow_raw(&[
+        "audit",
+        "--root",
+        dir.to_str().unwrap(),
+        "--base",
+        "main",
+        "--fail-on-stale-baseline",
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    assert!(
+        !no_baseline.stderr.contains("--fail-on-stale-baseline"),
+        "no baseline means no note: {}",
+        no_baseline.stderr
+    );
+}
+
 #[test]
 fn audit_with_dead_code_baseline_filters_preexisting_issues() {
     let tmp = create_audit_baseline_fixture();

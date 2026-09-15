@@ -8,8 +8,8 @@
 mod common;
 
 use common::{
-    fixture_path, parse_json, redact_all, run_fallow, run_fallow_combined, run_fallow_in_root,
-    run_fallow_raw, run_fallow_raw_with_env,
+    canonical_report, fixture_path, parse_json, redact_all, run_fallow, run_fallow_combined,
+    run_fallow_in_root, run_fallow_raw, run_fallow_raw_with_env,
 };
 use std::fmt::Write as _;
 use std::path::Path;
@@ -2455,6 +2455,345 @@ fn run_health_with_baseline(root: &Path, extra: &[&str]) -> common::CommandOutpu
     ];
     args.extend_from_slice(extra);
     run_fallow_in_root("health", root, &args)
+}
+
+/// A project with `count` complexity findings whose health baseline was saved
+/// while all of them existed, and whose source then keeps only `remaining` of
+/// them, so `count - remaining` baseline entries match nothing on the next run.
+fn rotted_health_baseline_project(count: usize, remaining: usize) -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    write_file(
+        &dir.path().join("package.json"),
+        r#"{"name":"health-baseline-staleness","version":"1.0.0"}"#,
+    );
+    let sources = |n: usize| -> String {
+        (0..n)
+            .map(|index| hotspot_source(&format!("hotspot{index}")))
+            .collect()
+    };
+    write_file(&dir.path().join("src/index.ts"), &sources(count));
+    let baseline_path = dir.path().join("health-baseline.json");
+    let saved = run_health_with_baseline(
+        dir.path(),
+        &[
+            "--save-baseline",
+            baseline_path.to_str().unwrap(),
+            "--baseline-mode",
+            "identity",
+        ],
+    );
+    assert_eq!(
+        parse_json(&saved)["findings"]
+            .as_array()
+            .map_or(0, Vec::len),
+        count,
+        "the saved baseline must hold exactly {count} findings: {}",
+        redact_all(&saved.stdout, dir.path())
+    );
+    write_file(&dir.path().join("src/index.ts"), &sources(remaining));
+    dir
+}
+
+/// Run `health --baseline` on a prepared fixture with human output, so the
+/// advisory staleness warning is visible on stderr.
+fn run_health_baseline_human(root: &Path, extra: &[&str]) -> common::CommandOutput {
+    let baseline_path = root.join("health-baseline.json");
+    let mut args = vec![
+        "--complexity",
+        "--max-cyclomatic",
+        "3",
+        "--max-crap",
+        "10000",
+        "--baseline",
+        baseline_path.to_str().unwrap(),
+        "--baseline-mode",
+        "identity",
+    ];
+    args.extend_from_slice(extra);
+    run_fallow_in_root("health", root, &args)
+}
+
+#[test]
+fn fail_on_stale_baseline_exits_one_on_a_stale_health_baseline() {
+    let project = rotted_health_baseline_project(5, 4);
+    let output = run_health_baseline_human(project.path(), &["--fail-on-stale-baseline"]);
+    assert!(
+        output
+            .stderr
+            .contains("Baseline gate failed: 1 of 5 entries"),
+        "the gate names the stale share: {}",
+        redact_all(&output.stderr, project.path())
+    );
+    assert!(
+        output.stderr.contains("matched no current finding"),
+        "the gate uses the health noun: {}",
+        redact_all(&output.stderr, project.path())
+    );
+    assert!(
+        !output.stderr.contains("partially stale"),
+        "one stale entry out of five stays below the advisory threshold: {}",
+        redact_all(&output.stderr, project.path())
+    );
+    assert_eq!(
+        output.code,
+        1,
+        "the opt-in gate fails the run: {}",
+        redact_all(&output.stderr, project.path())
+    );
+}
+
+/// The score and findings gates have their condition printed in the report, a
+/// stale baseline has it nowhere, so a run that fails the findings gate as well
+/// must still say what the opted-in baseline gate found.
+#[test]
+fn health_stale_baseline_gate_still_prints_behind_the_findings_gate() {
+    let project = rotted_health_baseline_project(5, 4);
+    let index = project.path().join("src/index.ts");
+    let mut source = std::fs::read_to_string(&index).expect("read the fixture source");
+    // A hotspot the baseline never saw, so one finding survives the baseline
+    // filter and the findings gate fires alongside the stale-baseline gate.
+    source.push_str(&hotspot_source("unbaselined"));
+    write_file(&index, &source);
+
+    let output = run_health_baseline_human(project.path(), &["--fail-on-stale-baseline"]);
+    assert!(
+        output
+            .stderr
+            .contains("Baseline gate failed: 1 of 5 entries"),
+        "the baseline gate reports even though findings remain: {}",
+        redact_all(&output.stderr, project.path())
+    );
+    assert_eq!(
+        output.code,
+        1,
+        "both gates fail the run: {}",
+        redact_all(&output.stderr, project.path())
+    );
+
+    let quiet = run_health_baseline_human(project.path(), &["--fail-on-stale-baseline", "--quiet"]);
+    assert!(
+        quiet
+            .stderr
+            .contains("Baseline gate failed: 1 of 5 entries"),
+        "--ci implies --quiet, which is exactly where a bare exit 1 would be          unexplained: {}",
+        redact_all(&quiet.stderr, project.path())
+    );
+}
+
+/// `--report-only` short-circuits every health gate, and the stale-baseline
+/// gate is not an exception to that one rule.
+/// `--report-only` is an explicit request never to fail, so the gate stands
+/// down. It says so: a job that passes both flags and then goes green forever
+/// has the same problem the gate exists to solve.
+#[test]
+fn health_stale_baseline_gate_says_why_it_stood_down_under_report_only() {
+    let project = rotted_health_baseline_project(5, 4);
+    let output = run_health_baseline_human(
+        project.path(),
+        &["--fail-on-stale-baseline", "--report-only"],
+    );
+    assert!(
+        !output.stderr.contains("Baseline gate failed"),
+        "--report-only never fails the run: {}",
+        redact_all(&output.stderr, project.path())
+    );
+    assert!(
+        output
+            .stderr
+            .contains("--fail-on-stale-baseline did not run"),
+        "the run must name the reason the gate stood down: {}",
+        redact_all(&output.stderr, project.path())
+    );
+    assert!(
+        output.stderr.contains("--report-only"),
+        "the reason must be --report-only: {}",
+        redact_all(&output.stderr, project.path())
+    );
+    assert_eq!(
+        output.code,
+        0,
+        "--report-only always exits 0: {}",
+        redact_all(&output.stderr, project.path())
+    );
+    // Control: the same baseline fails the same run without --report-only, so
+    // the stand-down above is a suppression and not a fresh baseline.
+    let gated = run_health_baseline_human(project.path(), &["--fail-on-stale-baseline"]);
+    assert_eq!(
+        gated.code,
+        1,
+        "the baseline really is stale: {}",
+        redact_all(&gated.stderr, project.path())
+    );
+}
+
+/// A project whose complexity hotspots are split between a production source
+/// file and a test file, with a health baseline saved from a full run, so the
+/// baseline is fresh and only `--production` narrowing can make it look stale.
+fn production_narrowed_health_baseline_project() -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    write_file(
+        &dir.path().join("package.json"),
+        r#"{"name":"health-baseline-production","version":"1.0.0"}"#,
+    );
+    write_file(
+        &dir.path().join("src/index.ts"),
+        &format!(
+            "{}{}",
+            hotspot_source("shipped"),
+            hotspot_source("alsoShipped")
+        ),
+    );
+    write_file(
+        &dir.path().join("src/index.test.ts"),
+        &format!(
+            "{}{}",
+            hotspot_source("tested"),
+            hotspot_source("alsoTested")
+        ),
+    );
+    let baseline_path = dir.path().join("health-baseline.json");
+    let saved = run_health_with_baseline(
+        dir.path(),
+        &[
+            "--save-baseline",
+            baseline_path.to_str().unwrap(),
+            "--baseline-mode",
+            "identity",
+        ],
+    );
+    assert_eq!(
+        parse_json(&saved)["findings"]
+            .as_array()
+            .map_or(0, Vec::len),
+        4,
+        "the saved baseline must hold every hotspot: {}",
+        redact_all(&saved.stdout, dir.path())
+    );
+    dir
+}
+
+/// Production mode drops test, story and dev files before analysis, so a
+/// whole-project baseline matches less of the run for a reason that is not
+/// rot. `dead-code` and `dupes` already stand down there; health must too, or
+/// the flag fails an unchanged project and advises a re-save that would delete
+/// every entry production mode never looked at.
+#[test]
+fn health_stale_baseline_gate_says_why_it_stood_down_in_production_mode() {
+    let project = production_narrowed_health_baseline_project();
+    let full = run_health_baseline_human(project.path(), &["--fail-on-stale-baseline"]);
+    assert_eq!(
+        full.code,
+        0,
+        "the baseline is fresh on a whole-project run: {}",
+        redact_all(&full.stderr, project.path())
+    );
+
+    let output = run_health_baseline_human(
+        project.path(),
+        &["--production", "--fail-on-stale-baseline"],
+    );
+    assert!(
+        !output.stderr.contains("Baseline gate failed"),
+        "a production run cannot judge a whole-project baseline: {}",
+        redact_all(&output.stderr, project.path())
+    );
+    assert!(
+        output
+            .stderr
+            .contains("--fail-on-stale-baseline did not run"),
+        "the run must name the reason the gate stood down: {}",
+        redact_all(&output.stderr, project.path())
+    );
+    assert_eq!(
+        output.code,
+        0,
+        "an unchanged project must not fail its own gate: {}",
+        redact_all(&output.stderr, project.path())
+    );
+}
+
+/// The advisory half of the same divergence: production mode must not advise a
+/// re-save that would drop the entries it never analyzed.
+#[test]
+fn health_baseline_staleness_warning_is_silent_in_production_mode() {
+    let project = production_narrowed_health_baseline_project();
+    let output = run_health_baseline_human(project.path(), &["--production"]);
+    assert!(
+        output.stderr.contains("Comparing against health baseline"),
+        "the baseline still loads under production mode: {}",
+        redact_all(&output.stderr, project.path())
+    );
+    assert!(
+        !output.stderr.contains("partially stale"),
+        "a production run cannot judge a whole-project baseline: {}",
+        redact_all(&output.stderr, project.path())
+    );
+    assert!(
+        !output.stderr.contains("matched 0 current findings"),
+        "re-saving from a production run would gut the baseline: {}",
+        redact_all(&output.stderr, project.path())
+    );
+}
+
+/// CI reads `--format json`, so the gate has to reach the machine renderer
+/// without touching the envelope it renders.
+#[test]
+fn health_stale_baseline_gate_leaves_json_output_unchanged() {
+    let project = rotted_health_baseline_project(5, 4);
+    let baseline_path = project.path().join("health-baseline.json");
+    let run = |extra: &[&str]| -> common::CommandOutput {
+        let mut args = vec![
+            "--baseline",
+            baseline_path.to_str().unwrap(),
+            "--baseline-mode",
+            "identity",
+        ];
+        args.extend_from_slice(extra);
+        run_health_with_baseline(project.path(), &args)
+    };
+    let without = run(&[]);
+    let with = run(&["--fail-on-stale-baseline"]);
+    assert!(
+        with.stderr.contains("Baseline gate failed: 1 of 5 entries"),
+        "the JSON run names the stale share on stderr: {}",
+        redact_all(&with.stderr, project.path())
+    );
+    assert_eq!(
+        without.code,
+        0,
+        "the JSON run is green without the flag: {}",
+        redact_all(&without.stderr, project.path())
+    );
+    assert_eq!(
+        with.code,
+        1,
+        "the opt-in gate fails the JSON run: {}",
+        redact_all(&with.stderr, project.path())
+    );
+    assert_eq!(
+        canonical_report(&without),
+        canonical_report(&with),
+        "the gate changes the exit code and stderr, never the health envelope"
+    );
+}
+
+/// The advisory wording health has always printed is untouched by the gate.
+#[test]
+fn health_stale_baseline_warning_is_unchanged() {
+    let project = rotted_health_baseline_project(4, 2);
+    let output = run_health_baseline_human(project.path(), &[]);
+    assert!(
+        output.stderr.contains(
+            "Warning: health baseline is partially stale: 2 of 4 entries matched no current finding"
+        ),
+        "the partial wording is unchanged: {}",
+        redact_all(&output.stderr, project.path())
+    );
+    assert!(
+        !output.stderr.contains("Baseline gate failed"),
+        "the gate stays off unless it is asked for: {}",
+        redact_all(&output.stderr, project.path())
+    );
 }
 
 /// A hotspot that replaces another hotspot in the same file and category is
