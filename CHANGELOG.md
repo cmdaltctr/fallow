@@ -167,6 +167,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The similar-code sidecar links rustls 0.23.45.** Its standalone lockfile
+  still pinned 0.23.43, which RUSTSEC-2026-0285 covers (TLS 1.3 handshake
+  messages accepted across encryption level boundaries); the workspace had
+  already moved in 3.25.0 and the sidecar now matches it.
+
 - **`fallow audit` no longer hangs on sparse checkouts of large monorepos.**
   The raw object materialization added in 3.4.2 read every blob in the base
   commit, so on a blobless partial clone each out-of-cone blob triggered a lazy
