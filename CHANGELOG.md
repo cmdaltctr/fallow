@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Baseline staleness reaches CI again.** 3.26.0 shipped the advisory that a
+  dead-code baseline has gone stale, and `--fail-on-stale-baseline` to turn that
+  into a failing build, but both lived on stderr only. Every CI path fallow
+  ships analyzes with `--quiet`, which removes the advisory at the source, and
+  the GitHub Action replays what is left as `::debug::` and discards the exit
+  code whenever stdout parses as JSON. So the documented CI path, the path the
+  original report came from, got exactly the pre-3.26.0 behaviour: a baseline
+  rotted for months and every run stayed green and silent. `fail-on-issues` did
+  not recover it either, because a baseline whose entries all match nothing
+  while the project itself is clean reports zero issues, which is the case the
+  gate exists for. This supersedes 3.26.0's statement that no envelope gains a
+  field: reaching a consumer that reads JSON is exactly what that decision made
+  impossible.
+
+  `dead-code` / `check`, the bare combined run, `dupes` and `health` now publish
+  one `baseline_staleness` object in their JSON envelopes, grouped output
+  included: the counts, how many findings there were to match against, whether
+  the run was narrowed, the advisory verdict, and `gate_trips`, the same rule
+  `--fail-on-stale-baseline` exits on. `dupes` carried nothing about a loaded
+  baseline before; `health` keeps the object it has had since 3.12.0 and gains
+  the verdict. `fix` and `security` take no baseline staleness and carry no
+  object, and `fallow audit` publishes only the health one. The object is absent
+  when no baseline was loaded, and emitted with or without the flag, so no
+  envelope schema version moved and the flag still changes nothing but the exit
+  code and the stderr line. Read `change_scoped` before dividing the counts: a
+  run narrowed to part of the project can report `matched_entries: 0` on a
+  perfectly healthy baseline, which is why deriving staleness from
+  `baseline.entries` and `baseline.matched` alone was never safe.
+
+  TypeScript consumers of `npm/fallow/types`: the `HealthBaselineStaleness`
+  interface is renamed to `BaselineStaleness` now that three commands share the
+  shape, and the old name ships as a deprecated alias so existing imports keep
+  compiling.
+
+  The GitHub Action and the GitLab template read that object. A stale baseline
+  surfaces as a `::warning::` (GitHub) or a warning line (GitLab) and in the job
+  summary, on any run that can judge the baseline. A run scoped to changed files
+  cannot judge a whole-project baseline, so on a pull request the integration
+  first re-reads the baseline once over the whole project; that re-read is not
+  behind the new input, because the advisory a repository never asked for is the
+  half that #2627 was about. The new `fail-on-stale-baseline` input and
+  `FALLOW_FAIL_ON_STALE_BASELINE` variable only decide whether that verdict
+  fails the job. They are independent of `fail-on-issues` /
+  `FALLOW_FAIL_ON_ISSUES`, like `type-aware-require` and the security gate
+  already were, and the verdict comes from the envelope rather than the exit
+  code, so a findings exit and a gate exit cannot be confused. The action also
+  exposes the counts and the verdict as step outputs, so a workflow can report
+  on staleness without failing on it.
+
+  What the integrations cannot read at runtime fails open: a pinned fallow older
+  than this release, a command that reports no staleness, or a re-read that
+  returns nothing usable all produce a warning and a green job. Combinations
+  that cannot work at all are rejected up front instead, with exit 2: the gate
+  with no `baseline` set, or the gate on `fix` or `security`.
+
+  The unscoped re-read carries no narrowing flag and no writing flag, so it
+  writes no baseline, no snapshot and no SARIF, and it feeds no comment,
+  annotation or summary. Measured on an 870-file TypeScript project it costs
+  0.11s on a warm cache and 0.11s on a cold one (the first run populates the
+  cache), 0.15s with caching disabled, and 0.24s with type-aware analysis on, in
+  every case less than the run it follows. When the run still cannot be widened,
+  because of production mode, workspace scoping, or a positional path passed
+  through `args`, the integration says the baseline could not be judged instead
+  of passing in silence: a warning when a gate was asked for and did not get
+  one, a notice otherwise, because production mode alongside a baseline is an
+  ordinary configuration and the CLI is silent there too.
+
+  Three notes for existing configurations. A repository that already passes
+  `--fail-on-stale-baseline` through the `args` input or `FALLOW_ARGS` should
+  remove it, and delete the separate unscoped gate step the issue suggested as a
+  workaround: keeping either means a pull request runs three analyses instead of
+  two, and on GitHub that flag never failed the job anyway while on GitLab it
+  printed a verdict the pipeline ignored. A repository that uses a baseline
+  without asking for any gate will start seeing the advisory on runs where the
+  baseline has gone stale; that is the point of the change, and re-saving the
+  baseline clears it. And pointing `baseline` and `save-baseline` at the same
+  file defeats the whole thing, because the run saves before it compares, so the
+  baseline can never report a stale entry; the integrations now say so. The PR
+  comment and the GitLab MR note do not carry the advisory yet
+  (Closes [#2673](https://github.com/fallow-rs/fallow/issues/2673)). Thanks to
+  the reporter for tracing it through the action scripts line by line.
+
 ## [3.26.0] - 2026-09-15
 
 ### Added
