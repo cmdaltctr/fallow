@@ -54,6 +54,15 @@ pub struct HealthOutput<Report, Group> {
     /// Per-bucket recomputed metrics; present only in grouped output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub groups: Option<Vec<Group>>,
+    /// Every gate this run ARMED, keyed by name, absent when it armed none.
+    /// Each entry is the same rule that decides the exit code, so a CI
+    /// integration reads the verdict instead of guessing from a process status
+    /// it usually cannot see. A gate fails the build when `status` is `fail`
+    /// AND `enforced` is true. Armed, not evaluated: fallow's default severity
+    /// rules fail a run with no flag at all, so an absent object means "no gate
+    /// was asked for", never "nothing failed". See [`crate::GateOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_outcomes: Option<crate::GateOutcomes>,
     /// `_meta` block with metric definitions, when `--explain` was passed.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Meta>,
@@ -85,6 +94,8 @@ pub struct HealthOutputInput<Report, Group> {
     pub grouped_by: Option<GroupByMode>,
     /// Per-bucket recomputed metrics, for grouped output.
     pub groups: Option<Vec<Group>>,
+    /// Every gate this run evaluated, absent when it evaluated none.
+    pub gate_outcomes: Option<crate::GateOutcomes>,
     /// `_meta` block to attach when `--explain` was passed.
     pub meta: Option<Meta>,
     /// Workspace-discovery, source-discovery, and analysis-stage diagnostics.
@@ -119,6 +130,7 @@ pub fn build_health_output<Report, Group>(
         report: input.report,
         grouped_by: input.grouped_by,
         groups: input.groups,
+        gate_outcomes: input.gate_outcomes,
         meta: input.meta,
         workspace_diagnostics: input.workspace_diagnostics,
         next_steps: input.next_steps,
@@ -160,6 +172,7 @@ mod tests {
     fn serialize_health_json_output_tags_and_strips_root_paths() {
         let output = serialize_health_json_output(HealthJsonOutputInput {
             output: HealthOutputInput {
+                gate_outcomes: None,
                 schema_version: 7,
                 version: "test".to_string(),
                 elapsed: Duration::ZERO,

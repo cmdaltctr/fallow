@@ -21,7 +21,7 @@ use crate::report;
 )]
 pub(crate) mod filtering;
 mod output;
-mod rules;
+pub mod rules;
 
 pub use filtering::get_changed_files;
 pub use filtering::resolve_workspace_scope;
@@ -1277,6 +1277,7 @@ pub fn benchmark_dead_code_json(
         regression: result.regression.as_ref(),
         baseline_matched: result.baseline_matched,
         baseline_staleness: envelope_baseline_staleness(&result),
+        gate_outcomes: None,
         config_fixable: result.config_fixable,
         workspace_diagnostics: &result.workspace_diagnostics,
         json_style: crate::json_style::JsonStyle::Compact,
@@ -1327,15 +1328,36 @@ pub struct PrintCheckOptions {
 }
 
 struct PreparedPrintCheck<'a> {
-    effective_rules: RulesConfig,
+    /// The severity rule's verdict, evaluated once. Both the published
+    /// `error-severity-findings` entry and the exit code read this, so the
+    /// single-source claim is structural rather than two calls that happen to
+    /// agree, and the findings arrays are walked once instead of twice.
+    has_error_severity: bool,
     report_ctx: report::ReportContext<'a>,
     regression_json: bool,
     quiet: bool,
 }
 
 fn prepare_print_check(result: &CheckResult, opts: PrintCheckOptions) -> PreparedPrintCheck<'_> {
+    let effective_rules = effective_check_rules(result);
+    let has_error_severity = rules::has_error_severity_issues(
+        &result.results,
+        &effective_rules,
+        Some(&result.config),
+        result.fail_on_issues,
+    );
+    let baseline_staleness = envelope_baseline_staleness(result);
+    let gate_outcomes = crate::gates::check_gate_outcomes(&crate::gates::CheckGateInputs {
+        fail_on_issues: result.fail_on_issues,
+        has_error_severity,
+        regression: result.regression.as_ref(),
+        baseline_staleness: baseline_staleness.as_ref(),
+        fail_on_stale_baseline: result.fail_on_stale_baseline,
+        type_aware_require: result.config.type_aware.require,
+        type_aware_meta: result.type_aware_meta.as_ref(),
+    });
     PreparedPrintCheck {
-        effective_rules: effective_check_rules(result),
+        has_error_severity,
         report_ctx: report::ReportContext {
             root: &result.config.root,
             rules: &result.config.rules,
@@ -1351,7 +1373,8 @@ fn prepare_print_check(result: &CheckResult, opts: PrintCheckOptions) -> Prepare
             summary_heading: opts.summary_heading,
             show_explain_tip: opts.show_explain_tip,
             baseline_matched: result.baseline_matched,
-            baseline_staleness: envelope_baseline_staleness(result),
+            baseline_staleness,
+            gate_outcomes,
             config_fixable: result.config_fixable,
             skip_score_and_trend: false,
             css_requested: false,
@@ -1363,7 +1386,7 @@ fn prepare_print_check(result: &CheckResult, opts: PrintCheckOptions) -> Prepare
     }
 }
 
-fn effective_check_rules(result: &CheckResult) -> RulesConfig {
+pub fn effective_check_rules(result: &CheckResult) -> RulesConfig {
     if result.fail_on_issues {
         let mut rules = result.config.rules.clone();
         rules::promote_warns_to_errors(&mut rules);
@@ -1422,7 +1445,11 @@ pub fn print_check_result(result: &CheckResult, opts: PrintCheckOptions) -> Exit
         return ExitCode::from(1);
     }
 
-    issue_severity_exit_code(result, &prepared.effective_rules)
+    if prepared.has_error_severity {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// This run's view of the loaded baseline, in the shape the JSON envelope
@@ -1596,19 +1623,6 @@ fn print_unmatched_ignore_findings_note(result: &CheckResult, quiet: bool) {
          project-root-relative globs; check for typos).",
         unmatched.join(", ")
     );
-}
-
-fn issue_severity_exit_code(result: &CheckResult, effective_rules: &RulesConfig) -> ExitCode {
-    if rules::has_error_severity_issues(
-        &result.results,
-        effective_rules,
-        Some(&result.config),
-        result.fail_on_issues,
-    ) {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    }
 }
 
 pub fn run_check(opts: &CheckOptions<'_>) -> ExitCode {

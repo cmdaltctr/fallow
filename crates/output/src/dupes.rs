@@ -81,6 +81,15 @@ pub struct DupesOutput<Report, Group> {
     /// can report `matched_entries: 0` on a healthy baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_staleness: Option<crate::BaselineStaleness>,
+    /// Every gate this run ARMED, keyed by name, absent when it armed none.
+    /// Each entry is the same rule that decides the exit code, so a CI
+    /// integration reads the verdict instead of guessing from a process status
+    /// it usually cannot see. A gate fails the build when `status` is `fail`
+    /// AND `enforced` is true. Armed, not evaluated: fallow's default severity
+    /// rules fail a run with no flag at all, so an absent object means "no gate
+    /// was asked for", never "nothing failed". See [`crate::GateOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_outcomes: Option<crate::GateOutcomes>,
     /// `_meta` block with metric / rule definitions, emitted when `--explain`
     /// is passed (always present in MCP responses).
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
@@ -128,6 +137,8 @@ pub struct DupesOutputInput<Report, Group> {
     pub groups: Option<Vec<Group>>,
     /// This run's view of the loaded duplication baseline, for baseline runs.
     pub baseline_staleness: Option<crate::BaselineStaleness>,
+    /// Every gate this run evaluated, absent when it evaluated none.
+    pub gate_outcomes: Option<crate::GateOutcomes>,
     /// `_meta` block to attach when `--explain` was passed.
     pub meta: Option<Meta>,
     /// Workspace-discovery and source-discovery diagnostics. See
@@ -155,6 +166,7 @@ pub fn build_dupes_output<Report, Group>(
         total_issues: input.total_issues,
         groups: input.groups,
         baseline_staleness: input.baseline_staleness,
+        gate_outcomes: input.gate_outcomes,
         meta: input.meta,
         workspace_diagnostics: input.workspace_diagnostics,
         next_steps: input.next_steps,
@@ -335,6 +347,7 @@ mod tests {
     #[test]
     fn dupes_json_output_uses_output_owned_root_contract() {
         let output = build_dupes_output(DupesOutputInput::<_, serde_json::Value> {
+            gate_outcomes: None,
             baseline_staleness: None,
             schema_version: 7,
             version: "0.0.0".to_string(),

@@ -136,6 +136,16 @@ export type ElapsedMs = number
  */
 export type AuditGate = ("new-only" | "all")
 /**
+ * What a gate concluded on this run.
+ *
+ * Four-valued rather than a boolean because audit's verdict has a warn tier
+ * (`crates/cli/src/cli_report.rs` maps it onto three conclusions) and because
+ * a gate can stand down without passing. Widening a published boolean later
+ * would retype a required field and bump every carrying envelope, so the width
+ * is decided here.
+ */
+export type GateStatus = ("pass" | "warn" | "fail" | "skipped")
+/**
  * Analysis mode stored with baselines, snapshots, audit sides, and impact data.
  */
 export type SemanticAnalysisMode = ("syntactic" | "type-aware")
@@ -436,6 +446,25 @@ path: string
  * with a next-step hint.
  */
 message: string
+/**
+ * True when this diagnostic reports a run whose RESULTS are degraded:
+ * something the user installed, wrote, or expected did not reach the
+ * analysis. Projected from [`WorkspaceDiagnosticKind::warns_on_stderr`],
+ * which is the same classification that decides whether the CLI prints a
+ * stderr line, so a CI log built from this field and a local non-quiet run
+ * say the same thing.
+ *
+ * Omitted when false, which is what keeps every clean run byte-identical.
+ * The two unconfigured-check kinds answer false on purpose: they fire in
+ * the product's default state on every project that never opted into
+ * boundaries or rule packs, so warning on them would warn forever. So does
+ * `excluded-by-default-ignore`, which is designed behavior on generated
+ * output; the alarm for that case is `no-source-files-analyzed`.
+ *
+ * Read this instead of hardcoding a kind allowlist: a degrading kind added
+ * in a later release then reaches an unchanged consumer.
+ */
+degrades_analysis?: boolean
 } & WorkspaceDiagnostic1)
 export type WorkspaceDiagnostic1 = ({
 kind: "undeclared-workspace"
@@ -533,6 +562,14 @@ file_count: number
  */
 directory_count: number
 kind: "excluded-by-default-ignore"
+} | {
+/**
+ * Candidate source files the built-in ignore patterns removed from
+ * this walk, summed across every pattern. `0` when the walk found no
+ * candidate to exclude in the first place.
+ */
+excluded_file_count: number
+kind: "no-source-files-analyzed"
 })
 /**
  * Discriminant for [`CloneGroupAction::kind`]. Mirrors the action types
@@ -1320,6 +1357,16 @@ base_snapshot_skipped?: (boolean | null)
 summary: AuditSummary
 attribution: AuditAttribution
 /**
+ * Every gate this run ARMED, keyed by name, absent when it armed none.
+ * Each entry is the same rule that decides the exit code, so a CI
+ * integration reads the verdict instead of guessing from a process status
+ * it usually cannot see. A gate fails the build when `status` is `fail`
+ * AND `enforced` is true. Armed, not evaluated: fallow's default severity
+ * rules fail a run with no flag at all, so an absent object means "no gate
+ * was asked for", never "nothing failed". See [`crate::GateOutcomes`].
+ */
+gate_outcomes?: (GateOutcomes | null)
+/**
  * `_meta` block with metric / rule definitions, when `--explain` was
  * passed.
  */
@@ -1400,6 +1447,78 @@ duplication_inherited: number
 styling_introduced: number
 styling_inherited: number
 duplication_demoted: number
+}
+/**
+ * Every gate a run ARMED, keyed by name.
+ *
+ * Armed, not evaluated: a gate is armed by a flag or by config, never merely
+ * because the rule behind it exists. Fallow's default severity rules fail a
+ * run with no flag at all, so a `dead-code` run can exit 1 carrying no object
+ * whatsoever. Read an absent object as "no gate was asked for", never as
+ * "nothing failed".
+ *
+ * Absent from an envelope whenever it is empty, so a run that armed no gate is
+ * byte-identical to one produced before this object existed. An empty object
+ * is never emitted: it would assert that gates were armed and none tripped,
+ * which is a different and false claim.
+ *
+ * The names this build can emit are `error-severity-findings`, `regression`,
+ * `stale-baseline`, `duplication-threshold`, `health-min-score`,
+ * `health-min-severity`, `health-findings`, `health-coverage-gaps`,
+ * `health-runtime-coverage`, `security`, `security-advisory`, `audit-verdict`
+ * and `type-aware-require`. The set is OPEN: a name a consumer does not
+ * recognise means "some gate", not an error.
+ */
+export interface GateOutcomes {
+[k: string]: GateOutcome
+}
+/**
+ * One gate's verdict on one run.
+ *
+ * `status` and `enforced` answer different questions and legitimately
+ * disagree. `status` is what the rule concluded; `enforced` is whether a
+ * `fail` from this gate would make the run exit non-zero. A
+ * `health --report-only` run is an explicit request never to fail, so a
+ * failing gate there reports `status: fail` with `enforced: false`, and a
+ * stale-baseline verdict published without `--fail-on-stale-baseline` reports
+ * the same pair.
+ *
+ * **A gate fails the build when `status` is `fail` AND `enforced` is true.**
+ * Neither member decides it alone: `enforced` is true on every armed gate,
+ * including the ones that passed, so gating on it by itself fails every run
+ * that armed anything. Read `status` on its own to decide what to say, and
+ * remember that `warn` and `skipped` are neither a pass nor a failure.
+ */
+export interface GateOutcome {
+status: GateStatus
+/**
+ * True when a `fail` from this gate makes the run exit non-zero. False
+ * when the verdict is published for information only, because the gate was
+ * never armed or because the run was told never to fail.
+ */
+enforced: boolean
+/**
+ * The measured value the gate compared, when there is one: the duplication
+ * percentage, the health score, or the number of findings at or above the
+ * severity floor. Whole numbers are carried as JSON numbers, so a count of
+ * three reads as `3.0`. Absent for gates that compare no number.
+ */
+observed?: (number | null)
+/**
+ * The configured limit `observed` was compared against, when there is one.
+ * Absent for gates that compare no number.
+ */
+threshold?: (number | null)
+/**
+ * How the limit was spelled, for a gate whose `threshold` number does not
+ * carry its own unit. `health-min-severity` sets it to the severity floor
+ * (`moderate`, `high` or `critical`); `regression` sets it to the
+ * tolerance as the user wrote it (`"50%"` or `"5"`), because `threshold`
+ * there is the allowance in issues and the percentage would otherwise be
+ * unrecoverable on the grouped envelope, which carries no `regression`
+ * object. Absent for gates whose numbers speak for themselves.
+ */
+threshold_label?: (string | null)
 }
 /**
  * Metric and rule definitions emitted under `_meta` when `--explain` is
@@ -2691,6 +2810,16 @@ baseline_staleness?: (BaselineStaleness | null)
  * Regression verdict against the baseline, in `--fail-on-regression` runs.
  */
 regression?: (RegressionResult | null)
+/**
+ * Every gate this run ARMED, keyed by name, absent when it armed none.
+ * Each entry is the same rule that decides the exit code, so a CI
+ * integration reads the verdict instead of guessing from a process status
+ * it usually cannot see. A gate fails the build when `status` is `fail`
+ * AND `enforced` is true. Armed, not evaluated: fallow's default severity
+ * rules fail a run with no flag at all, so an absent object means "no gate
+ * was asked for", never "nothing failed". See [`crate::GateOutcomes`].
+ */
+gate_outcomes?: (GateOutcomes | null)
 /**
  * `_meta` block with docs and rule definitions, when `--explain` was
  * passed.
@@ -10889,6 +11018,16 @@ grouped_by?: (GroupByMode | null)
  */
 groups?: (HealthGroup[] | null)
 /**
+ * Every gate this run ARMED, keyed by name, absent when it armed none.
+ * Each entry is the same rule that decides the exit code, so a CI
+ * integration reads the verdict instead of guessing from a process status
+ * it usually cannot see. A gate fails the build when `status` is `fail`
+ * AND `enforced` is true. Armed, not evaluated: fallow's default severity
+ * rules fail a run with no flag at all, so an absent object means "no gate
+ * was asked for", never "nothing failed". See [`crate::GateOutcomes`].
+ */
+gate_outcomes?: (GateOutcomes | null)
+/**
  * `_meta` block with metric definitions, when `--explain` was passed.
  */
 _meta?: (Meta | null)
@@ -11072,6 +11211,16 @@ groups?: (DuplicationGroup[] | null)
  */
 baseline_staleness?: (BaselineStaleness | null)
 /**
+ * Every gate this run ARMED, keyed by name, absent when it armed none.
+ * Each entry is the same rule that decides the exit code, so a CI
+ * integration reads the verdict instead of guessing from a process status
+ * it usually cannot see. A gate fails the build when `status` is `fail`
+ * AND `enforced` is true. Armed, not evaluated: fallow's default severity
+ * rules fail a run with no flag at all, so an absent object means "no gate
+ * was asked for", never "nothing failed". See [`crate::GateOutcomes`].
+ */
+gate_outcomes?: (GateOutcomes | null)
+/**
  * `_meta` block with metric / rule definitions, emitted when `--explain`
  * is passed (always present in MCP responses).
  */
@@ -11238,6 +11387,16 @@ groups: CheckGroupedEntry[]
  * can report `matched_entries: 0` on a healthy baseline.
  */
 baseline_staleness?: (BaselineStaleness | null)
+/**
+ * Every gate this run ARMED, keyed by name, absent when it armed none.
+ * Each entry is the same rule that decides the exit code, so a CI
+ * integration reads the verdict instead of guessing from a process status
+ * it usually cannot see. A gate fails the build when `status` is `fail`
+ * AND `enforced` is true. Armed, not evaluated: fallow's default severity
+ * rules fail a run with no flag at all, so an absent object means "no gate
+ * was asked for", never "nothing failed". See [`crate::GateOutcomes`].
+ */
+gate_outcomes?: (GateOutcomes | null)
 /**
  * `_meta` block with docs and rule definitions, when `--explain` was
  * passed.
@@ -11908,6 +12067,16 @@ version: ToolVersion
 elapsed_ms: ElapsedMs
 config: SecurityOutputConfig
 /**
+ * Every gate this run ARMED, keyed by name, absent when it armed none.
+ * Each entry is the same rule that decides the exit code, so a CI
+ * integration reads the verdict instead of guessing from a process status
+ * it usually cannot see. A gate fails the build when `status` is `fail`
+ * AND `enforced` is true. Armed, not evaluated: fallow's default severity
+ * rules fail a run with no flag at all, so an absent object means "no gate
+ * was asked for", never "nothing failed". See [`crate::GateOutcomes`].
+ */
+gate_outcomes?: (GateOutcomes | null)
+/**
  * Security-specific rule and field metadata, emitted with `--explain`.
  */
 _meta?: (Meta | null)
@@ -12531,6 +12700,16 @@ version: ToolVersion
 elapsed_ms: ElapsedMs
 config: SecurityOutputConfig
 /**
+ * Every gate this run ARMED, keyed by name, absent when it armed none.
+ * Each entry is the same rule that decides the exit code, so a CI
+ * integration reads the verdict instead of guessing from a process status
+ * it usually cannot see. A gate fails the build when `status` is `fail`
+ * AND `enforced` is true. Armed, not evaluated: fallow's default severity
+ * rules fail a run with no flag at all, so an absent object means "no gate
+ * was asked for", never "nothing failed". See [`crate::GateOutcomes`].
+ */
+gate_outcomes?: (GateOutcomes | null)
+/**
  * Security-specific rule and field metadata, emitted with `--explain`.
  */
 _meta?: (Meta | null)
@@ -12813,6 +12992,16 @@ export interface CombinedOutput {
 schema_version: CombinedSchemaVersion
 version: ToolVersion
 elapsed_ms: ElapsedMs
+/**
+ * Every gate this run ARMED, keyed by name, absent when it armed none.
+ * Each entry is the same rule that decides the exit code, so a CI
+ * integration reads the verdict instead of guessing from a process status
+ * it usually cannot see. A gate fails the build when `status` is `fail`
+ * AND `enforced` is true. Armed, not evaluated: fallow's default severity
+ * rules fail a run with no flag at all, so an absent object means "no gate
+ * was asked for", never "nothing failed". See [`crate::GateOutcomes`].
+ */
+gate_outcomes?: (GateOutcomes | null)
 /**
  * Per-section `_meta` blocks, when `--explain` was passed.
  */

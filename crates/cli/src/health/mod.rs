@@ -619,11 +619,149 @@ fn health_report_context<'a>(
         show_explain_tip: options.show_explain_tip,
         baseline_matched: None,
         baseline_staleness: None,
+        gate_outcomes: health_gate_outcomes(result, options),
         config_fixable: false,
         skip_score_and_trend: options.skip_score_and_trend,
         css_requested: options.css_requested,
         json_style: options.json_style,
         include_fragments: true,
+    }
+}
+
+/// The gates a health run armed, for the envelope's `gate_outcomes`.
+///
+/// Every entry reads the same predicate the exit path reads, so the published
+/// verdict and the process status cannot disagree. `--report-only` returns
+/// `ExitCode::SUCCESS` before any gate is consulted, so it clamps `enforced` to
+/// false on every entry while leaving each verdict in place; that is the case a
+/// boolean-only shape could not express, and the stale-baseline entry is
+/// clamped with the rest rather than reporting the flag it was armed with.
+///
+/// A gate armed by an explicit flag or by config always produces an entry.
+/// `health-findings` is the exception: it fails a plain `fallow health` run on
+/// any finding, which is the command's default rather than a gate a repository
+/// asked for, so it appears only once something else armed. That keeps an
+/// unarmed run byte-identical to one produced before this object existed, and
+/// it is why an absent object must be read as "no gate was asked for" rather
+/// than "nothing failed". Once the object exists the default rule is always in
+/// it, so the object can explain the exit code it sits beside.
+fn health_gate_outcomes(
+    result: &HealthResult,
+    options: HealthPrintOptions<'_>,
+) -> Option<fallow_output::GateOutcomes> {
+    use fallow_output::{GateName, GateOutcome, GateStatus};
+
+    let enforced = !options.gates.report_only;
+    let mut gates = fallow_output::GateOutcomes::new();
+
+    if let Some(threshold) = options.gates.min_score {
+        // `--min-score` implies `--score`, so a missing score means the caller
+        // is a programmatic one that requested the gate without computing what
+        // it compares. Report the stand-down rather than nothing, or "armed"
+        // and "not armed" read identically.
+        gates.insert(
+            GateName::HealthMinScore,
+            result.report.health_score.as_ref().map_or_else(
+                || GateOutcome::new(GateStatus::Skipped, false),
+                |score| {
+                    GateOutcome::measured(
+                        crate::gates::status_of(score.score < threshold),
+                        enforced,
+                        score.score,
+                        threshold,
+                    )
+                },
+            ),
+        );
+    }
+
+    if let Some(min_sev) = options.gates.min_severity {
+        let reached = result
+            .report
+            .findings
+            .iter()
+            .filter(|f| f.severity >= min_sev)
+            .count();
+        gates.insert(
+            GateName::HealthMinSeverity,
+            GateOutcome::counted(
+                crate::gates::status_of(reached > 0),
+                enforced,
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a finding count never approaches the f64 integer limit"
+                )]
+                {
+                    reached as f64
+                },
+                severity_floor_label(min_sev),
+            ),
+        );
+    }
+
+    if result.should_fail_on_coverage_gaps {
+        gates.insert(
+            GateName::HealthCoverageGaps,
+            GateOutcome::new(
+                crate::gates::status_of(result.coverage_gaps_has_findings),
+                enforced,
+            ),
+        );
+    }
+
+    // Armed by `--runtime-coverage`, so it belongs with the flag-armed gates
+    // rather than behind the default-rule guard below: without this a run whose
+    // only gate is runtime coverage exits 1 and publishes nothing.
+    if result.report.runtime_coverage.is_some() {
+        gates.insert(
+            GateName::HealthRuntimeCoverage,
+            GateOutcome::new(
+                crate::gates::status_of(has_failing_runtime_coverage(result)),
+                enforced,
+            ),
+        );
+    }
+
+    gates.insert_if(
+        GateName::StaleBaseline,
+        crate::gates::stale_baseline_outcome(
+            result.report.summary.baseline_staleness.as_ref(),
+            options.gates.fail_on_stale_baseline && enforced,
+        ),
+    );
+
+    if gates.is_empty() {
+        return None;
+    }
+
+    // The default findings rule, reached only once a gate was armed. With
+    // `--min-severity` the findings gate IS the severity gate, already
+    // recorded above under its own name.
+    if options.gates.min_severity.is_none() {
+        gates.insert(
+            GateName::HealthFindings,
+            if options.gates.min_score.is_some() {
+                // `--min-score` alone turns the findings branch off, which is
+                // what "complexity findings become informational" means.
+                GateOutcome::new(GateStatus::Skipped, false)
+            } else {
+                GateOutcome::new(
+                    crate::gates::status_of(!result.report.findings.is_empty()),
+                    enforced,
+                )
+            },
+        );
+    }
+
+    gates.into_option()
+}
+
+/// The wire spelling of a severity floor, for `threshold_label`.
+const fn severity_floor_label(severity: fallow_output::FindingSeverity) -> &'static str {
+    match severity {
+        fallow_output::FindingSeverity::Moderate => "moderate",
+        fallow_output::FindingSeverity::High => "high",
+        fallow_output::FindingSeverity::Critical => "critical",
     }
 }
 

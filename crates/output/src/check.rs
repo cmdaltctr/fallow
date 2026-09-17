@@ -73,6 +73,15 @@ pub struct CheckOutput {
     /// Regression verdict against the baseline, in `--fail-on-regression` runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regression: Option<RegressionResult>,
+    /// Every gate this run ARMED, keyed by name, absent when it armed none.
+    /// Each entry is the same rule that decides the exit code, so a CI
+    /// integration reads the verdict instead of guessing from a process status
+    /// it usually cannot see. A gate fails the build when `status` is `fail`
+    /// AND `enforced` is true. Armed, not evaluated: fallow's default severity
+    /// rules fail a run with no flag at all, so an absent object means "no gate
+    /// was asked for", never "nothing failed". See [`crate::GateOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_outcomes: Option<crate::GateOutcomes>,
     /// `_meta` block with docs and rule definitions, when `--explain` was
     /// passed.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
@@ -167,6 +176,15 @@ pub struct CheckGroupedOutput {
     /// can report `matched_entries: 0` on a healthy baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_staleness: Option<crate::BaselineStaleness>,
+    /// Every gate this run ARMED, keyed by name, absent when it armed none.
+    /// Each entry is the same rule that decides the exit code, so a CI
+    /// integration reads the verdict instead of guessing from a process status
+    /// it usually cannot see. A gate fails the build when `status` is `fail`
+    /// AND `enforced` is true. Armed, not evaluated: fallow's default severity
+    /// rules fail a run with no flag at all, so an absent object means "no gate
+    /// was asked for", never "nothing failed". See [`crate::GateOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_outcomes: Option<crate::GateOutcomes>,
     /// `_meta` block with docs and rule definitions, when `--explain` was
     /// passed.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
@@ -268,6 +286,7 @@ pub fn build_check_output(input: CheckOutputInput) -> CheckOutput {
         baseline: None,
         baseline_staleness: None,
         regression: None,
+        gate_outcomes: None,
         meta: input.meta,
         workspace_diagnostics: input.workspace_diagnostics,
         next_steps: input.next_steps,
@@ -1274,6 +1293,7 @@ mod tests {
     fn grouped_check_json_output_uses_output_owned_root_contract() {
         let root = std::path::Path::new("/project");
         let output = CheckGroupedOutput {
+            gate_outcomes: None,
             baseline_staleness: None,
             schema_version: SchemaVersion(7),
             version: ToolVersion("0.0.0".to_string()),

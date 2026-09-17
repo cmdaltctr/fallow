@@ -3,6 +3,7 @@ pub mod ci;
 pub(crate) mod codeclimate;
 mod compact;
 pub mod dupes_grouping;
+pub(crate) mod gate_outcome_text;
 pub mod github;
 pub mod github_annotations;
 pub mod github_summary;
@@ -128,6 +129,9 @@ pub(crate) struct ReportContext<'a> {
     /// run was change-scoped, the advisory verdict and the
     /// `--fail-on-stale-baseline` verdict.
     pub(crate) baseline_staleness: Option<fallow_output::BaselineStaleness>,
+    /// Every gate this run evaluated, for the JSON envelope's `gate_outcomes`.
+    /// `None` when the run evaluated none, which keeps the key off the wire.
+    pub(crate) gate_outcomes: Option<fallow_output::GateOutcomes>,
     /// Whether config-edit actions can be applied by `fallow fix`.
     ///
     /// This is caller-provided because an explicit `--config` path is fixable
@@ -254,6 +258,7 @@ pub(crate) struct CheckJsonRenderInput<'a> {
     pub(crate) regression: Option<&'a crate::regression::RegressionOutcome>,
     pub(crate) baseline_matched: Option<(usize, usize)>,
     pub(crate) baseline_staleness: Option<fallow_output::BaselineStaleness>,
+    pub(crate) gate_outcomes: Option<fallow_output::GateOutcomes>,
     pub(crate) config_fixable: bool,
     pub(crate) workspace_diagnostics: &'a [fallow_config::WorkspaceDiagnostic],
     pub(crate) json_style: crate::json_style::JsonStyle,
@@ -271,6 +276,7 @@ pub(crate) fn render_check_json(
         regression: input.regression,
         baseline_matched: input.baseline_matched,
         baseline_staleness: input.baseline_staleness,
+        gate_outcomes: input.gate_outcomes.clone(),
         config_fixable: input.config_fixable,
         workspace_diagnostics: input.workspace_diagnostics,
         json_style: input.json_style,
@@ -382,6 +388,7 @@ pub(crate) fn print_results(
             regression,
             baseline_matched: ctx.baseline_matched,
             baseline_staleness: ctx.baseline_staleness,
+            gate_outcomes: ctx.gate_outcomes.clone(),
             config_fixable: ctx.config_fixable,
             workspace_diagnostics: ctx.workspace_diagnostics,
             json_style: ctx.json_style,
@@ -460,6 +467,23 @@ fn print_check_github_format(
     }
 }
 
+/// The note a CI comment or review body carries: the type-aware message, the
+/// gate verdict, or both.
+///
+/// Shared by the live renderers and by `fallow report --from`, because the two
+/// must produce byte-identical bodies for one envelope and that parity has its
+/// own suite.
+pub(crate) fn ci_status_note(
+    existing: Option<&'static str>,
+    gates: Option<&fallow_output::GateOutcomes>,
+) -> Option<String> {
+    match (existing, gate_outcome_text::summary_line_for_gates(gates)) {
+        (Some(existing), Some(gates)) => Some(format!("{existing} {gates}")),
+        (Some(existing), None) => Some(existing.to_owned()),
+        (None, gates) => gates,
+    }
+}
+
 /// Render the CI comment / review / badge fallback arms for dead-code results.
 fn print_results_ci_comment(
     results: &AnalysisResults,
@@ -473,12 +497,21 @@ fn print_results_ci_comment(
     let value = fallow_output::codeclimate_issues_to_value(&issues);
     let incomplete = ci::required_type_aware_incomplete(ctx.type_aware);
     let conclusion = incomplete.then_some(fallow_output::PrDecisionConclusion::Failure);
-    let status_message = incomplete.then_some(ci::TYPE_AWARE_INCOMPLETE_MESSAGE);
-    print_ci_comment_format_with_status("dead-code", &value, output, conclusion, status_message)
-        .unwrap_or_else(|| {
-            eprintln!("Error: badge format is only supported for the health command");
-            ExitCode::from(2)
-        })
+    let status_message = ci_status_note(
+        incomplete.then_some(ci::TYPE_AWARE_INCOMPLETE_MESSAGE),
+        ctx.gate_outcomes.as_ref(),
+    );
+    print_ci_comment_format_with_status(
+        "dead-code",
+        &value,
+        output,
+        conclusion,
+        status_message.as_deref(),
+    )
+    .unwrap_or_else(|| {
+        eprintln!("Error: badge format is only supported for the health command");
+        ExitCode::from(2)
+    })
 }
 
 /// Render grouped results across all output formats.
@@ -513,6 +546,7 @@ fn print_grouped_results(
             resolver,
             config_fixable: ctx.config_fixable,
             baseline_staleness: ctx.baseline_staleness,
+            gate_outcomes: ctx.gate_outcomes.clone(),
             workspace_diagnostics: ctx.workspace_diagnostics,
             json_style: ctx.json_style,
         }),
@@ -579,10 +613,11 @@ pub(crate) fn print_duplication_report(
             report,
             ctx.root,
             ctx.elapsed,
-            json::DuplicationJsonRender {
+            &json::DuplicationJsonRender {
                 explain: ctx.explain,
                 include_fragments: ctx.include_fragments,
                 baseline_staleness: ctx.baseline_staleness,
+                gate_outcomes: ctx.gate_outcomes.clone(),
             },
             ctx.workspace_diagnostics,
             ctx.json_style,
@@ -603,7 +638,9 @@ pub(crate) fn print_duplication_report(
         OutputFormat::GithubSummary => {
             print_dupes_github_format(report, ctx, GithubTarget::Summary)
         }
-        ci_format => print_duplication_ci_comment(report, ctx.root, ci_format),
+        ci_format => {
+            print_duplication_ci_comment(report, ctx.root, ci_format, ctx.gate_outcomes.as_ref())
+        }
     }
 }
 
@@ -618,10 +655,11 @@ fn print_dupes_github_format(
         report,
         ctx.root,
         ctx.elapsed,
-        json::DuplicationJsonRender {
+        &json::DuplicationJsonRender {
             explain: ctx.explain,
             include_fragments: ctx.include_fragments,
             baseline_staleness: ctx.baseline_staleness,
+            gate_outcomes: ctx.gate_outcomes.clone(),
         },
         ctx.workspace_diagnostics,
     ) {
@@ -643,13 +681,16 @@ fn print_duplication_ci_comment(
     report: &DuplicationReport,
     root: &Path,
     output: OutputFormat,
+    gates: Option<&fallow_output::GateOutcomes>,
 ) -> ExitCode {
     let issues = codeclimate::api_duplication_codeclimate_issues(report, root);
     let value = fallow_output::codeclimate_issues_to_value(&issues);
-    print_ci_comment_format("dupes", &value, output).unwrap_or_else(|| {
-        eprintln!("Error: badge format is only supported for the health command");
-        ExitCode::from(2)
-    })
+    let gate_note = gate_outcome_text::summary_line_for_gates(gates);
+    print_ci_comment_format_with_status("dupes", &value, output, None, gate_note.as_deref())
+        .unwrap_or_else(|| {
+            eprintln!("Error: badge format is only supported for the health command");
+            ExitCode::from(2)
+        })
 }
 
 /// Render grouped duplication results across all output formats.
@@ -677,10 +718,11 @@ fn print_grouped_duplication_report(
             grouping,
             ctx.root,
             ctx.elapsed,
-            json::DuplicationJsonRender {
+            &json::DuplicationJsonRender {
                 explain: ctx.explain,
                 include_fragments: ctx.include_fragments,
                 baseline_staleness: ctx.baseline_staleness,
+                gate_outcomes: ctx.gate_outcomes.clone(),
             },
             ctx.workspace_diagnostics,
             ctx.json_style,
@@ -692,7 +734,9 @@ fn print_grouped_duplication_report(
         OutputFormat::PrCommentGithub
         | OutputFormat::PrCommentGitlab
         | OutputFormat::ReviewGithub
-        | OutputFormat::ReviewGitlab => print_duplication_ci_comment(report, ctx.root, output),
+        | OutputFormat::ReviewGitlab => {
+            print_duplication_ci_comment(report, ctx.root, output, ctx.gate_outcomes.as_ref())
+        }
         // The GitHub formats have no grouping concept; render ungrouped (same
         // fallback the PR-comment formats use).
         OutputFormat::GithubAnnotations => {
@@ -722,14 +766,6 @@ fn print_grouped_duplication_report(
 ///
 /// Returns `Some(exit_code)` for the four CI comment/review formats and `None`
 /// for every other output format, so callers keep their exhaustive match arms.
-fn print_ci_comment_format(
-    analysis: &str,
-    value: &serde_json::Value,
-    output: OutputFormat,
-) -> Option<ExitCode> {
-    print_ci_comment_format_with_status(analysis, value, output, None, None)
-}
-
 fn print_ci_comment_format_with_status(
     analysis: &str,
     value: &serde_json::Value,
@@ -739,7 +775,14 @@ fn print_ci_comment_format_with_status(
 ) -> Option<ExitCode> {
     let exit = match output {
         OutputFormat::PrCommentGithub => conclusion.map_or_else(
-            || ci::pr_comment::print_pr_comment(analysis, ci::pr_comment::Provider::Github, value),
+            || {
+                ci::pr_comment::print_pr_comment(
+                    analysis,
+                    ci::pr_comment::Provider::Github,
+                    value,
+                    status_message,
+                )
+            },
             |conclusion| {
                 ci::pr_comment::print_pr_comment_with_status(
                     analysis,
@@ -751,7 +794,14 @@ fn print_ci_comment_format_with_status(
             },
         ),
         OutputFormat::PrCommentGitlab => conclusion.map_or_else(
-            || ci::pr_comment::print_pr_comment(analysis, ci::pr_comment::Provider::Gitlab, value),
+            || {
+                ci::pr_comment::print_pr_comment(
+                    analysis,
+                    ci::pr_comment::Provider::Gitlab,
+                    value,
+                    status_message,
+                )
+            },
             |conclusion| {
                 ci::pr_comment::print_pr_comment_with_status(
                     analysis,
@@ -763,7 +813,14 @@ fn print_ci_comment_format_with_status(
             },
         ),
         OutputFormat::ReviewGithub => conclusion.map_or_else(
-            || ci::review::print_review_envelope(analysis, ci::pr_comment::Provider::Github, value),
+            || {
+                ci::review::print_review_envelope(
+                    analysis,
+                    ci::pr_comment::Provider::Github,
+                    value,
+                    status_message,
+                )
+            },
             |conclusion| {
                 ci::review::print_review_envelope_with_conclusion(
                     analysis,
@@ -775,7 +832,14 @@ fn print_ci_comment_format_with_status(
             },
         ),
         OutputFormat::ReviewGitlab => conclusion.map_or_else(
-            || ci::review::print_review_envelope(analysis, ci::pr_comment::Provider::Gitlab, value),
+            || {
+                ci::review::print_review_envelope(
+                    analysis,
+                    ci::pr_comment::Provider::Gitlab,
+                    value,
+                    status_message,
+                )
+            },
             |conclusion| {
                 ci::review::print_review_envelope_with_conclusion(
                     analysis,
@@ -856,6 +920,7 @@ pub(crate) fn print_health_report(
                 ctx.type_aware,
                 ctx.workspace_diagnostics,
                 ctx.json_style,
+                ctx.gate_outcomes.clone(),
             ),
             None => json::print_health_json(
                 report,
@@ -865,6 +930,7 @@ pub(crate) fn print_health_report(
                 ctx.type_aware,
                 ctx.workspace_diagnostics,
                 ctx.json_style,
+                ctx.gate_outcomes.clone(),
             ),
         },
         OutputFormat::CodeClimate => match group_resolver {
@@ -876,7 +942,9 @@ pub(crate) fn print_health_report(
         OutputFormat::PrCommentGithub
         | OutputFormat::PrCommentGitlab
         | OutputFormat::ReviewGithub
-        | OutputFormat::ReviewGitlab => print_health_ci_comment(report, ctx.root, output),
+        | OutputFormat::ReviewGitlab => {
+            print_health_ci_comment(report, ctx.root, output, ctx.gate_outcomes.as_ref())
+        }
         // The GitHub formats have no grouping concept; render ungrouped (same
         // fallback the PR-comment formats use).
         OutputFormat::GithubAnnotations => {
@@ -906,6 +974,7 @@ fn print_health_github_format(
         ctx.explain,
         ctx.type_aware,
         ctx.workspace_diagnostics,
+        ctx.gate_outcomes.clone(),
     ) {
         Ok(envelope) => print_github_format(
             github_annotations::EnvelopeKind::Health,
@@ -951,13 +1020,16 @@ fn print_health_ci_comment(
     report: &fallow_output::HealthReport,
     root: &Path,
     output: OutputFormat,
+    gates: Option<&fallow_output::GateOutcomes>,
 ) -> ExitCode {
     let issues = codeclimate::api_health_codeclimate_issues(report, root);
     let value = fallow_output::codeclimate_issues_to_value(&issues);
-    print_ci_comment_format("health", &value, output).unwrap_or_else(|| {
-        eprintln!("Error: badge format is only supported for the health command");
-        ExitCode::from(2)
-    })
+    let gate_note = gate_outcome_text::summary_line_for_gates(gates);
+    print_ci_comment_format_with_status("health", &value, output, None, gate_note.as_deref())
+        .unwrap_or_else(|| {
+            eprintln!("Error: badge format is only supported for the health command");
+            ExitCode::from(2)
+        })
 }
 
 fn warn_grouping_unsupported(grouping: Option<&fallow_output::HealthGrouping>, format: &str) {
@@ -1211,6 +1283,7 @@ mod tests {
     fn test_context<'a>(root: &'a Path, rules: &'a RulesConfig) -> ReportContext<'a> {
         ReportContext {
             baseline_staleness: None,
+            gate_outcomes: None,
             root,
             rules,
             workspace_diagnostics: &[],
