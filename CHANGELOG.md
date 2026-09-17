@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.27.0] - 2026-09-17
+
 ### Fixed
 
 - **Every gate fallow documents now actually fails the job.** `fail-on-regression`,
@@ -32,14 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gate_outcomes` lists the gates a run ARMED, not every rule that could fail
   it. Fallow's default severity rules fail a run with no flag at all, so a
   `dead-code` run can exit 1 with no object at all. Read an absent object as
-  "no gate was asked for", never as "nothing failed".
+  "no gate was asked for", never as "nothing failed"
+  (Closes [#2680](https://github.com/fallow-rs/fallow/issues/2680), [#2681](https://github.com/fallow-rs/fallow/issues/2681), [#2683](https://github.com/fallow-rs/fallow/issues/2683),
+  [#2685](https://github.com/fallow-rs/fallow/issues/2685)).
 
 - **`fallow report --from` states what each gate concluded.** Because both
   integrations already re-render through it, repositories tracking the latest
   CLI see a new `::notice::` annotation and a new line on the job summary, the
   pull-request comment and the merge-request note without changing their
   workflow. The line is informational on every surface and never fails a step by
-  itself; the integrations own the failing exit.
+  itself; the integrations own the failing exit
+  (Closes [#2684](https://github.com/fallow-rs/fallow/issues/2684)).
 
 - **A run that analyzed no source file now says so.** Its clean result means
   nothing was measured rather than that nothing was found, and until now that
@@ -48,7 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail. A repository whose scope legitimately holds no source, a docs-only
   repository or a workspace member with no TypeScript, keeps passing unless it
   opts in. A run whose findings were computed over less than the whole project
-  reports one aggregated warning listing the diagnostic kinds and their counts.
+  reports one aggregated warning listing the diagnostic kinds and their counts
+  (Closes [#2686](https://github.com/fallow-rs/fallow/issues/2686)).
 
 - **The duplication threshold reaches the bare command.** The action forwarded
   `--threshold` on `command: dupes` only, so the input could never produce a
@@ -184,7 +190,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not restored by that. When it is set the CLI turns its own findings rule off,
   and both integrations follow: the count gate stands down for that run, so the
   score alone decides it. `min-score` and `min-severity` apply to
-  `command: health` only and are rejected with exit 2 elsewhere.
+  `command: health` only and are rejected with exit 2 elsewhere
+  (Closes [#2682](https://github.com/fallow-rs/fallow/issues/2682)).
 
 - **The action's inline `Check threshold` step is gone.** Its logic moved into
   the analyze step, which is what lets the gates be tested and what makes them
@@ -9154,6 +9161,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
 [unreleased]: https://github.com/fallow-rs/fallow/compare/v3.25.0...HEAD
+[3.27.0]: https://github.com/fallow-rs/fallow/compare/v3.26.0...v3.27.0
 [3.26.0]: https://github.com/fallow-rs/fallow/compare/v3.25.0...v3.26.0
 [3.25.0]: https://github.com/fallow-rs/fallow/compare/v3.24.1...v3.25.0
 [3.24.1]: https://github.com/fallow-rs/fallow/compare/v3.24.0...v3.24.1
