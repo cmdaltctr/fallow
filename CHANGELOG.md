@@ -143,6 +143,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (Closes [#2673](https://github.com/fallow-rs/fallow/issues/2673)). Thanks to
   the reporter for tracing it through the action scripts line by line.
 
+- **MCP tool results say what the gates concluded.** Every CLI-backed tool runs
+  the CLI with `--quiet`, which removes the gate's stderr line, and converts its
+  exit 1 into a successful result so the findings still reach the agent. A gated
+  run therefore arrived looking exactly like an ungated one. Tool results now
+  restate the verdict the envelope already carries as plain sentences on the
+  root `warnings` array: a baseline that matched less than it was saved with,
+  together with the re-save remedy; every `gate_outcomes` entry that reported
+  `fail` or `warn`, with the numbers it compared and whether it was enforced;
+  and one aggregated entry when the run was degraded. The typed in-process
+  route reads the same members, so a tool no longer answers differently
+  depending on whether a parameter forced the CLI, and `find_dupes` with a
+  `threshold` now takes the route that can evaluate it instead of returning a
+  result that reads as a pass. The baseline sentence is deliberately stricter
+  than the CLI's own advisory: it fires on `gate_trips`, so a single unmatched
+  entry is reported where the CLI stays silent below a quarter, because a rotted
+  baseline on a cleaned project is exactly the case an agent cannot otherwise
+  see. Existing members do not move, a response with
+  nothing to report comes back exactly as before, and no result changes its
+  `isError`
+  (Closes [#2676](https://github.com/fallow-rs/fallow/issues/2676)).
+
 ### Changed
 
 - **`security-gate` now fails the job independently of `fail-on-issues`.** If

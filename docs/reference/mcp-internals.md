@@ -98,6 +98,39 @@ Contract rules:
 - Return structured results and structured errors. Do not require clients to
   parse human output.
 - Use JSON, quiet mode, and explanation metadata for CLI-backed analysis.
+- A tool result is the analysis envelope plus the run's verdicts, never a
+  prose prefix. `--quiet` removes the gate's stderr line and
+  `non_success_result` converts exit 1 into a success, both deliberately, so
+  `crates/mcp/src/tools/gate_verdicts.rs` restates what the envelope already
+  decided as plain strings on the root `warnings` array: `baseline_staleness`,
+  every `gate_outcomes` entry that reported `fail` or `warn`, and one
+  aggregated entry when `workspace_diagnostics` carries `degrades_analysis`.
+  It runs on every route that returns an envelope, the subprocess one in
+  `captured_output_result`, Code Mode in `normalize_output`, and the typed one
+  in `api_runtime::json_success`. The annotation is therefore route-complete;
+  the envelopes are not. `fallow_api` publishes no `gate_outcomes` from
+  `serialize_audit_programmatic_json`, `serialize_combined_programmatic_json` or
+  `serialize_health_programmatic_json` (`crates/api/src/runtime_json.rs`), so a
+  typed `audit` restates its diagnostics and its baseline and has no gate object
+  to read. A tool whose gate the programmatic route cannot evaluate takes the
+  CLI instead, which is what `CliFallbackReason::HealthMinScoreGate` and
+  `DuplicationThresholdGate` are for: without the second one, `find_dupes` with
+  a failing `threshold` returned a clean-looking result while the same call with
+  a `group_by` beside it reported the gate. Audit's verdict is not routed that
+  way, because every audit computes one and forcing the CLI would retire the
+  typed route; its absence is stated in the server instructions instead.
+  The lookup tables name each envelope
+  shape's sites, because `audit` nests its diagnostics inside its `dead_code` /
+  `duplication` / `complexity` sections and publishes its only staleness object
+  under `complexity.summary`, while every other command publishes both at the
+  root. It adds no verdict of
+  its own and moves no existing member, a response with nothing to state is not
+  re-serialized at all, and no result changes its `isError`: an exit-1 gate
+  stays a success carrying findings and an exit-8 security gate stays an error
+  that now names the gate. The tool results carry no `structured_content`: no
+  tool declares an `output_schema` for one to validate against, and a
+  verdict-only block would be a second shape with no manifest row and no drift
+  test.
 - Keep parameter names, defaults, license metadata, read-only status, and tool
   descriptions synchronized with the shared manifest.
 - `tools/list` is budgeted on both of its channels, because every byte of it is
