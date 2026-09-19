@@ -9,6 +9,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The artefact people read now says the baseline went stale.** A repository
+  whose baseline had rotted saw the advisory in the GitHub Action's step log and
+  job summary, and nothing at all on the sticky pull-request comment, the GitLab
+  merge-request note or the Check Run: those bodies are rendered in Rust and
+  were left out when the staleness object shipped.
+
+  All three now carry it. The comment, the note and the two review bodies gain
+  one advisory sentence in the status line they already used, present when the
+  baseline matched nothing, went partially stale, or tripped
+  `fail-on-stale-baseline`, and absent otherwise. The wording of the facts
+  matches the job summary word for word, so the two surfaces can be read side by
+  side; the remedy says to re-save from a whole-project run rather than naming
+  one channel, because a single renderer serves GitHub and GitLab and cannot
+  know which of the three ways to re-save the reader uses. An audit or combined
+  envelope carrying several baselines gets one sentence per baseline, each
+  naming its section.
+
+  The Check Run now lists every gate a run armed as its own row, next to the
+  command's, rather than showing a tripped gate only as a failed step. A row
+  names the gate, what it compared, and its threshold when it has one, and an
+  unenforced verdict reports as neutral rather than as a failure. The check's
+  overall conclusion is unchanged, so an advisory check does not become a merge
+  blocker. Repositories using `fallow ci post-check-run --split-gates` gain one
+  new `Fallow / <gate>` commit-status context per armed gate; nothing is renamed,
+  and neither integration passes that flag by default.
+
+- **`fallow audit`'s baselines no longer rot in silence.** An audit loads up to
+  three baselines (`dead-code-baseline`, `dupes-baseline`, `health-baseline`,
+  each also settable from project config) and judges none of them, because every
+  audit analyzes only the files that changed against its base. It said so once
+  on stderr, which `--quiet` removes, and its envelope reported nothing at all
+  for the dead-code and duplication baselines, so no CI integration could see
+  that the baseline it passes is inert.
+
+  The audit envelope now carries a staleness object per loaded baseline, at the
+  same place each command's own envelope carries it, plus one
+  `gate_outcomes["stale-baseline"]` entry reporting that the gate stood down.
+  All three always report `change_scoped: true` and `gate_trips: false`, so
+  nobody should build a gate on them. The GitHub Action and the GitLab template
+  now print one line per audit baseline naming the unscoped command that can
+  judge it, and both reject `--fail-on-stale-baseline` on an audit run through
+  `args` or `FALLOW_ARGS`, the last path by which that combination could still
+  buy a green run plus an invisible note.
+
+- **A baseline that recognises nothing no longer gates green in silence.** A
+  baseline saved by another command loaded without complaint and suppressed
+  nothing. Every verdict that followed was green and honest, because a baseline
+  with no entries has nothing that can go stale, so a repository that pointed
+  `baseline` at the wrong file kept a permanently passing
+  `fail-on-stale-baseline` gate and was never told.
+
+  Such a run now says so on CLI stderr, in the GitHub Action's step log and job
+  summary, in the GitLab job log, and in the MCP tools' warnings, and publishes
+  `baseline_staleness.unrecognised_format: true`, an optional member present
+  only in that state. The decision is the keys the file carries, measured
+  against the keys the reading command writes into its own baselines, not the
+  entry count: a baseline saved on a green main from a project with nothing to
+  record is legitimately empty, is not a mistake, and stays silent everywhere.
+  `dead-code` never reports it, because five of its baseline fields have no
+  default and a foreign file fails to load with exit 2 instead. The exit code is
+  unchanged on every command. The Action publishes the member as a new
+  `baseline-unrecognised` output, and both integrations now report the fact for
+  a baseline passed through `args` or `FALLOW_ARGS` as well.
+
 - **A run that asked to be scoped and could not be now says so.** Before:
   `--changed-since origin/main` on a shallow clone, or a `--diff-file` fallow
   could not place, warned on stderr, widened to the whole project and produced a
@@ -147,6 +211,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attributed as introduced, matching `fallow audit` on the same root.
   Thanks [@codingthat](https://github.com/codingthat) for the report and the
   bisect (Closes [#2699](https://github.com/fallow-rs/fallow/issues/2699)).
+
+### Added
+
+- **A narrowed run now names the channels that narrowed it.** A run scoped to
+  part of the project cannot judge a whole-project baseline, so both the
+  staleness advisory and `fail-on-stale-baseline` stand down there. The envelope
+  said only that this had happened, never why, and the GitHub Action and the
+  GitLab template had to guess from their own inputs which narrowing they could
+  remove and which was the caller's own choice.
+
+  `baseline_staleness` now carries `scope_reasons`, an array of channel names
+  present exactly when `change_scoped` is true and absent otherwise, so a
+  whole-project run is unchanged. The names are `diff`, `changed-since`,
+  `changed-files`, `workspace`, `changed-workspaces`, `scope`, `file`,
+  `issue-type-filter` and `production`; which of them a command can emit differs
+  per command, so read the array rather than assuming, and treat the name set as
+  open. Both integrations now decide from it instead of from their inputs: a run
+  narrowed only by channels they added is still re-read over the whole project,
+  and a run narrowed by production mode or workspace scoping stands down at once
+  and says which channel was responsible. Scoping passed through the `args`
+  input or `FALLOW_ARGS` is invisible to every input variable and is now visible
+  to both of them. The Action publishes the list as a new
+  `baseline-scope-reasons` output.
+
+  A run that loaded a non-empty baseline and was narrowed only by channels a
+  repeat can drop also gains a `recheck-baseline` entry in `next_steps`,
+  pointing at the unscoped command that can judge it. It is emitted on a run
+  with no findings too, which is exactly the run where a rotted baseline is
+  otherwise silent. Like every other entry it is runnable as-is and never
+  mutating: it re-reads the baseline and reports, it never re-saves. A run
+  narrowed by production mode or by workspace scoping gets no entry, because
+  those channels resolve from the project config and the environment as well as
+  from a flag, so the suggested command would come back just as narrow. The MCP
+  tools state the same fact as a sentence in their `warnings` array, so an agent
+  handed a scoped report learns that the baseline behind it was never judged.
 
 ## [3.27.0] - 2026-09-17
 

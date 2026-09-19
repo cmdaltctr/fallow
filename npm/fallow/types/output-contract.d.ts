@@ -421,6 +421,22 @@ export type DependencyOverrideMisconfigReason = ("unparsable-key" | "empty-value
  */
 export type BaselineStalenessAdvisory = ("none" | "zero-overlap" | "partial")
 /**
+ * One channel that narrowed a run to part of the project.
+ *
+ * Serialized as kebab-case inside `scope_reasons` and published as an OPEN
+ * set, the same tolerate-unknown contract `gate_outcomes` keys carry: a name
+ * this build does not emit means "some narrowing", not an error.
+ *
+ * Which names a command can emit differs per command, because the three
+ * narrowing predicates see different state. `dead-code` reads the flags
+ * themselves and can name every channel. `dupes` and `health` see an already
+ * resolved changed-file set and report `changed-files`, because at that point
+ * the flag that produced it is gone. `health` reports `workspace` for both
+ * `--workspace` and `--changed-workspaces` for the same reason. A consumer
+ * must therefore not assume a given command emits a given name.
+ */
+export type ScopeReason = ("diff" | "changed-since" | "changed-files" | "workspace" | "changed-workspaces" | "scope" | "file" | "issue-type-filter" | "production")
+/**
  * Status of a regression-check pass.
  */
 export type RegressionStatus = ("pass" | "exceeded" | "skipped")
@@ -5358,7 +5374,8 @@ current_findings: number
  * differ per command and include a diff, a base ref, `--changed-since`,
  * `--workspace`, `--changed-workspaces`, `--scope`, `--file`, an
  * issue-type filter, and production mode. Both `stale` and `gate_trips`
- * are false whenever this is true.
+ * are false whenever this is true. `scope_reasons` names the channels
+ * that fired.
  */
 change_scoped: boolean
 /**
@@ -5386,6 +5403,36 @@ gate_trips: boolean
  * `0`. Always `0` in health's count mode too.
  */
 moved_entries: number
+/**
+ * True when the loaded file carries no key this command's own baseline
+ * format writes, so it is a baseline another command saved or an object
+ * with nothing of this command's in it. Read this, not
+ * `baseline_entries == 0`, before telling anyone their baseline is the
+ * wrong file: a baseline saved from a project that had nothing to record
+ * is legitimately empty and is not a mistake.
+ *
+ * Present only when true, so an envelope from a run that loaded its own
+ * baseline is unchanged. `dead-code` never sets it: five of its baseline
+ * fields have no serde default, so a file that is not one fails to load
+ * with exit 2 long before this.
+ */
+unrecognised_format?: boolean
+/**
+ * Which channels narrowed this run, present and non-empty exactly when
+ * `change_scoped` is true. Both members are derived from one function, so
+ * the boolean and the array cannot disagree.
+ *
+ * Read it to decide whether the narrowing is removable: a run narrowed
+ * only by `diff`, `changed-since`, `changed-files`, `scope`, `file` or
+ * `issue-type-filter` can be repeated unscoped to judge the baseline,
+ * while `production`, `workspace` and `changed-workspaces` are the
+ * caller's own choice about what to analyze and an unscoped repeat would
+ * contradict it.
+ *
+ * The name set is OPEN and the names a command can emit differ per
+ * command; see [`ScopeReason`].
+ */
+scope_reasons?: ScopeReason[]
 }
 /**
  * Result of regression detection (`--fail-on-regression`). Compares current

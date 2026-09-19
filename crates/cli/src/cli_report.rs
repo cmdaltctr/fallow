@@ -214,7 +214,10 @@ fn render_saved_ci_target(
                 provider,
                 &issues,
                 conclusion,
-                status_message,
+                crate::report::ci::pr_comment::PrCommentStatus {
+                    message: status_message,
+                    gates: &crate::report::gate_outcome_text::gate_rows(envelope),
+                },
             )
         }
         ReportTarget::Review(_) => match conclusion {
@@ -239,13 +242,16 @@ fn render_saved_ci_target(
 }
 
 /// The note a saved envelope's comment and review bodies carry: the existing
-/// type-aware message, the gate verdict, whether the run did what it was
-/// asked, a grouping this target cannot carry, or any combination.
+/// type-aware message, the baseline advisory, the gate verdict, whether the run
+/// did what it was asked, a grouping this target cannot carry, or any
+/// combination of them.
 ///
 /// Additive to whatever `saved_ci_conclusion` already produced, so the
-/// type-aware message keeps its place and the later lines join it rather than
-/// replacing it. The clause order matches `report::ci_status_note`, which is
-/// what `the_live_and_saved_notes_agree` pins.
+/// type-aware message keeps its place and the later clauses join it rather than
+/// replacing it. Joined by the same function the live path uses, because the
+/// two renders are one contract, and the clause order therefore matches
+/// `report::ci_status_note`, which is what `the_live_and_saved_notes_agree`
+/// pins.
 ///
 /// The requests are read through `summary_line_for_saved_render`, because the
 /// diff filter governing THIS body was resolved by this process rather than by
@@ -255,29 +261,45 @@ fn saved_status_message(
     existing: Option<&'static str>,
     grouping_dropped: Option<&str>,
 ) -> Option<String> {
-    let joined = [
-        existing.map(str::to_owned),
-        crate::report::gate_outcome_text::summary_line(envelope),
-        crate::report::request_outcome_text::summary_line_for_saved_render(envelope),
-        grouping_dropped.map(crate::report::grouping_note::dropped_grouping_clause),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(" ");
-    if joined.is_empty() {
-        return None;
-    }
-    Some(joined)
+    crate::report::join_status_clauses(&[
+        existing,
+        crate::report::baseline_advisory_text::advisory_line(envelope).as_deref(),
+        crate::report::gate_outcome_text::summary_line(envelope).as_deref(),
+        crate::report::request_outcome_text::summary_line_for_saved_render(envelope).as_deref(),
+        grouping_dropped
+            .map(crate::report::grouping_note::dropped_grouping_clause)
+            .as_deref(),
+    ])
 }
 
 #[cfg(test)]
 mod status_note_tests {
-    fn gates() -> fallow_output::GateOutcomes {
-        let mut gates = fallow_output::GateOutcomes::new();
+    use fallow_output::{
+        BaselineScopeReasons, BaselineStaleness, BaselineStalenessAdvisory, GateName, GateOutcome,
+        GateOutcomes, GateStatus,
+    };
+
+    fn rotted_baseline() -> BaselineStaleness {
+        BaselineStaleness {
+            baseline_entries: 8,
+            matched_entries: 0,
+            stale_entries: 8,
+            current_findings: 6,
+            change_scoped: false,
+            stale: true,
+            warning: BaselineStalenessAdvisory::ZeroOverlap,
+            gate_trips: true,
+            moved_entries: 0,
+            unrecognised_format: false,
+            scope_reasons: BaselineScopeReasons::empty(),
+        }
+    }
+
+    fn gates() -> GateOutcomes {
+        let mut gates = GateOutcomes::new();
         gates.insert(
-            fallow_output::GateName::Regression,
-            fallow_output::GateOutcome::measured(fallow_output::GateStatus::Fail, true, 5.0, 0.0),
+            GateName::Regression,
+            GateOutcome::measured(GateStatus::Fail, true, 5.0, 0.0),
         );
         gates
     }
@@ -312,11 +334,52 @@ mod status_note_tests {
         let envelope = serde_json::json!({ "gate_outcomes": gates });
         assert_eq!(
             super::saved_status_message(&envelope, None, None),
-            crate::report::ci_status_note(None, Some(&gates), None, None),
+            crate::report::ci_status_note(None, None, Some(&gates), None, None),
         );
         assert_eq!(
             super::saved_status_message(&envelope, Some("Note."), None),
-            crate::report::ci_status_note(Some("Note."), Some(&gates), None, None),
+            crate::report::ci_status_note(Some("Note."), None, Some(&gates), None, None),
+        );
+    }
+
+    /// The type-aware message, the baseline advisory and the gate verdict at
+    /// once, which is the note a type-aware-incomplete run with a rotted
+    /// baseline and an armed gate produces.
+    #[test]
+    fn the_live_and_saved_notes_agree_on_every_clause() {
+        let staleness = rotted_baseline();
+        let mut gates = GateOutcomes::new();
+        gates.insert(
+            GateName::StaleBaseline,
+            GateOutcome::new(GateStatus::Fail, true),
+        );
+        let envelope = serde_json::json!({
+            "baseline_staleness": staleness,
+            "gate_outcomes": gates
+        });
+        let advisory =
+            crate::report::baseline_advisory_text::advisory_line_for_staleness(Some(&staleness));
+
+        let saved = super::saved_status_message(&envelope, Some("Note."), None)
+            .expect("three clauses are present");
+
+        assert_eq!(
+            Some(saved.clone()),
+            crate::report::ci_status_note(
+                Some("Note."),
+                advisory.as_deref(),
+                Some(&gates),
+                None,
+                None
+            ),
+        );
+        assert!(
+            saved.starts_with("Note. **Baseline matched nothing.**"),
+            "{saved}"
+        );
+        assert!(
+            saved.ends_with("Gate outcomes: failed stale-baseline."),
+            "{saved}"
         );
     }
 
@@ -330,7 +393,7 @@ mod status_note_tests {
             .expect("a grouped render has something to say");
         assert_eq!(
             Some(saved.clone()),
-            crate::report::ci_status_note(None, None, None, Some("owner")),
+            crate::report::ci_status_note(None, None, None, None, Some("owner")),
         );
         assert!(
             saved.contains("--group-by owner was requested"),
@@ -349,7 +412,7 @@ mod status_note_tests {
         let envelope = serde_json::json!({ "request_outcomes": requests });
         assert_eq!(
             super::saved_status_message(&envelope, None, None),
-            crate::report::ci_status_note(None, None, Some(&requests), None),
+            crate::report::ci_status_note(None, None, None, Some(&requests), None),
         );
 
         let gates = gates();
@@ -363,6 +426,7 @@ mod status_note_tests {
             Some(saved.clone()),
             crate::report::ci_status_note(
                 Some("Note."),
+                None,
                 Some(&gates),
                 Some(&requests),
                 Some("package")
@@ -382,13 +446,61 @@ mod status_note_tests {
         );
     }
 
-    /// A run with nothing to say renders no note, so a body produced before
-    /// either object existed stays byte-identical.
+    /// The whole note at once, in the order the two renderers must agree on:
+    /// the type-aware message, the baseline advisory, the gates, the requests
+    /// and last the grouping this target could not carry.
     #[test]
-    fn a_run_with_nothing_to_say_renders_no_note() {
-        let bare = serde_json::json!({ "kind": "dead-code" });
-        assert!(super::saved_status_message(&bare, None, None).is_none());
-        assert!(crate::report::ci_status_note(None, None, None, None).is_none());
+    fn the_live_and_saved_notes_agree_on_all_five_clauses() {
+        let staleness = rotted_baseline();
+        let mut gates = GateOutcomes::new();
+        gates.insert(
+            GateName::StaleBaseline,
+            GateOutcome::new(GateStatus::Fail, true),
+        );
+        let requests = requests();
+        let envelope = serde_json::json!({
+            "baseline_staleness": staleness,
+            "gate_outcomes": gates,
+            "request_outcomes": requests,
+        });
+        let advisory =
+            crate::report::baseline_advisory_text::advisory_line_for_staleness(Some(&staleness));
+
+        let saved = super::saved_status_message(&envelope, Some("Note."), Some("package"))
+            .expect("every clause is present");
+
+        assert_eq!(
+            Some(saved.clone()),
+            crate::report::ci_status_note(
+                Some("Note."),
+                advisory.as_deref(),
+                Some(&gates),
+                Some(&requests),
+                Some("package")
+            ),
+        );
+        let baseline = saved
+            .find("**Baseline matched nothing.**")
+            .expect("the baseline advisory");
+        let gate = saved.find("Gate outcomes:").expect("the gate inventory");
+        let request = saved
+            .find("Request outcomes:")
+            .expect("the request inventory");
+        let grouping = saved.find("Grouping: --group-by").expect("the grouping");
+        assert!(saved.starts_with("Note. "), "{saved}");
+        assert!(
+            baseline < gate && gate < request && request < grouping,
+            "{saved}"
+        );
+    }
+
+    /// A run with nothing to state must not gain an empty blockquote, so a body
+    /// produced before any of these objects existed stays byte-identical.
+    #[test]
+    fn an_envelope_with_no_verdict_carries_no_note() {
+        let envelope = serde_json::json!({ "kind": "dead-code" });
+        assert!(super::saved_status_message(&envelope, None, None).is_none());
+        assert!(crate::report::ci_status_note(None, None, None, None, None).is_none());
     }
 }
 

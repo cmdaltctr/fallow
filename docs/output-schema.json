@@ -26220,7 +26220,7 @@
         },
         "change_scoped": {
           "type": "boolean",
-          "description": "True when this run analyzed only part of the project, so a whole-project\nbaseline matches less of it for reasons that are not rot. The channels\ndiffer per command and include a diff, a base ref, `--changed-since`,\n`--workspace`, `--changed-workspaces`, `--scope`, `--file`, an\nissue-type filter, and production mode. Both `stale` and `gate_trips`\nare false whenever this is true."
+          "description": "True when this run analyzed only part of the project, so a whole-project\nbaseline matches less of it for reasons that are not rot. The channels\ndiffer per command and include a diff, a base ref, `--changed-since`,\n`--workspace`, `--changed-workspaces`, `--scope`, `--file`, an\nissue-type filter, and production mode. Both `stale` and `gate_trips`\nare false whenever this is true. `scope_reasons` names the channels\nthat fired."
         },
         "stale": {
           "type": "boolean",
@@ -26237,6 +26237,18 @@
         "moved_entries": {
           "type": "integer",
           "description": "Entries that matched only by following a file move. Only `health` can\nfollow one, in its identity baseline mode; `dead-code` and `dupes` match\nentries by fingerprint and never classify one as moved, so they report\n`0`. Always `0` in health's count mode too."
+        },
+        "unrecognised_format": {
+          "type": "boolean",
+          "description": "True when the loaded file carries no key this command's own baseline\nformat writes, so it is a baseline another command saved or an object\nwith nothing of this command's in it. Read this, not\n`baseline_entries == 0`, before telling anyone their baseline is the\nwrong file: a baseline saved from a project that had nothing to record\nis legitimately empty and is not a mistake.\n\nPresent only when true, so an envelope from a run that loaded its own\nbaseline is unchanged. `dead-code` never sets it: five of its baseline\nfields have no serde default, so a file that is not one fails to load\nwith exit 2 long before this."
+        },
+        "scope_reasons": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/definitions/ScopeReason"
+          },
+          "description": "Which channels narrowed this run, present and non-empty exactly when\n`change_scoped` is true. Both members are derived from one function, so\nthe boolean and the array cannot disagree.\n\nRead it to decide whether the narrowing is removable: a run narrowed\nonly by `diff`, `changed-since`, `changed-files`, `scope`, `file` or\n`issue-type-filter` can be repeated unscoped to judge the baseline,\nwhile `production`, `workspace` and `changed-workspaces` are the\ncaller's own choice about what to analyze and an unscoped repeat would\ncontradict it.\n\nThe name set is OPEN and the names a command can emit differ per\ncommand; see [`ScopeReason`]."
         }
       },
       "required": [
@@ -26506,6 +26518,56 @@
         }
       ],
       "description": "What a request governs, and therefore what its failure means.\n\nPublished on every entry so a consumer selects on the class rather than on\na name list. Without it the one sentence a consumer can write for the whole\nobject (\"the report is wider than requested\") is false for any request that\ndoes not narrow, which is how a failed `--sarif-file` write came to be\nreported as an unscoped run. A request name added later carries its own\nclass, so a consumer written today keeps saying the right thing about it.\n\nThe value set is OPEN, like the names and the statuses: read a class this\nbuild does not recognise as \"some request\", not as an error, and do not read\nit as `scope`."
+    },
+    "ScopeReason": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "diff",
+          "description": "A diff index reached the analysis, from `--diff-file`, `--diff-stdin`,\n`FALLOW_DIFF_FILE` or the shared index a CI format installs."
+        },
+        {
+          "type": "string",
+          "const": "changed-since",
+          "description": "`--changed-since`."
+        },
+        {
+          "type": "string",
+          "const": "changed-files",
+          "description": "A resolved changed-file set, on the commands that see the set rather\nthan the flag that produced it."
+        },
+        {
+          "type": "string",
+          "const": "workspace",
+          "description": "`--workspace`. On `health` this also covers `--changed-workspaces`,\nwhich it cannot distinguish."
+        },
+        {
+          "type": "string",
+          "const": "changed-workspaces",
+          "description": "`--changed-workspaces`."
+        },
+        {
+          "type": "string",
+          "const": "scope",
+          "description": "`--scope`."
+        },
+        {
+          "type": "string",
+          "const": "file",
+          "description": "One or more `--file`."
+        },
+        {
+          "type": "string",
+          "const": "issue-type-filter",
+          "description": "An active issue-type filter such as `--unused-exports`, which drops\nwhole baseline categories before the comparison."
+        },
+        {
+          "type": "string",
+          "const": "production",
+          "description": "Production mode, from the flag or the resolved project config. It drops\ntest, story and dev files at discovery."
+        }
+      ],
+      "description": "One channel that narrowed a run to part of the project.\n\nSerialized as kebab-case inside `scope_reasons` and published as an OPEN\nset, the same tolerate-unknown contract `gate_outcomes` keys carry: a name\nthis build does not emit means \"some narrowing\", not an error.\n\nWhich names a command can emit differs per command, because the three\nnarrowing predicates see different state. `dead-code` reads the flags\nthemselves and can name every channel. `dupes` and `health` see an already\nresolved changed-file set and report `changed-files`, because at that point\nthe flag that produced it is gone. `health` reports `workspace` for both\n`--workspace` and `--changed-workspaces` for the same reason. A consumer\nmust therefore not assume a given command emits a given name."
     }
   }
 }
