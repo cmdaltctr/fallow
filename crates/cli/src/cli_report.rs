@@ -198,7 +198,14 @@ fn render_saved_ci_target(
     // actually reads while the summary says it failed. The gate line is carried
     // as the status note, which leaves the check-run `conclusion` alone: that
     // is a documented non-blocker and moving it is a separate decision.
-    let status_message = saved_status_message(envelope, status_message);
+    let status_message = saved_status_message(
+        envelope,
+        status_message,
+        // The resolver exists exactly when the saved envelope was grouped, and
+        // carries the same mode label the live render prints. The flattened
+        // grouped dead-code envelope no longer has `grouped_by` to read.
+        resolver.map(crate::report::OwnershipResolver::mode_label),
+    );
     let status_message = status_message.as_deref();
     match target {
         ReportTarget::PrComment(_) => {
@@ -232,44 +239,156 @@ fn render_saved_ci_target(
 }
 
 /// The note a saved envelope's comment and review bodies carry: the existing
-/// type-aware message, the gate verdict, or both.
+/// type-aware message, the gate verdict, whether the run did what it was
+/// asked, a grouping this target cannot carry, or any combination.
 ///
 /// Additive to whatever `saved_ci_conclusion` already produced, so the
-/// type-aware message keeps its place and the gate line joins it rather than
-/// replacing it.
+/// type-aware message keeps its place and the later lines join it rather than
+/// replacing it. The clause order matches `report::ci_status_note`, which is
+/// what `the_live_and_saved_notes_agree` pins.
+///
+/// The requests are read through `summary_line_for_saved_render`, because the
+/// diff filter governing THIS body was resolved by this process rather than by
+/// the run that saved the envelope.
 fn saved_status_message(
     envelope: &serde_json::Value,
     existing: Option<&'static str>,
+    grouping_dropped: Option<&str>,
 ) -> Option<String> {
-    let gates = crate::report::gate_outcome_text::summary_line(envelope);
-    match (existing, gates) {
-        (Some(existing), Some(gates)) => Some(format!("{existing} {gates}")),
-        (Some(existing), None) => Some(existing.to_owned()),
-        (None, gates) => gates,
+    let joined = [
+        existing.map(str::to_owned),
+        crate::report::gate_outcome_text::summary_line(envelope),
+        crate::report::request_outcome_text::summary_line_for_saved_render(envelope),
+        grouping_dropped.map(crate::report::grouping_note::dropped_grouping_clause),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
+    if joined.is_empty() {
+        return None;
     }
+    Some(joined)
 }
 
 #[cfg(test)]
 mod status_note_tests {
-    /// The live path builds the note from typed gates and the saved path from
-    /// the parsed envelope. They must produce the same string, or
-    /// `report --from` stops being byte-identical to a direct render.
-    #[test]
-    fn the_live_and_saved_notes_agree() {
+    fn gates() -> fallow_output::GateOutcomes {
         let mut gates = fallow_output::GateOutcomes::new();
         gates.insert(
             fallow_output::GateName::Regression,
             fallow_output::GateOutcome::measured(fallow_output::GateStatus::Fail, true, 5.0, 0.0),
         );
+        gates
+    }
+
+    fn requests() -> fallow_output::RequestOutcomes {
+        let mut requests = fallow_output::RequestOutcomes::new();
+        requests.insert(
+            fallow_output::RequestName::ChangedSince,
+            fallow_output::RequestOutcome::not_applied(
+                fallow_output::RequestName::ChangedSince,
+                "origin/main",
+                "invalid-ref",
+                "--changed-since 'origin/main' was ignored.",
+            ),
+        );
+        requests.insert(
+            fallow_output::RequestName::DiffFilter,
+            fallow_output::RequestOutcome::applied(
+                fallow_output::RequestName::DiffFilter,
+                "--diff-file pr.diff",
+            ),
+        );
+        requests
+    }
+
+    /// The live path builds the note from typed gates and the saved path from
+    /// the parsed envelope. They must produce the same string, or
+    /// `report --from` stops being byte-identical to a direct render.
+    #[test]
+    fn the_live_and_saved_notes_agree() {
+        let gates = gates();
         let envelope = serde_json::json!({ "gate_outcomes": gates });
         assert_eq!(
-            super::saved_status_message(&envelope, None),
-            crate::report::ci_status_note(None, Some(&gates)),
+            super::saved_status_message(&envelope, None, None),
+            crate::report::ci_status_note(None, Some(&gates), None, None),
         );
         assert_eq!(
-            super::saved_status_message(&envelope, Some("Note.")),
-            crate::report::ci_status_note(Some("Note."), Some(&gates)),
+            super::saved_status_message(&envelope, Some("Note."), None),
+            crate::report::ci_status_note(Some("Note."), Some(&gates), None, None),
         );
+    }
+
+    /// A grouped envelope rendered into a body that cannot carry groups says
+    /// so, and says it identically whether the body was rendered live or from
+    /// the saved envelope (issue #2691).
+    #[test]
+    fn the_live_and_saved_grouping_notes_agree() {
+        let envelope = serde_json::json!({ "kind": "health" });
+        let saved = super::saved_status_message(&envelope, None, Some("owner"))
+            .expect("a grouped render has something to say");
+        assert_eq!(
+            Some(saved.clone()),
+            crate::report::ci_status_note(None, None, None, Some("owner")),
+        );
+        assert!(
+            saved.contains("--group-by owner was requested"),
+            "the requested mode reaches the rendered body: {saved}"
+        );
+
+        assert!(super::saved_status_message(&envelope, None, None).is_none());
+    }
+
+    /// The same parity for the run's requests, and for a body that carries
+    /// every clause at once: the clause order is part of the contract, not an
+    /// accident of which renderer ran.
+    #[test]
+    fn the_live_and_saved_request_notes_agree() {
+        let requests = requests();
+        let envelope = serde_json::json!({ "request_outcomes": requests });
+        assert_eq!(
+            super::saved_status_message(&envelope, None, None),
+            crate::report::ci_status_note(None, None, Some(&requests), None),
+        );
+
+        let gates = gates();
+        let both = serde_json::json!({
+            "gate_outcomes": gates,
+            "request_outcomes": requests,
+        });
+        let saved = super::saved_status_message(&both, Some("Note."), Some("package"))
+            .expect("a note for a run with something to say");
+        assert_eq!(
+            Some(saved.clone()),
+            crate::report::ci_status_note(
+                Some("Note."),
+                Some(&gates),
+                Some(&requests),
+                Some("package")
+            ),
+        );
+        assert!(
+            saved.starts_with("Note. Gate outcomes:"),
+            "the type-aware message keeps its place ahead of the verdicts: {saved}"
+        );
+        assert!(
+            saved.contains("Request outcomes: not applied changed-since (invalid-ref)"),
+            "an unapplied request reaches the rendered body: {saved}"
+        );
+        assert!(
+            saved.ends_with("run --format json for the grouped envelope."),
+            "the grouping clause comes last: {saved}"
+        );
+    }
+
+    /// A run with nothing to say renders no note, so a body produced before
+    /// either object existed stays byte-identical.
+    #[test]
+    fn a_run_with_nothing_to_say_renders_no_note() {
+        let bare = serde_json::json!({ "kind": "dead-code" });
+        assert!(super::saved_status_message(&bare, None, None).is_none());
+        assert!(crate::report::ci_status_note(None, None, None, None).is_none());
     }
 }
 

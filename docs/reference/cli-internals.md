@@ -145,6 +145,41 @@ an exit code.
   as inherited and additionally surface via
   `attribution.duplication_demoted` and a per-group `demotion_reason` field;
   human output names the deciding diff source in the demotion note.
+- Narrowing requests report their own fate (issues #2687, #2688). Two channels
+  can be asked for and refused: `--changed-since` and the opt-in shared diff.
+  Both widen the report rather than failing the run, so the fact travels on the
+  envelope as `request_outcomes` and not only on stderr, which `--quiet`
+  removes entirely on the `$FALLOW_DIFF_FILE` channel. Two rules keep it
+  honest. The print is quiet-gated and the RECORDING is not, so the object is
+  identical with and without `--quiet`; and the sentence the envelope carries is
+  the same string the stderr line prints
+  (`ChangedFilesError::changed_since_message`, `DiffStandDown::message`), so a
+  log a human read and a report a script read cannot state different remedies.
+  The diff outcome lives in a sibling `OnceLock` beside `SHARED_DIFF`
+  (`crates/cli/src/report/ci/diff_filter.rs`) rather than inside it: that
+  cache's three states each carry a documented correctness argument, and a
+  reporting concern does not belong inside a filtering decision. A diff that
+  parsed but names no analyzable file reports `applied`, because the filter WAS
+  applied over an empty scope. `fallow audit` records nothing: it exits 2 rather
+  than widen, and it resolves its base ref through the non-printing
+  `crate::check::try_get_changed_files` so the widening sentence cannot reach a
+  run that produced no report. On the combined envelope the root is the only
+  carrier, matching `workspace_diagnostics`.
+- The object also carries `--sarif-file`, which produces a file BESIDE the
+  report rather than narrowing it, so every entry publishes `affects`
+  (`scope` / `artifact`) and every consumer selects on that rather than on a
+  name. Without it the one sentence a consumer writes for the whole object
+  reported a failed SARIF write as a run wider than requested, on the pull
+  request, the merge request, the job summary and the Action's
+  `requests-unapplied` output. The class is derived from the name inside
+  `RequestOutcome::applied` / `not_applied`, so an entry cannot be filed under
+  one name carrying another's class.
+- The stand-down sentences name their candidate bases by relation to the
+  analysis root (`the project root`, `the repository root (the project root is
+  <offset> below it)`) rather than by absolute path, because `message` is a wire
+  field and every other path-bearing member of a fallow envelope is
+  project-root-relative. `requested` is the exception by design: it echoes what
+  the user typed, which may be an absolute path they chose.
 
 ## Compact health populations
 
