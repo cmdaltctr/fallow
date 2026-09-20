@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`autoImports` reports unused convention files when a Nuxt project turns the
+  scan off.** A config that switches auto-import scanning off
+  (`components: false`, `components: []`, `components: { dirs: [] }`,
+  `imports: { scan: false }`) was treated as a custom layout, so every
+  component, composable and util stayed an entry point and nothing was
+  reported. Those shapes now count as Nuxt's default and the convention entry
+  patterns are dropped. A project that combines `autoImports: true` with one of
+  them will see new `unused-file` findings: add a file to `entry` when fallow
+  cannot see how it is reached, or to `ignoreFindings` to silence one finding.
+  Every other `components:` or `imports:` shape keeps its entry patterns,
+  including a lone `imports: { autoImport: false }`, a config that declares
+  `extends`, an object built with a spread, and a non-empty `imports.dirs` next
+  to `scan: false`. Template tags and composable calls still credit their
+  files. Thanks [@Tsuyoshi84](https://github.com/Tsuyoshi84) for the report
+  (Closes [#2695](https://github.com/fallow-rs/fallow/issues/2695)).
+
 - **The artefact people read now says the baseline went stale.** A repository
   whose baseline had rotted saw the advisory in the GitHub Action's step log and
   job summary, and nothing at all on the sticky pull-request comment, the GitLab
