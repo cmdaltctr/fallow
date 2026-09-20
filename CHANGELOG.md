@@ -247,6 +247,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tools state the same fact as a sentence in their `warnings` array, so an agent
   handed a scoped report learns that the baseline behind it was never judged.
 
+- **Module Federation `exposes` and `remotes` are read from config.** A file
+  named in a static `exposes` mapping is a runtime entry point, so an exposed
+  component is no longer reported as unused and does not have to be listed in
+  `dynamicallyLoaded`. Imports from a remote are covered too: a `remotes` alias
+  and its subpaths count as provided by the remote container, which stops
+  `import('checkout/Button')` from being reported as an unlisted dependency.
+  That holds only under the directory of the config that declared the alias.
+  Both keys are read from `module-federation.config.{ts,js,mjs,cjs,mts,cts}`
+  and from inline plugin options in webpack, rspack, rsbuild and vite configs.
+  Exposed files follow `includeEntryExports` like any other entry point. A
+  value fallow cannot read statically (a non-literal object, a spread, the
+  array form, a non-string target) is named on stderr together with the config
+  key that covers the gap. Not read yet: `shared`, runtime `registerRemotes`
+  and `loadRemote` calls, and Federation options registered outside the
+  top-level `plugins` array, such as a Next.js `webpack(config)` hook
+  ([#2698](https://github.com/fallow-rs/fallow/issues/2698)).
+
 ## [3.27.0] - 2026-09-17
 
 ### Fixed
