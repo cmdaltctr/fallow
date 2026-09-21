@@ -616,6 +616,17 @@ kind: "no-source-files-analyzed"
 error: string
 kind: "file-scores-unavailable"
 } | {
+/**
+ * Which input stopped it, as a kebab-case token: `not-a-repository`,
+ * `invalid-since` or `churn-file-unreadable`. The set is open.
+ *
+ * The cause decides the remedy, which is why it is on the wire: a run
+ * outside a repository is fixed by running fallow inside one, a
+ * malformed `--since` by respelling the flag, and a churn file that
+ * changed under the run by rerunning it. A consumer reading only the
+ * kind would offer the first remedy for all three.
+ */
+cause: string
 kind: "hotspots-skipped"
 } | {
 /**
@@ -5500,6 +5511,10 @@ reason?: (string | null)
  * whole object narrows the report tells its reader an unwritten SARIF file
  * widened the analysis, which is what `affects` exists to prevent.
  *
+ * `scope_size` is emitted for `diff-filter` only today, in added lines. A
+ * consumer reads the unit off the name, so a name that starts measuring its
+ * own scope in a later release needs no change here.
+ *
  * `invalid-ref` is reachable only through the programmatic API. The
  * `--changed-since` flag validates its value before a run starts and fails
  * with exit 2 and an error document, which is the right side to err on: a
@@ -5527,6 +5542,27 @@ affects: RequestEffect
  * other path-shaped field.
  */
 requested: string
+/**
+ * How much this request left in scope, in the request's own unit, when the
+ * run applied it AND measured that scope. Absent otherwise, including on
+ * every unapplied entry: a request that stood down narrowed nothing, so a
+ * number there would describe a scope nobody applied.
+ *
+ * The unit belongs to the name. `diff-filter` counts added lines, which is
+ * what its filter keeps a finding for. Read the unit off the name the entry
+ * is keyed under, never across names, and read an absent member as "not
+ * measured" rather than as zero.
+ *
+ * The count is what the run INDEXED rather than the true total:
+ * `diff-filter` indexes at most one million added lines and reports that
+ * cap for a larger diff, so read any non-zero value as a lower bound.
+ *
+ * `0` is the case this member exists for: a request that applied over an
+ * EMPTY scope. Every finding then filters out and the report reads clean,
+ * so a consumer that sees no findings beside `scope_size: 0` learns that
+ * nothing was analyzable rather than that the code is clean.
+ */
+scope_size?: (number | null)
 /**
  * Why the request was not applied, as a kebab-case token. Present exactly
  * when `status` is not `applied`. The set is open per request name; the
@@ -13309,6 +13345,22 @@ schema_version: FeatureFlagsSchemaVersion
 version: ToolVersion
 elapsed_ms: ElapsedMs
 /**
+ * What the run was asked to narrow and whether it did. See
+ * [`crate::RequestOutcomes`] for the full contract.
+ *
+ * `fallow flags` accepts `--changed-since`, and an unresolvable ref widens
+ * the scan to the whole project rather than failing the run. Until this
+ * member existed the only account of that was a stderr line, which `--quiet`
+ * removes, so a flag inventory read as scoped to the change could silently
+ * be the whole project's (issue #2734).
+ *
+ * The command applies no diff filter, so the object carries the
+ * `changed-since` entry only. Omitted when the run was asked for nothing,
+ * which keeps a scan that passed no narrowing flag byte-identical and moves
+ * no `schema_version`.
+ */
+request_outcomes?: (RequestOutcomes | null)
+/**
  * Detected feature-flag findings.
  */
 feature_flags: FeatureFlagFinding[]
@@ -14644,6 +14696,22 @@ invalid_value?: (string | null)
  */
 export interface SuppressionInventoryOutput {
 schema_version: SuppressionInventorySchemaVersion
+/**
+ * What the run was asked to narrow and whether it did. See
+ * [`crate::RequestOutcomes`] for the full contract.
+ *
+ * `fallow suppressions` accepts `--changed-since`, and an unresolvable ref
+ * widens the inventory to the whole project rather than failing the run.
+ * Until this member existed the only account of that was a stderr line,
+ * which `--quiet` removes, so an inventory read as scoped to the change
+ * could silently be the whole project's (issue #2734).
+ *
+ * The command applies no diff filter, so the object carries the
+ * `changed-since` entry only. Omitted when the run was asked for nothing,
+ * which keeps an inventory that passed no narrowing flag byte-identical and
+ * leaves `schema_version` at `1`.
+ */
+request_outcomes?: (RequestOutcomes | null)
 summary: SuppressionInventorySummary
 /**
  * Per-file suppression listings, sorted by path then line.
