@@ -40,12 +40,21 @@ define_plugin!(
             config_parser::extract_config_string_or_array(source, config_path, &["entry"]);
         let context = config_parser::extract_config_path(source, config_path, &["context"])
             .and_then(|raw| config_parser::normalize_config_path_buf(&raw, config_path, root));
-        result.extend_entry_patterns(entries.into_iter().map(|entry| {
+        result.extend_entry_patterns_or_dependencies(entries.into_iter().map(|entry| {
             context
                 .as_ref()
                 .map(|context| normalize_context_entry(&entry, context, config_path, root))
                 .unwrap_or(entry)
         }));
+
+        super::module_federation::apply_bundler_plugin_options(
+            &mut result,
+            source,
+            config_path,
+            root,
+            context.as_deref(),
+            "webpack",
+        );
 
         for (find, replacement) in
             config_parser::extract_config_path_aliases(source, config_path, &["resolve", "alias"])
@@ -261,14 +270,107 @@ mod tests {
         );
         assert_eq!(
             result.entry_patterns,
+            vec!["src/app.js", "src/admin-polyfill.js", "src/admin.js"]
+        );
+        let deps = &result.referenced_dependencies;
+        assert!(deps.contains(&"react".to_string()));
+        assert!(deps.contains(&"react-dom".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_entry_module_request_is_credited_as_dependency() {
+        let source = r#"
+            module.exports = {
+                entry: ["react-hot-loader/patch", "./src/index.tsx"],
+            };
+        "#;
+        let plugin = WebpackPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/webpack.config.js"),
+            source,
+            std::path::Path::new("/project"),
+        );
+        assert_eq!(result.entry_patterns, vec!["src/index.tsx"]);
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"react-hot-loader".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_config_entry_module_request_keeps_its_resource_query_out_of_the_package() {
+        let source = r#"
+            module.exports = {
+                entry: [
+                    "webpack-hot-middleware/client?reload=true",
+                    "react-hot-loader/patch",
+                    "./src/index.ts",
+                ],
+            };
+        "#;
+        let plugin = WebpackPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/webpack.config.js"),
+            source,
+            std::path::Path::new("/project"),
+        );
+        assert_eq!(result.entry_patterns, vec!["src/index.ts"]);
+        let deps = &result.referenced_dependencies;
+        assert!(deps.contains(&"webpack-hot-middleware".to_string()));
+        assert!(deps.contains(&"react-hot-loader".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_keeps_glob_shaped_entries_as_patterns() {
+        let source = r#"
+            module.exports = {
+                entry: [
+                    "src/glob-like/**",
+                    "src/pages/*.entry.ts",
+                    "src/{a,b}/main",
+                    "src/pag?.ts",
+                    "src/pag?/main",
+                ],
+            };
+        "#;
+        let plugin = WebpackPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/webpack.config.js"),
+            source,
+            std::path::Path::new("/project"),
+        );
+        assert_eq!(
+            result.entry_patterns,
             vec![
-                "src/app.js",
-                "src/admin-polyfill.js",
-                "src/admin.js",
-                "react",
-                "react-dom",
+                "src/glob-like/**",
+                "src/pages/*.entry.ts",
+                "src/{a,b}/main",
+                "src/pag?.ts",
+                "src/pag?/main",
             ]
         );
+        assert!(result.referenced_dependencies.is_empty());
+    }
+
+    #[test]
+    fn resolve_config_keeps_relative_and_absolute_entries_as_patterns() {
+        let source = r#"
+            module.exports = {
+                entry: ["./src/relative.js", "src/bare.js", "/src/absolute.js"],
+            };
+        "#;
+        let plugin = WebpackPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/webpack.config.js"),
+            source,
+            std::path::Path::new("/project"),
+        );
+        assert_eq!(
+            result.entry_patterns,
+            vec!["src/relative.js", "src/bare.js", "/src/absolute.js"]
+        );
+        assert!(result.referenced_dependencies.is_empty());
     }
 
     #[test]
@@ -293,14 +395,11 @@ mod tests {
         );
         assert_eq!(
             result.entry_patterns,
-            vec![
-                "app/main.ts",
-                "app/admin-polyfill.ts",
-                "app/admin.ts",
-                "react",
-                "react-dom",
-            ]
+            vec!["app/main.ts", "app/admin-polyfill.ts", "app/admin.ts"]
         );
+        let deps = &result.referenced_dependencies;
+        assert!(deps.contains(&"react".to_string()));
+        assert!(deps.contains(&"react-dom".to_string()));
     }
 
     #[test]
@@ -459,5 +558,56 @@ mod tests {
                 ("@utils".to_string(), "src/utils".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn resolve_config_reads_inline_module_federation_options() {
+        let source = r#"
+            const { ModuleFederationPlugin } = require("webpack").container;
+
+            module.exports = {
+                plugins: [
+                    new ModuleFederationPlugin({
+                        name: "host",
+                        exposes: { "./Button": "./src/Button.tsx" },
+                        remotes: { checkout: "checkout@https://example.test/remoteEntry.js" },
+                    }),
+                ],
+            };
+        "#;
+        let plugin = WebpackPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/webpack.config.js"),
+            source,
+            std::path::Path::new("/project"),
+        );
+
+        assert_eq!(result.entry_patterns, vec!["src/Button.tsx"]);
+        assert_eq!(result.provided_dependencies.len(), 1);
+        assert!(result.provided_dependencies[0].covers_specifier("checkout/Button"));
+    }
+
+    #[test]
+    fn resolve_config_context_roots_exposed_federation_targets() {
+        let source = r#"
+            const path = require("path");
+
+            module.exports = {
+                context: path.resolve(__dirname, "app"),
+                plugins: [
+                    new ModuleFederationPlugin({
+                        exposes: { "./B": "./src/B.tsx" },
+                    }),
+                ],
+            };
+        "#;
+        let plugin = WebpackPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/webpack.config.js"),
+            source,
+            std::path::Path::new("/project"),
+        );
+
+        assert_eq!(result.entry_patterns, vec!["app/src/B.tsx"]);
     }
 }

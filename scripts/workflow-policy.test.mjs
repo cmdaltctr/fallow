@@ -514,7 +514,11 @@ test("release publication waits for the aggregate verification gate", () => {
     ],
     [vscodeOpenVsx, "Open VSX", "ovsx", vscodePackage.devDependencies.ovsx, "OVSX_PAT", "VSCE_PAT"],
   ]) {
-    assert.match(job, /needs: \[vscode-prep, vscode-host-smoke, release-assets\]/, registry);
+    assert.match(
+      job,
+      /needs: \[vscode-prep, vscode-host-smoke, release-assets, npm-root-approved\]/,
+      registry,
+    );
     assert.match(job, /permissions: \{\}/, registry);
     assert.match(
       job,
@@ -564,10 +568,110 @@ test("release publication waits for the aggregate verification gate", () => {
   assert.doesNotMatch(vscodePublicVerify, /secrets\.|_PAT|npm install|pnpm install/u);
   assert.match(
     releaseReady,
-    /needs: \[publish-crates, npm-publish, vscode-public-verify, release-assets\]/,
+    /needs: \[publish-crates, npm-publish, npm-root-approved, vscode-public-verify, release-assets\]/,
   );
   assert.match(releaseReady, /permissions:\n\s+contents: read/);
   assert.match(releaseReady, /Release tag .* appeared before the release workflow completed/u);
+});
+
+test("release stages the fallow npm root for maintainer approval", () => {
+  const workflow = readWorkflow(".github/workflows/release.yml");
+  const npmPublish = indentedBlock(workflow, "npm-publish", 2);
+  const security = readFileSync("docs/development/release-security.md", "utf8");
+  const stageCalls = npmPublish.match(/^\s+stage_output=\$\(.*npm stage publish /gmu) ?? [];
+  const stagedBranch = npmPublish.indexOf('if is_staged_name "$name"; then');
+  const directPublish = npmPublish.indexOf('if ! npm publish "$file"');
+
+  assert.match(npmPublish, /^\s+STAGED_NAMES=\("fallow"\)$/mu);
+  assert.equal(stageCalls.length, 1, "npm-publish must make exactly one stage call");
+  assert.match(
+    npmPublish,
+    /NODE_AUTH_TOKEN="" npm stage publish "\$file" --access public --provenance --ignore-scripts/u,
+  );
+  assert.notEqual(stagedBranch, -1, "staged names must branch before the direct publish");
+  assert.ok(stagedBranch < directPublish, "a staged name must never reach npm publish");
+  assert.match(
+    npmPublish.slice(stagedBranch, directPublish),
+    /index=\$\(\(index \+ 1\)\)\n\s+continue\n\s+fi\n\s*$/u,
+    "the staged branch must end by skipping the direct publish",
+  );
+  assert.match(npmPublish, /grep -q '\^npm error code E409\$'/u);
+  assert.match(npmPublish, /npm install -g --ignore-scripts npm@11\.19\.0/u);
+  assert.match(security, /Stage the `fallow` npm root, never publish it from the workflow/u);
+  assert.match(security, /exactly one `npm stage publish` call/u);
+});
+
+test("release publishes no VSIX before the approved fallow root is public", () => {
+  const workflow = readWorkflow(".github/workflows/release.yml");
+  const npmPublish = indentedBlock(workflow, "npm-publish", 2);
+  const gate = indentedBlock(workflow, "npm-root-approved", 2);
+  const marketplace = indentedBlock(workflow, "vscode-publish-marketplace", 2);
+  const openVsx = indentedBlock(workflow, "vscode-publish-open-vsx", 2);
+  const security = readFileSync("docs/development/release-security.md", "utf8");
+  const procedure = readFileSync("docs/development/release-procedure.md", "utf8");
+
+  assert.match(npmPublish, /^\s+id: publish$/mu);
+  assert.match(npmPublish, /fallow_sha256: \$\{\{ steps\.publish\.outputs\.fallow_sha256 \}\}/u);
+  assert.match(npmPublish, /echo "fallow_sha256=\$digest" >> "\$GITHUB_OUTPUT"/u);
+  assert.match(gate, /^\s+needs: npm-publish$/mu);
+  assert.match(gate, /permissions:\n\s+contents: read/u);
+  assert.doesNotMatch(gate, /^\s+environment:|secrets\.|id-token: write|actions\/checkout/mu);
+  assert.match(gate, /EXPECTED_SHA256: \$\{\{ needs\.npm-publish\.outputs\.fallow_sha256 \}\}/u);
+  assert.match(gate, /curl -fsS[^\n]*"\$\{REGISTRY\}\/fallow\/\$\{VERSION\}"/u);
+  assert.match(gate, /sha256sum fallow-public\.tgz/u);
+  assert.match(gate, /"\$actual_sha256" != "\$EXPECTED_SHA256"/u);
+  assert.match(gate, /rerun the failed jobs of this run/u);
+  assert.match(gate, /^\s+timeout-minutes: 360$/mu);
+  assert.match(gate, /WAIT_MINUTES: '3[0-5][0-9]'/u);
+  for (const publisher of [marketplace, openVsx]) {
+    assert.match(
+      publisher,
+      /needs: \[vscode-prep, vscode-host-smoke, release-assets, npm-root-approved\]/u,
+    );
+  }
+  assert.match(security, /Publish no VSIX before the approved `fallow` root is public/u);
+  assert.match(procedure, /Wait for the approved fallow root/u);
+  assert.match(procedure, /Do this right after\s+`release-ready` without other work in between/u);
+});
+
+test("release credential jobs run in the main-only release environment", () => {
+  const workflow = readWorkflow(".github/workflows/release.yml");
+  const procedure = readFileSync("docs/development/release-procedure.md", "utf8");
+  const security = readFileSync("docs/development/release-security.md", "utf8");
+  const credentialJobs = [
+    "build",
+    "npm-publish",
+    "publish-crates",
+    "vscode-publish-marketplace",
+    "vscode-publish-open-vsx",
+  ];
+  const jobNames = Array.from(
+    indentedBlock(workflow, "jobs", 0).matchAll(/^ {2}([a-z][a-z0-9-]*):$/gmu),
+    (match) => match[1],
+  );
+  const environmentJobs = [];
+
+  for (const name of jobNames) {
+    const job = indentedBlock(workflow, name, 2);
+    const inEnvironment = /^ {4}environment: release$/mu.test(job);
+    const holdsCredentials =
+      /\$\{\{\s*secrets\.(?!GITHUB_TOKEN\b)/u.test(job) || /^\s+id-token: write$/mu.test(job);
+
+    if (inEnvironment) {
+      environmentJobs.push(name);
+    }
+    assert.ok(
+      !holdsCredentials || inEnvironment,
+      `${name} holds publication credentials outside the release environment`,
+    );
+    assert.doesNotMatch(job, /^ {4}environment:(?! release$)/mu);
+  }
+
+  assert.deepEqual(environmentJobs.toSorted(), credentialJobs);
+  assert.match(procedure, /environments\/release\/deployment-branch-policies/u);
+  assert.match(procedure, /exists at both levels; delete the repository copy/u);
+  assert.match(procedure, /unprotected by the release environment/u);
+  assert.match(security, /Its deployment branch policy admits `main` only/u);
 });
 
 test("release keeps the version tag last and requires curated public notes", () => {
@@ -580,7 +684,9 @@ test("release keeps the version tag last and requires curated public notes", () 
   const assembleStep = releaseAssets.indexOf("- name: Assemble release asset bundle");
   const uploadStep = releaseAssets.indexOf("- name: Upload release asset bundle");
   const workflowDispatch = procedure.indexOf("gh workflow run release.yml");
-  const downloadBundle = procedure.indexOf('gh run download "$RUN_ID"');
+  const downloadBundle = procedure.indexOf("--name release-assets");
+  const stageDigestCheck = procedure.indexOf('test "$BUILT" = "$STAGED"');
+  const stageApprove = procedure.indexOf('npm stage approve "$STAGE_ID"');
   const signedTag = procedure.indexOf('git tag -s "$TAG"');
   const createRelease = procedure.indexOf('gh release create "$TAG"');
 
@@ -637,6 +743,15 @@ test("release keeps the version tag last and requires curated public notes", () 
   assert.notEqual(createRelease, -1, "procedure must create the immutable release");
   assert.ok(workflowDispatch < downloadBundle, "workflow must complete before asset download");
   assert.ok(downloadBundle < signedTag, "asset bundle must exist before tag creation");
+  assert.notEqual(
+    stageDigestCheck,
+    -1,
+    "procedure must compare the staged root with the run artifact",
+  );
+  assert.notEqual(stageApprove, -1, "procedure must approve the staged fallow root");
+  assert.ok(workflowDispatch < stageDigestCheck, "workflow must complete before the stage check");
+  assert.ok(stageDigestCheck < stageApprove, "staged bytes must be verified before approval");
+  assert.ok(stageApprove < signedTag, "the staged root must be approved before tag creation");
   assert.ok(signedTag < createRelease, "signed tag must exist before release creation");
 });
 

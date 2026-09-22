@@ -309,15 +309,20 @@ pub enum WorkspaceDiagnosticKind {
         /// Scoring error text.
         error: String,
     },
-    /// Churn-based hotspot analysis was skipped because the project root is not
-    /// a git repository, so the hotspots, churn and ownership sections report
-    /// nothing at all. The remaining health sections are unaffected.
-    ///
-    /// Carries no payload: the other two skip paths (a malformed `--since`, a
-    /// `--churn-file` that became unreadable after validation) route through
-    /// `tracing` rather than a user-facing note and are not part of this kind
-    /// yet.
-    HotspotsSkipped,
+    /// Churn-based hotspot analysis was skipped, so the hotspots, churn and
+    /// ownership sections report nothing at all. The remaining health sections
+    /// are unaffected.
+    HotspotsSkipped {
+        /// Which input stopped it, as a kebab-case token: `not-a-repository`,
+        /// `invalid-since` or `churn-file-unreadable`. The set is open.
+        ///
+        /// The cause decides the remedy, which is why it is on the wire: a run
+        /// outside a repository is fixed by running fallow inside one, a
+        /// malformed `--since` by respelling the flag, and a churn file that
+        /// changed under the run by rerunning it. A consumer reading only the
+        /// kind would offer the first remedy for all three.
+        cause: String,
+    },
     /// The repository is a shallow clone, so churn is measured over the fetched
     /// history only and every hotspot figure is incomplete.
     ShallowClone {
@@ -344,6 +349,71 @@ pub enum WorkspaceDiagnosticKind {
     TrendSnapshotUnreadable {
         /// Filesystem or JSON error text.
         error: String,
+    },
+    /// A framework plugin read a build config and could not read one of its
+    /// keys in full, so part of what the key declares never reached the
+    /// analysis. `path` names the config file.
+    ///
+    /// The reader is syntactic, so a key whose value is computed at build time
+    /// is invisible to it: a Module Federation `exposes: makeExposes()` or a
+    /// `remotes` map spread from an environment module declares entries this
+    /// run does not know about. The consequence is a finding, not a missing
+    /// number: an unread `exposes` target is not registered as an entry point
+    /// and its file can surface as `unused-file`, and an unread `remotes` alias
+    /// is not treated as provided by a remote container and its import can
+    /// surface as an unlisted dependency.
+    ///
+    /// Recorded by the plugin stage, which runs before analysis and is not
+    /// cached, so the entry is present on a warm cache too. It used to be a
+    /// bare `tracing::warn!` from inside the plugin, so it reached no envelope
+    /// and no CI consumer (issue #2736).
+    PluginConfigUnreadable {
+        /// The plugin that read the config, as it labels itself:
+        /// `module-federation` for a standalone `module-federation.config.*`,
+        /// or the bundler plugin (`webpack`, `rspack`, `rsbuild`, `vite`) that
+        /// read the same options inline from its own config.
+        plugin: String,
+        /// The config key that was present and not fully readable (`exposes`,
+        /// `remotes`). The set is open.
+        key: String,
+        /// Why it could not be read, as a kebab-case token:
+        /// `not-object-literal`, `array-form`, `spread` or
+        /// `unreadable-entries`. The set is open.
+        ///
+        /// The reason decides the remedy, which is why it is on the wire: a
+        /// value that is not an object literal is fixed by writing one, while
+        /// unreadable entries are fixed by naming those entries in the config
+        /// option the message points at.
+        reason: String,
+    },
+    /// A framework plugin read a config key it understands, does not model
+    /// that key's effect, and therefore stood a modeled default down. `path`
+    /// names the config file.
+    ///
+    /// The Nuxt auto-import gate is the case this exists for. With
+    /// `autoImports` enabled fallow drops the Nuxt convention entry patterns
+    /// so a genuinely unreferenced convention file is reported, and a
+    /// `components:` or `imports:` block whose effect it cannot model keeps
+    /// them, which silently costs the user the findings they opted in for.
+    ///
+    /// Deliberately NOT one of the [`Self::warns_on_stderr`] kinds. Nothing
+    /// was lost that the run could have measured: the patterns stayed, so
+    /// findings are suppressed rather than invented, and a project in this
+    /// state would otherwise warn on every run forever with "write different
+    /// config" as the only remedy, which is the reason
+    /// `boundaries-not-configured` is off stderr as well.
+    PluginEffectNotModeled {
+        /// The plugin that read the config, as it labels itself (`nuxt`).
+        plugin: String,
+        /// The config key whose effect is not modeled (`components`,
+        /// `imports`). The set is open.
+        key: String,
+        /// Why the effect is not modeled, as a kebab-case token:
+        /// `key-effect-not-modeled` when the key's own value is the reason,
+        /// `config-property-unreadable` when a top-level property of the same
+        /// config file could not be read statically, so no surface in it can
+        /// be classified at all. The set is open.
+        reason: String,
     },
     /// Test coverage was auto-detected on disk rather than passed with
     /// `--coverage`, and `path` names the file that fed the CRAP scores.
@@ -380,11 +450,13 @@ impl WorkspaceDiagnosticKind {
             Self::ExcludedByDefaultIgnore { .. } => "excluded-by-default-ignore",
             Self::NoSourceFilesAnalyzed { .. } => "no-source-files-analyzed",
             Self::FileScoresUnavailable { .. } => "file-scores-unavailable",
-            Self::HotspotsSkipped => "hotspots-skipped",
+            Self::HotspotsSkipped { .. } => "hotspots-skipped",
             Self::ShallowClone { .. } => "shallow-clone",
             Self::UnpinnedClock => "unpinned-clock",
             Self::OwnershipUnavailable { .. } => "ownership-unavailable",
             Self::TrendSnapshotUnreadable { .. } => "trend-snapshot-unreadable",
+            Self::PluginConfigUnreadable { .. } => "plugin-config-unreadable",
+            Self::PluginEffectNotModeled { .. } => "plugin-effect-not-modeled",
             Self::CoverageAutoDetected => "coverage-auto-detected",
         }
     }
@@ -407,12 +479,20 @@ impl WorkspaceDiagnosticKind {
     /// the provenance of an input that DID load, so a consumer sentence about a
     /// degraded run would state something untrue about it. Its own note is
     /// printed by the health pipeline.
+    ///
+    /// `plugin-effect-not-modeled` answers false for the first reason: the
+    /// config was readable and nothing the run could have measured was lost,
+    /// so it would warn forever on a project whose `nuxt.config` fallow does
+    /// not model. Its sibling `plugin-config-unreadable` answers true, because
+    /// there a declaration the user wrote did not reach the analysis and
+    /// findings can be wrong in either direction.
     #[must_use]
     pub const fn warns_on_stderr(&self) -> bool {
         match self {
             Self::BoundariesNotConfigured
             | Self::RulePacksNotConfigured
             | Self::ExcludedByDefaultIgnore { .. }
+            | Self::PluginEffectNotModeled { .. }
             | Self::CoverageAutoDetected => false,
             Self::UndeclaredWorkspace
             | Self::MalformedPackageJson { .. }
@@ -431,11 +511,12 @@ impl WorkspaceDiagnosticKind {
             | Self::NodeModulesMissing
             | Self::NoSourceFilesAnalyzed { .. }
             | Self::FileScoresUnavailable { .. }
-            | Self::HotspotsSkipped
+            | Self::HotspotsSkipped { .. }
             | Self::ShallowClone { .. }
             | Self::UnpinnedClock
             | Self::OwnershipUnavailable { .. }
-            | Self::TrendSnapshotUnreadable { .. } => true,
+            | Self::TrendSnapshotUnreadable { .. }
+            | Self::PluginConfigUnreadable { .. } => true,
         }
     }
 
@@ -550,11 +631,13 @@ impl WorkspaceDiagnosticKind {
             | Self::ExcludedByDefaultIgnore { .. }
             | Self::NoSourceFilesAnalyzed { .. }
             | Self::FileScoresUnavailable { .. }
-            | Self::HotspotsSkipped
+            | Self::HotspotsSkipped { .. }
             | Self::ShallowClone { .. }
             | Self::UnpinnedClock
             | Self::OwnershipUnavailable { .. }
             | Self::TrendSnapshotUnreadable { .. }
+            | Self::PluginConfigUnreadable { .. }
+            | Self::PluginEffectNotModeled { .. }
             | Self::CoverageAutoDetected => false,
         }
     }
@@ -596,11 +679,13 @@ impl WorkspaceDiagnosticKind {
             | Self::ExcludedByDefaultIgnore { .. }
             | Self::NoSourceFilesAnalyzed { .. }
             | Self::FileScoresUnavailable { .. }
-            | Self::HotspotsSkipped
+            | Self::HotspotsSkipped { .. }
             | Self::ShallowClone { .. }
             | Self::UnpinnedClock
             | Self::OwnershipUnavailable { .. }
             | Self::TrendSnapshotUnreadable { .. }
+            | Self::PluginConfigUnreadable { .. }
+            | Self::PluginEffectNotModeled { .. }
             | Self::CoverageAutoDetected => false,
         }
     }
@@ -625,7 +710,7 @@ impl WorkspaceDiagnosticKind {
     pub const fn is_health_stage(&self) -> bool {
         match self {
             Self::FileScoresUnavailable { .. }
-            | Self::HotspotsSkipped
+            | Self::HotspotsSkipped { .. }
             | Self::ShallowClone { .. }
             | Self::UnpinnedClock
             | Self::OwnershipUnavailable { .. }
@@ -649,7 +734,60 @@ impl WorkspaceDiagnosticKind {
             | Self::BoundariesNotConfigured
             | Self::RulePacksNotConfigured
             | Self::ExcludedByDefaultIgnore { .. }
+            | Self::PluginConfigUnreadable { .. }
+            | Self::PluginEffectNotModeled { .. }
             | Self::NoSourceFilesAnalyzed { .. } => false,
+        }
+    }
+
+    /// Whether this diagnostic is recorded by the PLUGIN stage (framework
+    /// plugins reading their own build configs) rather than by workspace
+    /// discovery, source discovery, the analyze stage or the health pipeline.
+    ///
+    /// Plugin-stage diagnostics are recorded after config load, so
+    /// `stash_workspace_diagnostics` must preserve them across combined mode's
+    /// per-analysis config re-loads, and each plugin run replaces the previous
+    /// run's set so a fixed config drops out on the next run (issue #2736).
+    ///
+    /// They are deliberately NOT [`Self::is_analysis_stage`], although they
+    /// share both of those properties. That predicate additionally means "the
+    /// dead-code analyze pass re-records this", and the pass clears every kind
+    /// answering it on entry. Plugins run in the prelude of that same pass, so
+    /// a plugin-stage kind classified there would be wiped inside the run that
+    /// produced it.
+    ///
+    /// The match is exhaustive on purpose: a new kind must be classified here
+    /// before it compiles.
+    #[must_use]
+    pub const fn is_plugin_stage(&self) -> bool {
+        match self {
+            Self::PluginConfigUnreadable { .. } | Self::PluginEffectNotModeled { .. } => true,
+            Self::UndeclaredWorkspace
+            | Self::MalformedPackageJson { .. }
+            | Self::GlobMatchedNoPackageJson { .. }
+            | Self::MalformedTsconfig { .. }
+            | Self::TsconfigReferenceDirMissing
+            | Self::MalformedPnpmWorkspaceYaml { .. }
+            | Self::SkippedLargeFile { .. }
+            | Self::SkippedMinifiedFile { .. }
+            | Self::SkippedSourceDotdir
+            | Self::SourceReadFailure { .. }
+            | Self::SourceParseDegraded { .. }
+            | Self::BunLockbOverrideResolutionSkipped
+            | Self::BunLockOverrideResolutionSkipped
+            | Self::BunResolutionsShadowedByOverrides
+            | Self::NodeModulesMissing
+            | Self::BoundariesNotConfigured
+            | Self::RulePacksNotConfigured
+            | Self::ExcludedByDefaultIgnore { .. }
+            | Self::NoSourceFilesAnalyzed { .. }
+            | Self::FileScoresUnavailable { .. }
+            | Self::HotspotsSkipped { .. }
+            | Self::ShallowClone { .. }
+            | Self::UnpinnedClock
+            | Self::OwnershipUnavailable { .. }
+            | Self::TrendSnapshotUnreadable { .. }
+            | Self::CoverageAutoDetected => false,
         }
     }
 }
@@ -956,6 +1094,50 @@ pub fn glob_first_literal_segment(pattern: &str) -> Option<&str> {
     })
 }
 
+/// The clause naming why a plugin could not read a config key in full, for one
+/// `plugin-config-unreadable` reason token.
+///
+/// The token set is open, so an unrecognised token renders the general claim
+/// rather than nothing: a diagnostic from a plugin added later still reads as a
+/// sentence.
+fn unreadable_situation(reason: &str) -> &'static str {
+    match reason {
+        "array-form" => "uses the array form, which is not read yet",
+        "spread" => "spreads a value that is not statically readable",
+        "unreadable-entries" => "has entries that hold no statically readable value",
+        "not-object-literal" => "is not a static object literal",
+        _ => "could not be read statically",
+    }
+}
+
+/// What an unread config key costs, and the configuration option that covers
+/// the gap.
+///
+/// Keyed on the config KEY rather than on the plugin name, because one key is
+/// read by several plugins: Module Federation `exposes` and `remotes` reach a
+/// build from a standalone config file and inline from the webpack, rspack,
+/// rsbuild and vite configs, and both the consequence and the remedy are the
+/// same in all five. A key this build does not know falls back to the general
+/// claim rather than borrowing another key's remedy, so a plugin added later
+/// still renders a sentence that is true.
+fn unreadable_key_consequence(key: &str) -> (&'static str, &'static str) {
+    match key {
+        "exposes" => (
+            "the targets are not registered as entry points",
+            "Name the exposed files in `dynamicallyLoaded`.",
+        ),
+        "remotes" => (
+            "the aliases are not treated as provided by a remote container",
+            "Name the aliases in `ignoreDependencies`, or declare them as the keys of an object \
+             literal, whose values may be computed.",
+        ),
+        _ => (
+            "what it declares is not fully registered",
+            "Declare the value as a static object literal.",
+        ),
+    }
+}
+
 fn render_message(root: &Path, path: &Path, kind: &WorkspaceDiagnosticKind) -> String {
     let display = display_relative(root, path);
     match kind {
@@ -1085,13 +1267,27 @@ fn render_message(root: &Path, path: &Path, kind: &WorkspaceDiagnosticKind) -> S
              project has nothing to score. Rerun with --no-cache, or scope the run to a \
              subdirectory to find the input that fails."
         ),
-        WorkspaceDiagnosticKind::HotspotsSkipped => {
-            "Hotspot analysis was skipped because no git repository was found at the project \
-             root, so the hotspots, churn and ownership sections report nothing rather than \
-             zero. Run fallow inside the repository, or pass --churn-file with exported change \
-             history."
-                .to_owned()
-        }
+        WorkspaceDiagnosticKind::HotspotsSkipped { cause } => match cause.as_str() {
+            "invalid-since" => "Hotspot analysis was skipped because --since could not be read \
+                 as a time window, so the hotspots, churn and ownership sections report nothing \
+                 rather than zero. Spell it as a duration such as 6m or 90d, or drop it to use \
+                 the default window."
+                .to_owned(),
+            "churn-file-unreadable" => format!(
+                "Hotspot analysis was skipped because the churn file '{display}' could no longer \
+                 be read after it was validated, so the hotspots, churn and ownership sections \
+                 report nothing rather than zero. Make sure nothing rewrites the file while \
+                 fallow runs, and rerun."
+            ),
+            // The original single cause, whose wording predates the token and
+            // is kept byte-identical: a consumer matching on this sentence is
+            // reading the same run it always was.
+            _ => "Hotspot analysis was skipped because no git repository was found at the \
+                  project root, so the hotspots, churn and ownership sections report nothing \
+                  rather than zero. Run fallow inside the repository, or pass --churn-file with \
+                  exported change history."
+                .to_owned(),
+        },
         WorkspaceDiagnosticKind::ShallowClone {
             ownership_requested,
         } => {
@@ -1138,6 +1334,41 @@ fn render_message(root: &Path, path: &Path, kind: &WorkspaceDiagnosticKind) -> S
              CRAP scores depend on whichever coverage file is on disk at run time. Pass --coverage \
              '{display}' explicitly for reproducible scores."
         ),
+        WorkspaceDiagnosticKind::PluginConfigUnreadable {
+            plugin,
+            key,
+            reason,
+        } => {
+            let (consequence, advice) = unreadable_key_consequence(key);
+            format!(
+                "Plugin '{plugin}': `{key}` in '{display}' {situation}, so {consequence}. {advice}",
+                situation = unreadable_situation(reason)
+            )
+        }
+        WorkspaceDiagnosticKind::PluginEffectNotModeled {
+            plugin,
+            key,
+            reason,
+        } => {
+            // Two causes, one effect, one remedy. Each cause gets its own
+            // sentence: the cause and the effect on the findings are separate
+            // facts, and one sentence with two `so` clauses states neither fact
+            // clearly.
+            let effect = "`autoImports` kept the convention entry patterns for that surface, and \
+                          fallow reports no unused file there. Write the setting as static \
+                          literals, or remove the key to use the framework defaults.";
+            if reason == "config-property-unreadable" {
+                format!(
+                    "Plugin '{plugin}': fallow cannot read a top-level property in '{display}', so \
+                     it cannot classify the `{key}` surface. {effect}"
+                )
+            } else {
+                format!(
+                    "Plugin '{plugin}': fallow does not model the effect of `{key}` in \
+                     '{display}'. {effect}"
+                )
+            }
+        }
         WorkspaceDiagnosticKind::ExcludedByDefaultIgnore {
             pattern,
             file_count,
@@ -2000,7 +2231,9 @@ mod tests {
             WorkspaceDiagnosticKind::FileScoresUnavailable {
                 error: "boom".to_owned(),
             },
-            WorkspaceDiagnosticKind::HotspotsSkipped,
+            WorkspaceDiagnosticKind::HotspotsSkipped {
+                cause: "not-a-repository".to_owned(),
+            },
             WorkspaceDiagnosticKind::ShallowClone {
                 ownership_requested: true,
             },
@@ -2038,7 +2271,10 @@ mod tests {
     #[test]
     fn only_the_coverage_provenance_kind_does_not_degrade_the_analysis() {
         assert!(
-            WorkspaceDiagnosticKind::HotspotsSkipped.warns_on_stderr(),
+            WorkspaceDiagnosticKind::HotspotsSkipped {
+                cause: "invalid-since".to_owned(),
+            }
+            .warns_on_stderr(),
             "a skipped hotspot section is a degraded result"
         );
         assert!(
@@ -2049,6 +2285,56 @@ mod tests {
             !WorkspaceDiagnosticKind::CoverageAutoDetected.warns_on_stderr(),
             "auto-detected coverage loaded fine and degraded nothing"
         );
+    }
+
+    /// Each skip cause carries its own remedy, and the original cause's wording
+    /// is frozen: it shipped before the token existed, so a reader who matched
+    /// on that sentence must still match on it.
+    #[test]
+    fn every_hotspot_skip_cause_renders_its_own_remedy() {
+        let root = Path::new("/project");
+        let skipped = |cause: &str, path: PathBuf| {
+            WorkspaceDiagnostic::new(
+                root,
+                path,
+                WorkspaceDiagnosticKind::HotspotsSkipped {
+                    cause: cause.to_owned(),
+                },
+            )
+        };
+
+        let no_repo = skipped("not-a-repository", root.to_path_buf());
+        assert_eq!(
+            no_repo.message,
+            "Hotspot analysis was skipped because no git repository was found at the project \
+             root, so the hotspots, churn and ownership sections report nothing rather than \
+             zero. Run fallow inside the repository, or pass --churn-file with exported change \
+             history."
+        );
+
+        let bad_since = skipped("invalid-since", root.to_path_buf());
+        assert!(
+            bad_since.message.contains("--since")
+                && bad_since.message.contains("6m or 90d")
+                && !bad_since.message.contains("no git repository"),
+            "a malformed window is respelled, not moved into a repository: {}",
+            bad_since.message
+        );
+
+        let churn = skipped("churn-file-unreadable", root.join("build/churn.json"));
+        assert!(
+            churn.message.contains("'build/churn.json'") && churn.message.contains("rerun"),
+            "the remedy names the file that changed under the run: {}",
+            churn.message
+        );
+
+        for diagnostic in [&no_repo, &bad_since, &churn] {
+            assert!(
+                diagnostic.degrades_analysis,
+                "every skip leaves the hotspot sections unmeasured: {}",
+                diagnostic.message
+            );
+        }
     }
 
     /// The message is the only prose a consumer renders, so each one must name
@@ -2116,6 +2402,199 @@ mod tests {
             ownership.message.contains("botPatterns"),
             "the two causes render different remedies: {}",
             ownership.message
+        );
+    }
+
+    fn plugin_unreadable(key: &str, reason: &str) -> WorkspaceDiagnostic {
+        WorkspaceDiagnostic::new(
+            Path::new("/project"),
+            PathBuf::from("/project/module-federation.config.ts"),
+            WorkspaceDiagnosticKind::PluginConfigUnreadable {
+                plugin: "module-federation".to_owned(),
+                key: key.to_owned(),
+                reason: reason.to_owned(),
+            },
+        )
+    }
+
+    fn plugin_not_modeled(key: &str, reason: &str) -> WorkspaceDiagnostic {
+        WorkspaceDiagnostic::new(
+            Path::new("/project"),
+            PathBuf::from("/project/nuxt.config.ts"),
+            WorkspaceDiagnosticKind::PluginEffectNotModeled {
+                plugin: "nuxt".to_owned(),
+                key: key.to_owned(),
+                reason: reason.to_owned(),
+            },
+        )
+    }
+
+    /// The plugin stage is its own stage: classified there and nowhere else, so
+    /// the stash preserve keeps it and no other stage's clear wipes it.
+    #[test]
+    fn plugin_stage_kinds_are_classified_as_plugin_stage_and_nothing_else() {
+        for kind in [
+            WorkspaceDiagnosticKind::PluginConfigUnreadable {
+                plugin: "module-federation".to_owned(),
+                key: "exposes".to_owned(),
+                reason: "not-object-literal".to_owned(),
+            },
+            WorkspaceDiagnosticKind::PluginEffectNotModeled {
+                plugin: "nuxt".to_owned(),
+                key: "components".to_owned(),
+                reason: "key-effect-not-modeled".to_owned(),
+            },
+        ] {
+            let id = kind.id();
+            assert!(kind.is_plugin_stage(), "{id} must be plugin-stage");
+            assert!(!kind.is_analysis_stage(), "{id} must not be analysis-stage");
+            assert!(!kind.is_health_stage(), "{id} must not be health-stage");
+            assert!(
+                !kind.is_source_discovery(),
+                "{id} must not be source-discovery"
+            );
+            assert!(
+                !kind.is_source_walk_recorded(),
+                "{id} must not be walk-recorded"
+            );
+            assert!(
+                !kind.source_never_analyzed(),
+                "{id} reports a config file, not an unread source file"
+            );
+        }
+        assert!(
+            !WorkspaceDiagnosticKind::UnpinnedClock.is_plugin_stage(),
+            "another stage's kind must not answer the plugin predicate"
+        );
+    }
+
+    /// An unread declaration costs findings in both directions, so it degrades
+    /// the analysis; an effect fallow does not model suppresses findings the
+    /// user opted into and must not warn on every run forever.
+    #[test]
+    fn only_the_unreadable_plugin_config_degrades_the_analysis() {
+        let unreadable = plugin_unreadable("exposes", "not-object-literal");
+        assert!(
+            unreadable.degrades_analysis,
+            "an unread declaration did not reach the analysis: {}",
+            unreadable.message
+        );
+        let not_modeled = plugin_not_modeled("components", "key-effect-not-modeled");
+        assert!(
+            !not_modeled.degrades_analysis,
+            "the config was readable and the patterns stayed: {}",
+            not_modeled.message
+        );
+    }
+
+    /// The reason decides the remedy, so each token renders its own situation,
+    /// and a token from a later release still renders a sentence.
+    #[test]
+    fn every_unreadable_reason_renders_its_own_situation() {
+        let cases = [
+            ("not-object-literal", "is not a static object literal"),
+            ("array-form", "uses the array form"),
+            ("spread", "spreads a value that is not statically readable"),
+            (
+                "unreadable-entries",
+                "has entries that hold no statically readable value",
+            ),
+        ];
+        for (reason, expected) in cases {
+            let diagnostic = plugin_unreadable("exposes", reason);
+            assert!(
+                diagnostic.message.contains(expected),
+                "`{reason}` must render its own situation: {}",
+                diagnostic.message
+            );
+        }
+        let unknown = plugin_unreadable("exposes", "reason-from-a-later-release");
+        assert!(
+            unknown.message.contains("could not be read statically"),
+            "an unrecognised token still renders a sentence: {}",
+            unknown.message
+        );
+    }
+
+    /// The payload carries no prose, so the remedy comes from the key: both
+    /// Module Federation keys name the option that covers the gap, and the
+    /// message names the config file the user must edit.
+    #[test]
+    fn unreadable_plugin_messages_name_the_config_file_and_the_option() {
+        let exposes = plugin_unreadable("exposes", "not-object-literal");
+        assert!(
+            exposes
+                .message
+                .contains("`exposes` in 'module-federation.config.ts'")
+                && exposes.message.contains("dynamicallyLoaded")
+                && exposes.message.starts_with("Plugin 'module-federation':"),
+            "{}",
+            exposes.message
+        );
+        let remotes = plugin_unreadable("remotes", "spread");
+        assert!(
+            remotes.message.contains("ignoreDependencies"),
+            "the two keys have different remedies: {}",
+            remotes.message
+        );
+        let unknown_key = plugin_unreadable("shared", "not-object-literal");
+        assert!(
+            !unknown_key.message.contains("dynamicallyLoaded")
+                && !unknown_key.message.contains("ignoreDependencies")
+                && unknown_key
+                    .message
+                    .contains("Declare the value as a static object literal."),
+            "a key with no documented consequence falls back to the general claim: {}",
+            unknown_key.message
+        );
+        assert!(
+            !exposes.message.contains('\n'),
+            "the sentence travels into a CI annotation and stays on one line: {}",
+            exposes.message
+        );
+    }
+
+    /// One config file can hold two unreadable keys, and the payload is what
+    /// tells them apart: the fold keys on the whole kind, so both survive.
+    #[test]
+    fn two_unreadable_keys_in_one_file_are_two_diagnostics() {
+        let merged = dedupe_workspace_diagnostics(vec![
+            plugin_unreadable("exposes", "not-object-literal"),
+            plugin_unreadable("remotes", "spread"),
+        ]);
+        assert_eq!(merged.len(), 2, "{merged:?}");
+    }
+
+    /// A surface whose own key fallow cannot model and a config file whose
+    /// top-level property it cannot read need different remedies. The two tokens
+    /// render different causes, and each cause states one fact per sentence.
+    #[test]
+    fn the_not_modeled_reasons_render_different_causes() {
+        let key = plugin_not_modeled("components", "key-effect-not-modeled");
+        assert!(
+            key.message
+                .contains("fallow does not model the effect of `components` in 'nuxt.config.ts'.")
+                && key
+                    .message
+                    .contains("`autoImports` kept the convention entry patterns"),
+            "{}",
+            key.message
+        );
+        let property = plugin_not_modeled("imports", "config-property-unreadable");
+        assert!(
+            property.message.contains(
+                "fallow cannot read a top-level property in 'nuxt.config.ts', so it cannot \
+                 classify the `imports` surface. `autoImports` kept the convention entry patterns \
+                 for that surface, and fallow reports no unused file there."
+            ),
+            "{}",
+            property.message
+        );
+        assert_eq!(
+            property.message.matches(", so ").count(),
+            1,
+            "one cause per sentence: {}",
+            property.message
         );
     }
 }

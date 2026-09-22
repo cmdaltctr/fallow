@@ -283,7 +283,7 @@ variables:
           echo "ERROR: FALLOW_SKIP_INSTALL=true but no 'fallow' binary is on PATH. Install fallow before this job (e.g. 'pnpm install' so a pinned fallow lands on PATH), or unset FALLOW_SKIP_INSTALL to let the template run 'npm install -g fallow'."
           exit 2
         fi
-        installed_version="$(fallow --version 2>/dev/null || echo 'unknown version')"
+        installed_version="$(fallow --version || echo 'unknown version')"
         echo "Skipping install; using pre-installed ${installed_version} ($(command -v fallow))"
         # Let the MR-integration script-prep block pin remote scripts to the
         # matching release tag when the binary reports an exact semver (parity
@@ -297,7 +297,7 @@ variables:
 
       requested_version="$(trim "${FALLOW_VERSION:-}")"
       root="${FALLOW_ROOT:-.}"
-      project_spec="$(project_fallow_spec "$root" 2>/dev/null || true)"
+      project_spec="$(project_fallow_spec "$root" || true)"
       project_spec="$(trim "$project_spec")"
       install_spec=""
 
@@ -338,7 +338,7 @@ variables:
 
       npm install -g --ignore-scripts "$install_arg" || { echo "ERROR: Failed to install ${install_arg}"; exit 2; }
 
-      installed_version="$(fallow --version 2>/dev/null || echo 'unknown version')"
+      installed_version="$(fallow --version || echo 'unknown version')"
       echo "Installed fallow ${installed_version}"
 
       if [ -z "$requested_version" ] && [ -n "$project_spec" ] && is_exact_version "$project_spec"; then
@@ -359,6 +359,8 @@ variables:
         if [ -d "ci/scripts" ]; then
           echo "Using vendored MR integration scripts from the repository checkout..."
 
+          # The stderr of `cp` is discarded because the `else` branch names the
+          # file that failed, and the counter below decides the job outcome.
           for f in comment.sh review.sh gitlab_common.sh; do
             if cp "ci/scripts/${f}" "${FALLOW_SCRIPTS_DIR}/${f}" 2>/dev/null; then
               chmod +x "${FALLOW_SCRIPTS_DIR}/${f}"
@@ -368,7 +370,7 @@ variables:
             fi
           done
         else
-          FALLOW_RESOLVED_VERSION="$(cat /tmp/fallow-version-spec 2>/dev/null || printf '%s' "${FALLOW_VERSION:-}")"
+          FALLOW_RESOLVED_VERSION="$(cat /tmp/fallow-version-spec || printf '%s' "${FALLOW_VERSION:-}")"
           if [ -z "$FALLOW_SCRIPTS_REF" ] && echo "$FALLOW_RESOLVED_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-.][a-zA-Z0-9.]+)?$'; then
             FALLOW_SCRIPTS_REF="v${FALLOW_RESOLVED_VERSION}"
           fi
@@ -385,6 +387,8 @@ variables:
           FALLOW_SCRIPTS_BASE="https://raw.githubusercontent.com/fallow-rs/fallow/${FALLOW_SCRIPTS_REF}"
           echo "Downloading MR integration scripts pinned to ${FALLOW_SCRIPTS_REF}..."
 
+          # The stderr of `curl` is discarded because the `else` branch names the
+          # file that failed, and the counter below decides the job outcome.
           for f in comment.sh review.sh gitlab_common.sh; do
             if curl -sf --retry 3 --retry-connrefused --retry-delay 2 "${FALLOW_SCRIPTS_BASE}/ci/scripts/${f}" -o "${FALLOW_SCRIPTS_DIR}/${f}" 2>/dev/null; then
               chmod +x "${FALLOW_SCRIPTS_DIR}/${f}"
@@ -416,6 +420,15 @@ variables:
       esac
       if [ "$FALLOW_COMMAND" = "audit" ] && { [ -n "$FALLOW_BASELINE" ] || [ -n "$FALLOW_SAVE_BASELINE" ]; }; then
         echo "ERROR: The audit command does not support FALLOW_BASELINE/FALLOW_SAVE_BASELINE. Use FALLOW_AUDIT_DEAD_CODE_BASELINE, FALLOW_AUDIT_HEALTH_BASELINE, or FALLOW_AUDIT_DUPES_BASELINE instead."
+        exit 2
+      fi
+      # audit cannot judge a whole-project baseline, and FALLOW_BASELINE is
+      # already rejected for it above, so the pair is unreachable through the
+      # variables. It is still reachable through FALLOW_ARGS, where it buys a
+      # green pipeline plus a note --quiet removes.
+      if [ "$FALLOW_COMMAND" = "audit" ] \
+        && printf '%s' "$FALLOW_ARGS" | grep -q -- '--fail-on-stale-baseline'; then
+        echo "ERROR: --fail-on-stale-baseline in FALLOW_ARGS cannot apply to command: audit, which analyzes only the files that changed against its base and cannot judge a whole-project baseline. Run the gate on dead-code, dupes or health."
         exit 2
       fi
       # The stale-baseline gate reads the analysis envelope, so it needs a
@@ -484,7 +497,7 @@ variables:
       # variable is visible to the saved-envelope comment/review renderers.
       # They derive the diff themselves only when FALLOW_DIFF_FILE is unset.
       if [ -n "$FALLOW_CHANGED_SINCE" ] && [ -z "$FALLOW_DIFF_FILE" ]; then
-        if git diff --unified=0 "${FALLOW_CHANGED_SINCE}..HEAD" > fallow-mr.diff 2>/dev/null && [ -s fallow-mr.diff ]; then
+        if git diff --unified=0 "${FALLOW_CHANGED_SINCE}..HEAD" > fallow-mr.diff && [ -s fallow-mr.diff ]; then
           export FALLOW_DIFF_FILE="$PWD/fallow-mr.diff"
         else
           rm -f fallow-mr.diff
@@ -737,13 +750,29 @@ variables:
       STALE_BASELINE_GATE_FAILED=false
       BASELINE_STALENESS_JQ='.baseline_staleness // .summary.baseline_staleness // .check.baseline_staleness // empty'
 
+      # `section` selects which staleness object to read: empty for the
+      # single-analysis commands, whose object the // chain finds, or one section
+      # prefix for audit, which carries up to three and whose first-match chain
+      # would report one of them under every label.
       read_staleness_field() {
-        local file=$1 field=$2
+        local file=$1 field=$2 section=${3:-}
+        local selector="${BASELINE_STALENESS_JQ}"
+        if [ -n "$section" ]; then
+          selector="${section}.baseline_staleness // empty"
+        fi
         # `// empty` cannot be used here: jq treats `false` as absent, which
         # would silently blank `change_scoped: false` and `gate_trips: false`.
         jq -r --arg field "$field" \
-          "(${BASELINE_STALENESS_JQ}) | if has(\$field) then .[\$field] else empty end" \
-          "$file" 2>/dev/null || true
+          "(${selector}) | if has(\$field) then .[\$field] else empty end" \
+          "$file" || true
+      }
+
+      # scope_reasons needs its own reader: it is an array, and the scalar
+      # reader above returns the raw jq rendering of one, not a log line.
+      read_staleness_scope_reasons() {
+        local file=$1
+        jq -r "(${BASELINE_STALENESS_JQ}) | (.scope_reasons // []) | join(\", \")" \
+          "$file" || true
       }
 
       read_all_staleness_fields() {
@@ -753,6 +782,8 @@ variables:
         BASELINE_ADVISORY=$(read_staleness_field "$file" warning)
         BASELINE_GATE_TRIPS=$(read_staleness_field "$file" gate_trips)
         BASELINE_CHANGE_SCOPED=$(read_staleness_field "$file" change_scoped)
+        BASELINE_UNRECOGNISED=$(read_staleness_field "$file" unrecognised_format)
+        BASELINE_SCOPE_REASONS=$(read_staleness_scope_reasons "$file")
       }
 
       read_all_staleness_fields fallow-results.json
@@ -760,7 +791,24 @@ variables:
       # Production mode and workspace scoping are the user's own choice about
       # what to analyze, so they are never removed and a run narrowed by them
       # stands down instead.
+      #
+      # Driven by the run's own scope_reasons when the binary reports them, so
+      # scoping smuggled through FALLOW_ARGS is visible here instead of sending
+      # the template into a re-read that comes back narrowed anyway. A binary
+      # that predates the member falls back to the variable-based guess.
+      BASELINE_REMOVABLE_SCOPE_REASONS="diff changed-since changed-files scope file issue-type-filter"
+
       template_can_rerun_unscoped() {
+        if [ -n "${BASELINE_SCOPE_REASONS:-}" ]; then
+          local reason
+          for reason in $(printf '%s' "$BASELINE_SCOPE_REASONS" | tr ',' ' '); do
+            case " ${BASELINE_REMOVABLE_SCOPE_REASONS} " in
+              *" ${reason} "*) ;;
+              *) return 1 ;;
+            esac
+          done
+          return 0
+        fi
         if [ "$FALLOW_PRODUCTION" = "true" ]; then return 1; fi
         if [ "$FALLOW_PRODUCTION_DEAD_CODE" = "true" ]; then return 1; fi
         if [ "$FALLOW_PRODUCTION_HEALTH" = "true" ]; then return 1; fi
@@ -850,7 +898,7 @@ variables:
             || ! jq -e '.' fallow-stale-baseline-gate-raw.json > /dev/null 2>&1; then
           return 1
         fi
-        jq -s 'last' fallow-stale-baseline-gate-raw.json > fallow-stale-baseline-gate.json 2>/dev/null || return 1
+        jq -s 'last' fallow-stale-baseline-gate-raw.json > fallow-stale-baseline-gate.json || return 1
         if jq -e '.error == true' fallow-stale-baseline-gate.json > /dev/null 2>&1; then
           return 1
         fi
@@ -864,6 +912,25 @@ variables:
       # baseline is an ordinary configuration, and warning on every merge
       # request about a judgement nobody requested is noise the project cannot
       # turn off. The CLI itself is silent there, so the level matches it.
+      # The channels that narrowed the run, as a parenthetical for a log line.
+      # Empty when the binary does not report them.
+      baseline_scope_clause() {
+        if [ -n "${BASELINE_SCOPE_REASONS:-}" ]; then
+          printf ' (%s)' "$BASELINE_SCOPE_REASONS"
+        fi
+      }
+
+      # Why a narrowed run cannot be re-read unscoped. Falls back to the two
+      # variables the guess is built from, for a binary that reports no
+      # scope_reasons.
+      baseline_unremovable_scope_clause() {
+        if [ -n "${BASELINE_SCOPE_REASONS:-}" ]; then
+          printf ' (%s)' "$BASELINE_SCOPE_REASONS"
+        else
+          printf ' (production mode or workspace scoping)'
+        fi
+      }
+
       stale_baseline_stand_down() {
         if [ "$FALLOW_FAIL_ON_STALE_BASELINE" = "true" ]; then
           echo "WARNING: baseline staleness could not be judged on this run because ${1}. FALLOW_FAIL_ON_STALE_BASELINE stood down. ${2}"
@@ -881,22 +948,99 @@ variables:
           if run_stale_gate_analysis; then
             read_all_staleness_fields fallow-stale-baseline-gate.json
             if [ "$BASELINE_CHANGE_SCOPED" = "true" ]; then
-              stale_baseline_stand_down "the unscoped re-read was still narrowed to part of the project" "Remove the positional path from FALLOW_ARGS to judge the baseline."
+              stale_baseline_stand_down "the unscoped re-read was still narrowed to part of the project$(baseline_scope_clause)" "Remove the positional path from FALLOW_ARGS to judge the baseline."
             fi
           else
             stale_baseline_stand_down "the unscoped baseline re-read produced no readable result" "The primary analysis is unaffected; its stderr is printed above."
           fi
           rm -f fallow-stale-baseline-gate-raw.json fallow-stale-baseline-gate.json fallow-stale-baseline-gate-stderr.log
         else
-          stale_baseline_stand_down "it analyzed only part of the project (production mode or workspace scoping)" "Run an unscoped pipeline to judge the baseline."
+          stale_baseline_stand_down "it analyzed only part of the project$(baseline_unremovable_scope_clause)" "Run an unscoped pipeline to judge the baseline."
         fi
       fi
 
+      # fallow audit loads up to three baselines and judges none of them:
+      # every audit narrows to the files that changed against its base. It says
+      # so once on stderr, which --quiet removes, so an audit user never learned
+      # that the baseline they pass is inert (issue #2677).
+      #
+      # Read each section separately rather than lengthening the
+      # single-analysis // chain: that chain is first-match, so an audit with
+      # three baselines would report one and hide the other two.
+      audit_baseline_notices() {
+        local file=$1 row label command input section entries unrecognised path
+        # label:jq-prefix:command:variable. The label names the envelope
+        # section a reader goes looking in; the command is what they have to
+        # run, and the two differ: duplication is served by fallow dupes and
+        # complexity by fallow health.
+        for row in \
+          'dead-code:.dead_code:dead-code:FALLOW_AUDIT_DEAD_CODE_BASELINE' \
+          'duplication:.duplication:dupes:FALLOW_AUDIT_DUPES_BASELINE' \
+          'complexity:.complexity.summary:health:FALLOW_AUDIT_HEALTH_BASELINE'
+        do
+          label=${row%%:*}
+          section=$(printf '%s' "$row" | cut -d: -f2)
+          command=$(printf '%s' "$row" | cut -d: -f3)
+          input=${row##*:}
+          # Through the shared reader, so this loop reads a member the same
+          # way the single-analysis path does. The reader guards with has, which
+          # keeps a literal false distinct from an absent member. The inline
+          # // empty it replaces collapsed the two. No consumer here saw a
+          # difference, because each one compares the value against true.
+          entries=$(read_staleness_field "$file" baseline_entries "$section")
+          if [ -z "$entries" ]; then
+            continue
+          fi
+          unrecognised=$(read_staleness_field "$file" unrecognised_format "$section")
+          path=$(eval "printf '%s' \"\${${input}:-}\"")
+          if [ "$unrecognised" = "true" ]; then
+            if [ -n "$path" ]; then
+              echo "WARNING: the ${label} baseline at ${path} has no entries this command recognises. It may be a baseline saved by another command, or an empty file. Either way it suppresses nothing."
+            else
+              echo "WARNING: the ${label} baseline has no entries this command recognises. It may be a baseline saved by another command, or an empty file. Either way it suppresses nothing."
+            fi
+            continue
+          fi
+          if [ -n "$path" ]; then
+            echo "NOTICE: the ${label} baseline (${path}) has ${entries} entries and was not judged on this run: fallow audit analyzes only the files that changed against its base. Run 'fallow ${command} --baseline ${path}' over the whole project to check it."
+          else
+            echo "NOTICE: the ${label} baseline has ${entries} entries and was not judged on this run: fallow audit analyzes only the files that changed against its base. Run 'fallow ${command}' with that baseline over the whole project to check it."
+          fi
+        done
+      }
+
+      if [ "$FALLOW_COMMAND" = "audit" ]; then
+        audit_baseline_notices fallow-results.json
+      fi
+
+      # A baseline written by another command suppresses nothing, so the counts
+      # below are all zero and read exactly like a baseline saved on a project
+      # that had nothing to record. A project that pointed FALLOW_BASELINE at
+      # the wrong file would otherwise gate on it forever.
+      #
+      # Ahead of the advisory rather than beside it: the binary now trips the
+      # gate on such a file, so the *) arm below would add "0 of 0 baseline
+      # entries matched nothing this run" next to the line that says what is
+      # actually wrong.
+      #
+      # Keyed on the binary's own verdict rather than on a zero entry count,
+      # which a baseline saved on a green main with nothing to record carries
+      # too: warning on every pipeline about a correctly saved baseline is noise
+      # the project cannot turn off. Not gated on FALLOW_BASELINE either, so a
+      # baseline passed through FALLOW_ARGS earns the same line; the path is
+      # named only when the template knows it.
+      #
       # The advisory and the gate answer different questions and legitimately
       # disagree, so speak on either. A rotted baseline on a project with
       # nothing left to report is warning "none" with gate_trips true, which is
       # exactly the case issue #2673 was filed about.
-      if [ -n "$BASELINE_ENTRIES" ]; then
+      if [ "${BASELINE_UNRECOGNISED:-}" = "true" ]; then
+        if [ -n "$FALLOW_BASELINE" ]; then
+          echo "WARNING: the baseline at ${FALLOW_BASELINE} has no entries this command recognises. It may be a baseline saved by another command, or an empty file. Either way it suppresses nothing."
+        else
+          echo "WARNING: the loaded baseline has no entries this command recognises. It may be a baseline saved by another command, or an empty file. Either way it suppresses nothing."
+        fi
+      elif [ -n "$BASELINE_ENTRIES" ]; then
         case "$BASELINE_ADVISORY" in
           partial)
             echo "WARNING: baseline is partially stale: ${BASELINE_STALE_ENTRIES} of ${BASELINE_ENTRIES} entries matched nothing this run, so it protects less than what was saved. Re-save it with FALLOW_SAVE_BASELINE."
@@ -985,7 +1129,7 @@ variables:
           [ "$CODEQUALITY_EXIT" -ne 0 ] || CODEQUALITY_EXIT=2
           exit "$CODEQUALITY_EXIT"
         fi
-        CQ_COUNT=$(jq '. | length' gl-code-quality-report.json 2>/dev/null || echo 0)
+        CQ_COUNT=$(jq '. | length' gl-code-quality-report.json || echo 0)
         echo "Code Quality report: ${CQ_COUNT} findings"
       else
         echo "[]" > gl-code-quality-report.json
@@ -1065,7 +1209,7 @@ variables:
           | if ($gates | has($gate)) and ($gates[$gate] | has($member))
             then ($gates[$gate][$member] | tostring)
             else "" end
-        ' fallow-results.json 2>/dev/null || true
+        ' fallow-results.json || true
       }
 
       # The envelope carries these as JSON numbers, so a whole value arrives
@@ -1081,7 +1225,7 @@ variables:
         case "$1" in
           regression)
             local delta
-            delta=$(jq -r '(.regression.delta // .check.regression.delta // "") | tostring' fallow-results.json 2>/dev/null || true)
+            delta=$(jq -r '(.regression.delta // .check.regression.delta // "") | tostring' fallow-results.json || true)
             [ -n "$delta" ] && printf 'issue count rose by %s (tolerance %s)' "$delta" "$FALLOW_TOLERANCE"
             ;;
           duplication-threshold)
@@ -1104,7 +1248,7 @@ variables:
             ;;
           security)
             local new_count
-            new_count=$(jq -r '(.gate.new_count // "") | tostring' fallow-results.json 2>/dev/null || true)
+            new_count=$(jq -r '(.gate.new_count // "") | tostring' fallow-results.json || true)
             [ -n "$new_count" ] && printf '%s new security candidate(s) on changed lines (gate: %s)' "$new_count" "$FALLOW_SECURITY_GATE"
             ;;
         esac
@@ -1117,6 +1261,13 @@ variables:
       record_gate_failure() {
         local gate=$1 detail line
         if [ "$gate" = "stale-baseline" ]; then
+          # The gate also trips on a file this command cannot read as its own,
+          # whose counts are all zero: re-saving is not the remedy there, and
+          # "0 of 0 entries matched nothing" names nothing to act on.
+          if [ "${BASELINE_UNRECOGNISED:-}" = "true" ]; then
+            GATE_FAILURES+=("Fallow baseline gate failed: the baseline ${FALLOW_BASELINE:-passed to this pipeline} has no entries this command recognises, so it suppresses nothing. Point FALLOW_BASELINE at this command's own baseline, or set FALLOW_FAIL_ON_STALE_BASELINE to false.")
+            return
+          fi
           GATE_FAILURES+=("Fallow baseline gate failed: ${BASELINE_STALE_ENTRIES} of ${BASELINE_ENTRIES} entries in ${FALLOW_BASELINE} matched nothing this run. Re-save the baseline, or set FALLOW_FAIL_ON_STALE_BASELINE to false.")
           return
         fi
@@ -1207,7 +1358,7 @@ variables:
             continue
           fi
           classify_gate "$gate_key" "$(read_gate_member "$gate_key" status)" "$(read_gate_member "$gate_key" enforced)"
-        done < <(jq -r '(.gate_outcomes // {}) | keys[]?' fallow-results.json 2>/dev/null || true)
+        done < <(jq -r '(.gate_outcomes // {}) | keys[]?' fallow-results.json || true)
       else
         # A pinned binary older than the gate index. Read the feature-local
         # field each gate already published, and fail OPEN for the three that
@@ -1253,7 +1404,7 @@ variables:
         | group_by(.kind)
         | map("\(.[0].kind) (\(length))")
         | join(", ")
-      ' fallow-results.json 2>/dev/null || true)
+      ' fallow-results.json || true)
       if [ -n "$DEGRADED_SUMMARY" ]; then
         ANALYSIS_DEGRADED=true
         echo "WARNING: Fallow ran with degraded inputs: ${DEGRADED_SUMMARY}. Some findings or scores were computed over less than the whole project, or from an input that did not load."
@@ -1273,9 +1424,22 @@ variables:
           | select(.value.status != "applied" and .value.affects == "scope")
           | if .value.reason then "\(.key) (\(.value.reason))" else .key end ]
         | join(", ")
-      ' fallow-results.json 2>/dev/null || true)
+      ' fallow-results.json || true)
       if [ -n "$REQUESTS_UNAPPLIED" ]; then
         echo "WARNING: Fallow could not apply: ${REQUESTS_UNAPPLIED}. The findings below cover more of the project than was requested, so do not read this run as scoped to the change."
+      fi
+      # The opposite shape: a narrowing request that DID apply, over a scope it
+      # measured as empty. Every finding filters out, so the clean report below
+      # covered nothing. A binary that publishes no `scope_size` says nothing
+      # here.
+      REQUESTS_EMPTY_SCOPE=$(jq -r '
+        [ (.request_outcomes // {}) | to_entries[]
+          | select(.value.status == "applied" and .value.affects == "scope" and .value.scope_size == 0)
+          | .key ]
+        | join(", ")
+      ' fallow-results.json || true)
+      if [ -n "$REQUESTS_EMPTY_SCOPE" ]; then
+        echo "WARNING: Fallow applied ${REQUESTS_EMPTY_SCOPE} over an empty scope, so no finding could survive it and the report below is clean because nothing was analyzable. Check the diff or ref this run was given before reading it as a clean result."
       fi
 
       if jq -e '[ (.workspace_diagnostics // .dead_code.workspace_diagnostics // [])[] | select(.kind == "no-source-files-analyzed") ] | length > 0' fallow-results.json > /dev/null 2>&1; then

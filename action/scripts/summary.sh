@@ -132,6 +132,22 @@ append_baseline_advisory() {
   [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
   [ -n "${FALLOW_BASELINE_ENTRIES:-}" ] || return 0
   local line=""
+  # Checked before the advisory: such a file carries zero entries, so the
+  # advisory arms below would read "0 of 0 saved entries matched nothing this
+  # run" next to the line that says what is actually wrong. Keyed on the
+  # binary's verdict rather than on a zero entry count, which a baseline saved
+  # on a project with nothing to record carries too. The path comes from the
+  # analyze step, and is empty for a baseline that reached the run through the
+  # `args` input, where the action never sees it.
+  if [ "${FALLOW_BASELINE_UNRECOGNISED:-}" = "true" ]; then
+    if [ -n "${FALLOW_BASELINE_PATH:-}" ]; then
+      line="> **Baseline recognises nothing.** The baseline at \`${FALLOW_BASELINE_PATH}\` has no entries this command recognises. It may be a baseline saved by another command, or an empty file. Either way it suppresses nothing."
+    else
+      line="> **Baseline recognises nothing.** The baseline has no entries this command recognises. It may be a baseline saved by another command, or an empty file. Either way it suppresses nothing."
+    fi
+    printf '%s\n\n' "$line" >> "$GITHUB_STEP_SUMMARY"
+    return 0
+  fi
   case "${FALLOW_BASELINE_ADVISORY:-}" in
     partial)
       line="> **Baseline is partially stale.** ${FALLOW_BASELINE_STALE_ENTRIES} of ${FALLOW_BASELINE_ENTRIES} saved entries matched nothing this run, so the baseline protects less than what was saved. Re-save it with the \`save-baseline\` input."
@@ -168,8 +184,13 @@ append_gate_summary() {
     done
     printf '%s\n\n' "> **Gates:** ${joined}." >> "$GITHUB_STEP_SUMMARY"
   fi
+  # The degrading kinds are not all about files: a plugin config a reader could
+  # not read, a health input that did not load, and a coverage snapshot the run
+  # could not use all set this flag. The sentence therefore states what every
+  # degrading kind has in common, wording it the way the analyze step already
+  # words its own warning, instead of claiming files were skipped.
   if [ "${FALLOW_ANALYSIS_DEGRADED:-}" = "true" ]; then
-    printf '%s\n\n' "> **Analysis was degraded.** Some files never reached the analysis, so these findings were computed over less than the whole project." >> "$GITHUB_STEP_SUMMARY"
+    printf '%s\n\n' "> **Analysis was degraded.** Some findings or scores were computed over less than the whole project, or from an input that did not load." >> "$GITHUB_STEP_SUMMARY"
   fi
 }
 

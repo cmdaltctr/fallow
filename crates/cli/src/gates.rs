@@ -95,6 +95,12 @@ pub fn regression_outcome(
 /// Reads `gate_trips` off the envelope object the run already publishes, so the
 /// two can never drift. `enforced` is the opt-in flag: the verdict is published
 /// either way, and only the flag decides whether it fails the run.
+///
+/// A narrowed run cannot judge a whole-project baseline and stands down, with one
+/// exception: telling a file this command never wrote from one of its own needs
+/// no whole-project run, so an unrecognised baseline is judged at any scope. That
+/// keeps this status equal to `gate_trips`, which is the identity the object
+/// exists for.
 pub const fn stale_baseline_outcome(
     staleness: Option<&fallow_output::BaselineStaleness>,
     fail_on_stale_baseline: bool,
@@ -102,7 +108,7 @@ pub const fn stale_baseline_outcome(
     let Some(staleness) = staleness else {
         return None;
     };
-    if staleness.change_scoped {
+    if staleness.change_scoped && !staleness.unrecognised_format {
         return Some(GateOutcome::new(GateStatus::Skipped, false));
     }
     Some(GateOutcome::new(
@@ -264,6 +270,8 @@ mod tests {
             warning: fallow_output::BaselineStalenessAdvisory::None,
             gate_trips: true,
             moved_entries: 0,
+            unrecognised_format: false,
+            scope_reasons: fallow_output::BaselineScopeReasons::empty(),
         };
         let unarmed = stale_baseline_outcome(Some(&staleness), false).expect("verdict published");
         assert_eq!(unarmed.status, GateStatus::Fail);
@@ -286,6 +294,9 @@ mod tests {
             warning: fallow_output::BaselineStalenessAdvisory::None,
             gate_trips: false,
             moved_entries: 0,
+            unrecognised_format: false,
+            scope_reasons: fallow_output::BaselineScopeReasons::empty()
+                .with(fallow_output::ScopeReason::Production),
         };
         let outcome = stale_baseline_outcome(Some(&staleness), true).expect("verdict published");
         assert_eq!(outcome.status, GateStatus::Skipped);

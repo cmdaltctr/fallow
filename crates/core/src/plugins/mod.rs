@@ -44,6 +44,7 @@ const RUNTIME_ENTRY_POINT_PLUGINS: &[&str] = &[
     "expo-router",
     "gatsby",
     "hardhat",
+    "module-federation",
     "nestjs",
     "next-intl",
     "nextjs",
@@ -93,6 +94,108 @@ const SUPPORT_ENTRY_POINT_PLUGINS: &[&str] = &[
     "velite",
 ];
 
+/// Which workspace diagnostic kind a plugin-stage advisory becomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginConfigEffect {
+    /// The plugin could not read the key in full, so part of what it declares
+    /// never reached the analysis.
+    Unreadable,
+    /// The plugin read the key and does not model its effect, so a modeled
+    /// default the run would otherwise have applied stood down.
+    NotModeled,
+}
+
+/// One advisory about a config file a plugin read, before it becomes a
+/// [`fallow_config::WorkspaceDiagnostic`].
+///
+/// A plugin knows the fact (which config file, which key, why) but not the root
+/// the message renders against: in a workspace run its own `root` is the package
+/// root, while the diagnostic's path and message are project-root-relative. The
+/// conversion therefore happens once, where every plugin result has converged on
+/// the project root, and `config_path` is kept ABSOLUTE until then so the
+/// registry's canonical dedupe and the serialized root-relative form both work
+/// from one value (issue #2736).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginConfigDiagnostic {
+    /// Absolute path of the config file that was read.
+    pub config_path: PathBuf,
+    /// The plugin that read it, as it labels itself. Module Federation options
+    /// reach four bundler plugins inline, and each names itself rather than the
+    /// reader, because the config file the user must edit is the bundler's.
+    pub plugin: String,
+    /// The config key the advisory is about (`exposes`, `remotes`,
+    /// `components`, `imports`).
+    pub key: String,
+    /// Why, as a kebab-case token from the resulting kind's open set.
+    pub reason: String,
+    /// Which workspace diagnostic kind this becomes.
+    pub effect: PluginConfigEffect,
+}
+
+impl PluginConfigDiagnostic {
+    /// Build an advisory about a key a plugin could not read in full.
+    pub(super) fn unreadable(
+        config_path: &Path,
+        plugin: &str,
+        key: &str,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            config_path: config_path.to_path_buf(),
+            plugin: plugin.to_owned(),
+            key: key.to_owned(),
+            reason: reason.to_owned(),
+            effect: PluginConfigEffect::Unreadable,
+        }
+    }
+
+    /// Build an advisory about a key whose effect the plugin does not model.
+    pub(super) fn not_modeled(
+        config_path: &Path,
+        plugin: &str,
+        key: &str,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            config_path: config_path.to_path_buf(),
+            plugin: plugin.to_owned(),
+            key: key.to_owned(),
+            reason: reason.to_owned(),
+            effect: PluginConfigEffect::NotModeled,
+        }
+    }
+
+    /// Render this advisory against the PROJECT root, which is the root every
+    /// consumer's paths are relative to.
+    #[must_use]
+    pub fn into_workspace_diagnostic(self, root: &Path) -> fallow_config::WorkspaceDiagnostic {
+        let Self {
+            config_path,
+            plugin,
+            key,
+            reason,
+            effect,
+        } = self;
+        let kind = match effect {
+            PluginConfigEffect::Unreadable => {
+                fallow_config::WorkspaceDiagnosticKind::PluginConfigUnreadable {
+                    plugin,
+                    key,
+                    reason,
+                }
+            }
+            PluginConfigEffect::NotModeled => {
+                fallow_config::WorkspaceDiagnosticKind::PluginEffectNotModeled {
+                    plugin,
+                    key,
+                    reason,
+                }
+            }
+        };
+        fallow_config::WorkspaceDiagnostic::new(root, config_path, kind)
+    }
+}
+
 /// Result of resolving a plugin's config file.
 #[derive(Debug, Default)]
 pub struct PluginResult {
@@ -138,6 +241,10 @@ pub struct PluginResult {
     /// File-scoped dependency providers. Matching imports are considered
     /// available from the framework runtime and are not unlisted dependencies.
     provided_dependencies: Vec<ProvidedDependencyRule>,
+    /// Advisories about the config file this result was read from. A plugin
+    /// records the fact here instead of printing it, so it reaches the report
+    /// and every consumer rather than only a stderr line.
+    config_diagnostics: Vec<PluginConfigDiagnostic>,
 }
 
 impl PluginResult {
@@ -158,6 +265,31 @@ impl PluginResult {
         );
     }
 
+    /// Route each config value to the surface that can use it: a value naming a
+    /// module request credits its package, every other value becomes an entry
+    /// pattern.
+    ///
+    /// A bundler `entry` accepts a project file and a bare module request such as
+    /// `react-hot-loader/patch` in the same list. A module request names no file,
+    /// so a glob built from it matches nothing while the package still needs
+    /// dependency credit. Module Federation `exposes` targets already split the
+    /// two this way (issue #2706); bundler entries now do too (issue #2739).
+    fn extend_entry_patterns_or_dependencies<I, S>(&mut self, values: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for value in values {
+            let value = value.into();
+            if let Some(request) = module_request(&value) {
+                self.referenced_dependencies
+                    .push(crate::resolve::extract_package_name(request));
+                continue;
+            }
+            self.push_entry_pattern(value);
+        }
+    }
+
     fn push_used_export_rule(
         &mut self,
         pattern: impl Into<String>,
@@ -167,9 +299,16 @@ impl PluginResult {
             .push(UsedExportRule::new(pattern, exports));
     }
 
+    /// Whether this result contributes nothing, which lets the registry skip a
+    /// config file entirely.
+    ///
+    /// A config that yields only a diagnostic is NOT empty: an unreadable
+    /// `exposes` in a config that declares nothing else is exactly the case the
+    /// advisory exists for, and skipping the result would drop it.
     #[must_use]
     const fn is_empty(&self) -> bool {
-        self.entry_patterns.is_empty()
+        self.config_diagnostics.is_empty()
+            && self.entry_patterns.is_empty()
             && self.used_exports.is_empty()
             && self.used_class_members.is_empty()
             && self.referenced_dependencies.is_empty()
@@ -189,6 +328,69 @@ fn normalize_entry_pattern(pattern: String) -> String {
         .strip_prefix("./")
         .map(str::to_owned)
         .unwrap_or(pattern)
+}
+
+/// The module request a config value names, or `None` when the value names a
+/// file or a pattern over project files.
+///
+/// A bundler resolves a value without a leading `./`, `../` or `/` and without a
+/// source extension through module resolution, so it names a package. Both
+/// Module Federation `exposes` targets and bundler `entry` values are read this
+/// way. A value carrying glob syntax is a path in every case: no module
+/// resolution accepts a glob, so `src/pages/**` stays an entry pattern. A
+/// resource query is not part of the request, so it is dropped before both
+/// tests and before the package name is taken.
+fn module_request(value: &str) -> Option<&str> {
+    let request = strip_resource_query(value);
+    (config_parser::is_package_specifier(request)
+        && !has_glob_syntax(request)
+        && !has_source_extension(request))
+    .then_some(request)
+}
+
+/// Drop a trailing resource query from a config value.
+///
+/// A bundler hands everything after the first `?` to the loader, so the standard
+/// hot-reload entry `webpack-hot-middleware/client?reload=true` names the
+/// package's `client` module. A `?` is also the single-character glob wildcard,
+/// so what follows it decides: `reload=true` is a query, the `.ts` of
+/// `src/pag?.ts` is not.
+fn strip_resource_query(value: &str) -> &str {
+    match value.split_once('?') {
+        Some((request, query)) if is_resource_query(query) => request,
+        _ => value,
+    }
+}
+
+/// Whether a string is an `&`-separated list of `key` or `key=value` pairs whose
+/// keys read like identifiers.
+fn is_resource_query(query: &str) -> bool {
+    !query.is_empty()
+        && query.split('&').all(|pair| {
+            let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+            key.starts_with(|first: char| first.is_ascii_alphanumeric() || first == '_')
+                && key
+                    .chars()
+                    .all(|char| char.is_ascii_alphanumeric() || matches!(char, '_' | '-' | '.'))
+        })
+}
+
+/// Whether a config value carries glob metacharacters, which makes it a pattern
+/// over project files rather than a single path or module request.
+fn has_glob_syntax(value: &str) -> bool {
+    value.contains('*') || value.contains('?') || value.contains('[') || value.contains('{')
+}
+
+/// Whether a config value carries an extension discovery analyzes. Discovery's
+/// own extension set decides, so a value naming a file type discovery does not
+/// analyze stays a module request.
+fn has_source_extension(value: &str) -> bool {
+    Path::new(value)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            crate::discover::SOURCE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+        })
 }
 
 /// A file-pattern rule with optional exclusion globs plus path-level or
@@ -1275,6 +1477,7 @@ mod lit;
 mod markdownlint;
 mod mintlify;
 mod mocha;
+mod module_federation;
 mod msw;
 mod napi_rs;
 mod nestjs;

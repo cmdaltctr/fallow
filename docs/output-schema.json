@@ -951,7 +951,7 @@
           "items": {
             "$ref": "#/definitions/WorkspaceDiagnostic"
           },
-          "description": "Non-fatal diagnostics about the project itself, from all three stages\nthat record them (issue #473):\n\n- workspace discovery, at config load: `undeclared-workspace`,\n  `malformed-package-json`, `glob-matched-no-package-json`,\n  `malformed-tsconfig`, `tsconfig-reference-dir-missing`;\n- source discovery, during the file walk: `skipped-large-file`,\n  `skipped-minified-file`, `skipped-source-dotdir`,\n  `excluded-by-default-ignore`, `source-read-failure`,\n  `source-parse-degraded`;\n- dead-code analysis, from the dependency-catalog and override\n  detectors: `malformed-pnpm-workspace-yaml`,\n  `bun-lockb-override-resolution-skipped`.\n\nAnalysis-stage kinds therefore reach only the envelopes whose run\nincludes a dead-code analyze pass, never a standalone\n`fallow dupes --format json`. `path` is project-root-relative with\nforward slashes; the array is omitted when empty. The same list is\nrepeated on each top-level command's envelope so single-command\nconsumers see it without having to look at a separate top-level field.\n\nA diagnostic here is advisory and never withholds a finding. Where an\nentry reports a source file this run never fully analyzed\n(`source-parse-degraded`, `source-read-failure`, `skipped-large-file`,\n`skipped-minified-file`, `skipped-source-dotdir`) it can distort a\nverdict, so the affected `unused_files[]`, `unused_exports[]`, and\ndependency entries additionally carry the caveat themselves in their own\noptional `reachability_caveats[]` array, and a reader who never scrolls\nback up to this list still sees it. `fallow fix` reads the same array\nand withholds the removal while a caveat stands.\n\n`excluded-by-default-ignore` is the one source-discovery kind that\nreports unseen files WITHOUT raising a caveat. It names a built-in\nignore pattern (`**/dist/**`, `**/build/**`, `**/coverage/**`, or one\nof the four minified-bundle globs) that removed candidate source files\nfrom the walk, which is designed behavior on generated output rather\nthan a degraded run, so it is advisory only and no finding inherits it.\nOne entry per pattern, never per file, so the array stays bounded on a\nproject of any size. Gitignored trees are pruned before the walk sees\nthem and count zero, and `**/node_modules/**` is never reported:\ninstalled dependencies are not the first-party source the kind is\nabout."
+          "description": "Non-fatal diagnostics about the project itself, from all three stages\nthat record them (issue #473):\n\n- workspace discovery, at config load: `undeclared-workspace`,\n  `malformed-package-json`, `glob-matched-no-package-json`,\n  `malformed-tsconfig`, `tsconfig-reference-dir-missing`;\n- source discovery, during the file walk: `skipped-large-file`,\n  `skipped-minified-file`, `skipped-source-dotdir`,\n  `excluded-by-default-ignore`, `source-read-failure`,\n  `source-parse-degraded`;\n- dead-code analysis, from the dependency-catalog and override\n  detectors: `malformed-pnpm-workspace-yaml`,\n  `bun-lockb-override-resolution-skipped`;\n- framework plugins, while they read their own build configs:\n  `plugin-config-unreadable`, `plugin-effect-not-modeled`.\n\nAnalysis-stage and plugin-stage kinds therefore reach only the envelopes\nwhose run includes a dead-code analyze pass, never a standalone\n`fallow dupes --format json`. `path` is project-root-relative with\nforward slashes; the array is omitted when empty. The same list is\nrepeated on each top-level command's envelope so single-command\nconsumers see it without having to look at a separate top-level field.\n\nA diagnostic here is advisory and never withholds a finding. Where an\nentry reports a source file this run never fully analyzed\n(`source-parse-degraded`, `source-read-failure`, `skipped-large-file`,\n`skipped-minified-file`, `skipped-source-dotdir`) it can distort a\nverdict, so the affected `unused_files[]`, `unused_exports[]`, and\ndependency entries additionally carry the caveat themselves in their own\noptional `reachability_caveats[]` array, and a reader who never scrolls\nback up to this list still sees it. `fallow fix` reads the same array\nand withholds the removal while a caveat stands.\n\n`excluded-by-default-ignore` is the one source-discovery kind that\nreports unseen files WITHOUT raising a caveat. It names a built-in\nignore pattern (`**/dist/**`, `**/build/**`, `**/coverage/**`, or one\nof the four minified-bundle globs) that removed candidate source files\nfrom the walk, which is designed behavior on generated output rather\nthan a degraded run, so it is advisory only and no finding inherits it.\nOne entry per pattern, never per file, so the array stays bounded on a\nproject of any size. Gitignored trees are pruned before the walk sees\nthem and count zero, and `**/node_modules/**` is never reported:\ninstalled dependencies are not the first-party source the kind is\nabout."
         },
         "next_steps": {
           "type": "array",
@@ -11934,15 +11934,20 @@
         {
           "type": "object",
           "properties": {
+            "cause": {
+              "type": "string",
+              "description": "Which input stopped it, as a kebab-case token: `not-a-repository`,\n`invalid-since` or `churn-file-unreadable`. The set is open.\n\nThe cause decides the remedy, which is why it is on the wire: a run\noutside a repository is fixed by running fallow inside one, a\nmalformed `--since` by respelling the flag, and a churn file that\nchanged under the run by rerunning it. A consumer reading only the\nkind would offer the first remedy for all three."
+            },
             "kind": {
               "type": "string",
               "const": "hotspots-skipped"
             }
           },
           "required": [
-            "kind"
+            "kind",
+            "cause"
           ],
-          "description": "Churn-based hotspot analysis was skipped because the project root is not\na git repository, so the hotspots, churn and ownership sections report\nnothing at all. The remaining health sections are unaffected.\n\nCarries no payload: the other two skip paths (a malformed `--since`, a\n`--churn-file` that became unreadable after validation) route through\n`tracing` rather than a user-facing note and are not part of this kind\nyet."
+          "description": "Churn-based hotspot analysis was skipped, so the hotspots, churn and\nownership sections report nothing at all. The remaining health sections\nare unaffected."
         },
         {
           "type": "object",
@@ -12015,6 +12020,62 @@
             "error"
           ],
           "description": "A saved health snapshot could not be read or parsed, so the trend is\ncomputed over fewer snapshots than the project has on disk and a\ndirection can flip on the missing point alone."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "plugin": {
+              "type": "string",
+              "description": "The plugin that read the config, as it labels itself:\n`module-federation` for a standalone `module-federation.config.*`,\nor the bundler plugin (`webpack`, `rspack`, `rsbuild`, `vite`) that\nread the same options inline from its own config."
+            },
+            "key": {
+              "type": "string",
+              "description": "The config key that was present and not fully readable (`exposes`,\n`remotes`). The set is open."
+            },
+            "reason": {
+              "type": "string",
+              "description": "Why it could not be read, as a kebab-case token:\n`not-object-literal`, `array-form`, `spread` or\n`unreadable-entries`. The set is open.\n\nThe reason decides the remedy, which is why it is on the wire: a\nvalue that is not an object literal is fixed by writing one, while\nunreadable entries are fixed by naming those entries in the config\noption the message points at."
+            },
+            "kind": {
+              "type": "string",
+              "const": "plugin-config-unreadable"
+            }
+          },
+          "required": [
+            "kind",
+            "plugin",
+            "key",
+            "reason"
+          ],
+          "description": "A framework plugin read a build config and could not read one of its\nkeys in full, so part of what the key declares never reached the\nanalysis. `path` names the config file.\n\nThe reader is syntactic, so a key whose value is computed at build time\nis invisible to it: a Module Federation `exposes: makeExposes()` or a\n`remotes` map spread from an environment module declares entries this\nrun does not know about. The consequence is a finding, not a missing\nnumber: an unread `exposes` target is not registered as an entry point\nand its file can surface as `unused-file`, and an unread `remotes` alias\nis not treated as provided by a remote container and its import can\nsurface as an unlisted dependency.\n\nRecorded by the plugin stage, which runs before analysis and is not\ncached, so the entry is present on a warm cache too. It used to be a\nbare `tracing::warn!` from inside the plugin, so it reached no envelope\nand no CI consumer (issue #2736)."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "plugin": {
+              "type": "string",
+              "description": "The plugin that read the config, as it labels itself (`nuxt`)."
+            },
+            "key": {
+              "type": "string",
+              "description": "The config key whose effect is not modeled (`components`,\n`imports`). The set is open."
+            },
+            "reason": {
+              "type": "string",
+              "description": "Why the effect is not modeled, as a kebab-case token:\n`key-effect-not-modeled` when the key's own value is the reason,\n`config-property-unreadable` when a top-level property of the same\nconfig file could not be read statically, so no surface in it can\nbe classified at all. The set is open."
+            },
+            "kind": {
+              "type": "string",
+              "const": "plugin-effect-not-modeled"
+            }
+          },
+          "required": [
+            "kind",
+            "plugin",
+            "key",
+            "reason"
+          ],
+          "description": "A framework plugin read a config key it understands, does not model\nthat key's effect, and therefore stood a modeled default down. `path`\nnames the config file.\n\nThe Nuxt auto-import gate is the case this exists for. With\n`autoImports` enabled fallow drops the Nuxt convention entry patterns\nso a genuinely unreferenced convention file is reported, and a\n`components:` or `imports:` block whose effect it cannot model keeps\nthem, which silently costs the user the findings they opted in for.\n\nDeliberately NOT one of the [`Self::warns_on_stderr`] kinds. Nothing\nwas lost that the run could have measured: the patterns stayed, so\nfindings are suppressed rather than invented, and a project in this\nstate would otherwise warn on every run forever with \"write different\nconfig\" as the only remedy, which is the reason\n`boundaries-not-configured` is off stderr as well."
         },
         {
           "type": "object",
@@ -20024,6 +20085,17 @@
           "description": "Wall-clock analysis duration in milliseconds.",
           "$ref": "#/definitions/ElapsedMs"
         },
+        "request_outcomes": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RequestOutcomes"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the run was asked to narrow and whether it did. See\n[`crate::RequestOutcomes`] for the full contract.\n\n`fallow flags` accepts `--changed-since`, and an unresolvable ref widens\nthe scan to the whole project rather than failing the run. Until this\nmember existed the only account of that was a stderr line, which `--quiet`\nremoves, so a flag inventory read as scoped to the change could silently\nbe the whole project's (issue #2734).\n\nThe command applies no diff filter, so the object carries the\n`changed-since` entry only. Omitted when the run was asked for nothing,\nwhich keeps a scan that passed no narrowing flag byte-identical and moves\nno `schema_version`."
+        },
         "feature_flags": {
           "type": "array",
           "items": {
@@ -20650,6 +20722,17 @@
         "schema_version": {
           "description": "Schema version of this envelope.",
           "$ref": "#/definitions/SuppressionInventorySchemaVersion"
+        },
+        "request_outcomes": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RequestOutcomes"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the run was asked to narrow and whether it did. See\n[`crate::RequestOutcomes`] for the full contract.\n\n`fallow suppressions` accepts `--changed-since`, and an unresolvable ref\nwidens the inventory to the whole project rather than failing the run.\nUntil this member existed the only account of that was a stderr line,\nwhich `--quiet` removes, so an inventory read as scoped to the change\ncould silently be the whole project's (issue #2734).\n\nThe command applies no diff filter, so the object carries the\n`changed-since` entry only. Omitted when the run was asked for nothing,\nwhich keeps an inventory that passed no narrowing flag byte-identical and\nleaves `schema_version` at `1`."
         },
         "summary": {
           "description": "Project-level totals over the scoped inventory.",
@@ -26220,7 +26303,7 @@
         },
         "change_scoped": {
           "type": "boolean",
-          "description": "True when this run analyzed only part of the project, so a whole-project\nbaseline matches less of it for reasons that are not rot. The channels\ndiffer per command and include a diff, a base ref, `--changed-since`,\n`--workspace`, `--changed-workspaces`, `--scope`, `--file`, an\nissue-type filter, and production mode. Both `stale` and `gate_trips`\nare false whenever this is true."
+          "description": "True when this run analyzed only part of the project, so a whole-project\nbaseline matches less of it for reasons that are not rot. The channels\ndiffer per command and include a diff, a base ref, `--changed-since`,\n`--workspace`, `--changed-workspaces`, `--scope`, `--file`, an\nissue-type filter, and production mode. Both `stale` and `gate_trips`\nare false whenever this is true. `scope_reasons` names the channels\nthat fired."
         },
         "stale": {
           "type": "boolean",
@@ -26232,11 +26315,23 @@
         },
         "gate_trips": {
           "type": "boolean",
-          "description": "True exactly when\n`!change_scoped && baseline_entries > 0 && matched_entries < baseline_entries`,\nwhich is the rule `--fail-on-stale-baseline` applies. Deliberately\nstricter than `stale`: any unmatched entry counts. It describes the\nbaseline, not the run's exit code: `health --report-only` is an explicit\nrequest never to fail, so that run exits 0 and says so on stderr while\nstill reporting `gate_trips: true` here."
+          "description": "True exactly when `unrecognised_format` is true, or\n`!change_scoped && baseline_entries > 0 && matched_entries < baseline_entries`.\nThat is the rule `--fail-on-stale-baseline` applies. Deliberately\nstricter than `stale`: any unmatched entry counts, and so does a file\nthis command could not read as its own, which protects nothing at all.\nThe second half is suppressed by `change_scoped` and the first is not:\nwhich command wrote a file does not depend on how much of the project\nthe run looked at.\n\nIt describes the baseline, not the run's exit code: `health\n--report-only` is an explicit request never to fail, so that run exits 0\nand says so on stderr while still reporting `gate_trips: true` here, and\n`fallow audit` never judges a baseline at all, so its\n`gate_outcomes[\"stale-baseline\"]` stands down beside a section that\nreports `true`."
         },
         "moved_entries": {
           "type": "integer",
           "description": "Entries that matched only by following a file move. Only `health` can\nfollow one, in its identity baseline mode; `dead-code` and `dupes` match\nentries by fingerprint and never classify one as moved, so they report\n`0`. Always `0` in health's count mode too."
+        },
+        "unrecognised_format": {
+          "type": "boolean",
+          "description": "True when the loaded file is not a baseline of the command that read it:\nit names another command in its top-level `kind`, or it names none and\ncarries no key this command's own format writes. Read this, not\n`baseline_entries == 0`, before telling anyone their baseline is the\nwrong file: a baseline saved from a project that had nothing to record\nis legitimately empty and is not a mistake.\n\nPresent only when true, so an envelope from a run that loaded its own\nbaseline is unchanged. All three commands set it, including `dead-code`,\nwhich classifies the file before its required fields could reject it.\nA file with no `kind` is the reading a baseline saved before that member\nexisted gets, which is why the keys remain the fallback."
+        },
+        "scope_reasons": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/definitions/ScopeReason"
+          },
+          "description": "Which channels narrowed this run, present and non-empty exactly when\n`change_scoped` is true. Both members are derived from one function, so\nthe boolean and the array cannot disagree.\n\nRead it to decide whether the narrowing is removable: a run narrowed\nonly by `diff`, `changed-since`, `changed-files`, `scope`, `file` or\n`issue-type-filter` can be repeated unscoped to judge the baseline,\nwhile `production`, `workspace` and `changed-workspaces` are the\ncaller's own choice about what to analyze and an unscoped repeat would\ncontradict it.\n\nThe name set is OPEN and the names a command can emit differ per\ncommand; see [`ScopeReason`]."
         }
       },
       "required": [
@@ -26418,7 +26513,7 @@
       "additionalProperties": {
         "$ref": "#/definitions/RequestOutcome"
       },
-      "description": "Every narrowing or shaping request a run RECEIVED, keyed by name.\n\nReceived, not failed: a request the run honoured is published with\n`status: \"applied\"`, so a consumer can say \"scoped to the change\"\npositively. Read an absent object as \"nothing was asked for\", never as\n\"nothing failed\".\n\nAbsent from an envelope whenever it is empty, so a run that was asked for\nnothing is byte-identical to one produced before this object existed. An\nempty object is never emitted: it would assert that something was asked and\nall of it applied, which is a different and false claim.\n\nThe names this build can emit are `changed-since`, `diff-filter` and\n`sarif-file`. The reasons are `git-missing`, `not-a-repository`,\n`git-failed` and `invalid-ref` for `changed-since`, `oversize`,\n`unreadable`, `not-utf8`, `foreign-namespace` and `ambiguous-base` for\n`diff-filter`, and `directory-create-failed`, `write-failed` and\n`serialize-failed` for `sarif-file`. Every set is OPEN: a name a consumer\ndoes not recognise means \"some request\", not an error.\n\n`sarif-file` reports a SECONDARY artifact rather than the scope of the\nreport it travels in, and it is in the same object for the same reason the\nothers are: the run was asked to do something and did something else, and\nnothing in the primary report says so. Which of the two an entry is, every\nentry says for itself: `affects` is `scope` for the narrowing requests and\n`artifact` for this one. Select on it. A consumer that instead assumes the\nwhole object narrows the report tells its reader an unwritten SARIF file\nwidened the analysis, which is what `affects` exists to prevent.\n\n`invalid-ref` is reachable only through the programmatic API. The\n`--changed-since` flag validates its value before a run starts and fails\nwith exit 2 and an error document, which is the right side to err on: a\nmalformed ref is invalid input rather than a report of the wrong scope."
+      "description": "Every narrowing or shaping request a run RECEIVED, keyed by name.\n\nReceived, not failed: a request the run honoured is published with\n`status: \"applied\"`, so a consumer can say \"scoped to the change\"\npositively. Read an absent object as \"nothing was asked for\", never as\n\"nothing failed\".\n\nAbsent from an envelope whenever it is empty, so a run that was asked for\nnothing is byte-identical to one produced before this object existed. An\nempty object is never emitted: it would assert that something was asked and\nall of it applied, which is a different and false claim.\n\nThe names this build can emit are `changed-since`, `diff-filter` and\n`sarif-file`. The reasons are `git-missing`, `not-a-repository`,\n`git-failed` and `invalid-ref` for `changed-since`, `oversize`,\n`unreadable`, `not-utf8`, `foreign-namespace` and `ambiguous-base` for\n`diff-filter`, and `directory-create-failed`, `write-failed` and\n`serialize-failed` for `sarif-file`. Every set is OPEN: a name a consumer\ndoes not recognise means \"some request\", not an error.\n\n`sarif-file` reports a SECONDARY artifact rather than the scope of the\nreport it travels in, and it is in the same object for the same reason the\nothers are: the run was asked to do something and did something else, and\nnothing in the primary report says so. Which of the two an entry is, every\nentry says for itself: `affects` is `scope` for the narrowing requests and\n`artifact` for this one. Select on it. A consumer that instead assumes the\nwhole object narrows the report tells its reader an unwritten SARIF file\nwidened the analysis, which is what `affects` exists to prevent.\n\n`scope_size` is emitted for `diff-filter` only today, in added lines. A\nconsumer reads the unit off the name, so a name that starts measuring its\nown scope in a later release needs no change here.\n\n`invalid-ref` is reachable only through the programmatic API. The\n`--changed-since` flag validates its value before a run starts and fails\nwith exit 2 and an error document, which is the right side to err on: a\nmalformed ref is invalid input rather than a report of the wrong scope."
     },
     "RequestOutcome": {
       "type": "object",
@@ -26434,6 +26529,13 @@
         "requested": {
           "type": "string",
           "description": "What was asked, as the user spelled it: the git ref for\n`changed-since`, the diff source label (`--diff-file pr.diff`,\n`--diff-stdin`, `$FALLOW_DIFF_FILE build/pr.diff`) for `diff-filter`,\nthe target path for `sarif-file`. Echoed rather than normalised, so a\nconsumer must not join it to the project root the way it joins every\nother path-shaped field."
+        },
+        "scope_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "How much this request left in scope, in the request's own unit, when the\nrun applied it AND measured that scope. Absent otherwise, including on\nevery unapplied entry: a request that stood down narrowed nothing, so a\nnumber there would describe a scope nobody applied.\n\nThe unit belongs to the name. `diff-filter` counts added lines, which is\nwhat its filter keeps a finding for. Read the unit off the name the entry\nis keyed under, never across names, and read an absent member as \"not\nmeasured\" rather than as zero.\n\nThe count is what the run INDEXED rather than the true total:\n`diff-filter` indexes at most one million added lines and reports that\ncap for a larger diff, so read any non-zero value as a lower bound.\n\n`0` is the case this member exists for: a request that applied over an\nEMPTY scope. Every finding then filters out and the report reads clean,\nso a consumer that sees no findings beside `scope_size: 0` learns that\nnothing was analyzable rather than that the code is clean."
         },
         "reason": {
           "type": [
@@ -26506,6 +26608,56 @@
         }
       ],
       "description": "What a request governs, and therefore what its failure means.\n\nPublished on every entry so a consumer selects on the class rather than on\na name list. Without it the one sentence a consumer can write for the whole\nobject (\"the report is wider than requested\") is false for any request that\ndoes not narrow, which is how a failed `--sarif-file` write came to be\nreported as an unscoped run. A request name added later carries its own\nclass, so a consumer written today keeps saying the right thing about it.\n\nThe value set is OPEN, like the names and the statuses: read a class this\nbuild does not recognise as \"some request\", not as an error, and do not read\nit as `scope`."
+    },
+    "ScopeReason": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "diff",
+          "description": "A diff index reached the analysis, from `--diff-file`, `--diff-stdin`,\n`FALLOW_DIFF_FILE` or the shared index a CI format installs."
+        },
+        {
+          "type": "string",
+          "const": "changed-since",
+          "description": "`--changed-since`."
+        },
+        {
+          "type": "string",
+          "const": "changed-files",
+          "description": "A resolved changed-file set, on the commands that see the set rather\nthan the flag that produced it."
+        },
+        {
+          "type": "string",
+          "const": "workspace",
+          "description": "`--workspace`. On `health` this also covers `--changed-workspaces`,\nwhich it cannot distinguish."
+        },
+        {
+          "type": "string",
+          "const": "changed-workspaces",
+          "description": "`--changed-workspaces`."
+        },
+        {
+          "type": "string",
+          "const": "scope",
+          "description": "`--scope`."
+        },
+        {
+          "type": "string",
+          "const": "file",
+          "description": "One or more `--file`."
+        },
+        {
+          "type": "string",
+          "const": "issue-type-filter",
+          "description": "An active issue-type filter such as `--unused-exports`, which drops\nwhole baseline categories before the comparison."
+        },
+        {
+          "type": "string",
+          "const": "production",
+          "description": "Production mode, from the flag or the resolved project config. It drops\ntest, story and dev files at discovery."
+        }
+      ],
+      "description": "One channel that narrowed a run to part of the project.\n\nSerialized as kebab-case inside `scope_reasons` and published as an OPEN\nset, the same tolerate-unknown contract `gate_outcomes` keys carry: a name\nthis build does not emit means \"some narrowing\", not an error.\n\nWhich names a command can emit differs per command, because the three\nnarrowing predicates see different state. `dead-code` reads the flags\nthemselves and can name every channel. `dupes` and `health` see an already\nresolved changed-file set and report `changed-files`, because at that point\nthe flag that produced it is gone. `health` reports `workspace` for both\n`--workspace` and `--changed-workspaces` for the same reason. A consumer\nmust therefore not assume a given command emits a given name."
     }
   }
 }

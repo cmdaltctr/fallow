@@ -155,52 +155,25 @@ const CARRIER_KEYS: &[&str] = &[
 
 /// Every verdict this envelope states, in a fixed order so two identical runs
 /// produce identical responses.
+///
+/// The baseline sites are the shared list, because the pull-request comment
+/// advisory reads the same envelopes and a site only one surface knows about
+/// is a baseline only one surface reports. `audit` resolves its baselines from
+/// config as well as from parameters, which is why the sites are keyed on the
+/// envelope rather than on what the caller passed.
 fn verdict_warnings(root: &Map<String, Value>) -> Vec<String> {
     let noun = noun(root);
-    let mut warnings: Vec<String> = BASELINE_SITES
-        .iter()
-        .filter_map(|(path, analysis)| baseline_warning(lookup(root, path)?, *analysis, noun))
+    let gate_runs = stale_baseline_gate_runs(root);
+    let mut warnings: Vec<String> = fallow_types::envelope_sites::baseline_staleness_objects(root)
+        .filter_map(|(staleness, analysis)| baseline_warning(staleness, analysis, noun, gate_runs))
         .collect();
     let baseline_reported = !warnings.is_empty();
     warnings.extend(gate_warnings(root, baseline_reported));
     warnings.extend(degraded_analysis_warning(root));
     warnings.extend(unapplied_request_warning(root));
+    warnings.extend(empty_scope_request_warning(root));
     warnings
 }
-
-/// Where a loaded baseline's staleness sits on each envelope shape, and which
-/// analysis it belongs to on the shapes that carry more than one.
-///
-/// Every row is a path a run actually emits, measured rather than inferred.
-/// `dead-code` and `dupes` publish it at the root and `health` inside
-/// `summary`; the combined envelope repeats those under `check`, `dupes` and
-/// `health`. `audit` publishes exactly one, under its `complexity` section's
-/// own `summary`, and none for its dead-code or duplication baselines, so
-/// there are no rows for those. Naming the sites is what keeps the
-/// multi-section shapes from reporting one baseline's rot against another's
-/// counts, and a shape that carries none of them contributes nothing.
-///
-/// The label is the section the envelope actually uses, not the command the
-/// baseline came from, because that is what an agent reading the sentence goes
-/// looking for. Audit's row is quiet today for a reason of its own: every audit
-/// is change-scoped, so its staleness object always reports
-/// `change_scoped: true`, which makes both the advisory and `gate_trips` false
-/// by construction.
-///
-/// `audit` resolves its baselines from config as well as from parameters,
-/// which is why the rows are keyed on the envelope rather than on what the
-/// caller passed.
-const BASELINE_SITES: &[(&[&str], Option<&str>)] = &[
-    (&["baseline_staleness"], None),
-    (&["summary", "baseline_staleness"], None),
-    (&["check", "baseline_staleness"], Some("dead-code")),
-    (&["dupes", "baseline_staleness"], Some("duplication")),
-    (&["health", "summary", "baseline_staleness"], Some("health")),
-    (
-        &["complexity", "summary", "baseline_staleness"],
-        Some("complexity"),
-    ),
-];
 
 /// Where a run publishes the diagnostics that say it was degraded, in the
 /// order they are looked for.
@@ -216,15 +189,6 @@ const DIAGNOSTIC_SITES: &[&[&str]] = &[
     &["complexity", "workspace_diagnostics"],
 ];
 
-fn lookup<'a>(root: &'a Map<String, Value>, path: &[&str]) -> Option<&'a Value> {
-    let (first, rest) = path.split_first()?;
-    let mut current = root.get(*first)?;
-    for key in rest {
-        current = current.get(key)?;
-    }
-    Some(current)
-}
-
 /// What this command calls the things a baseline entry describes, matching the
 /// noun its own CLI advisory uses. Read from the envelope's `kind`, so a
 /// multi-section run keeps the generic noun rather than borrowing one
@@ -238,15 +202,27 @@ fn noun(root: &Map<String, Value>) -> &'static str {
 }
 
 /// One sentence for a loaded baseline that matched less than it was saved
-/// with, mirroring the CLI's two advisory messages and its gate message.
+/// with, mirroring the CLI's two advisory messages and its gate message, for
+/// one this run was too narrow to judge at all, or for a file that is not this
+/// command's baseline.
+///
+/// A file written by another command is read from `unrecognised_format` rather
+/// than from `baseline_entries == 0`, which is also what a baseline saved on a
+/// project with nothing to record carries.
 ///
 /// The remedy names the parameter rather than a path because the envelope
 /// carries no baseline path, and because `audit` resolves its three baselines
 /// from config, where there was never a parameter to echo back.
+///
+/// `gate_runs` decides whether the sentence carries the gate clause. The gate
+/// rule is a fact about the baseline. What `--fail-on-stale-baseline` does with it
+/// is a fact about the command. `fallow audit` rejects that flag, and its
+/// `stale-baseline` entry stands down for every baseline it loads.
 fn baseline_warning(
     staleness: &Value,
     analysis: Option<&str>,
     noun: &'static str,
+    gate_runs: bool,
 ) -> Option<String> {
     let advisory = staleness
         .get("warning")
@@ -256,16 +232,34 @@ fn baseline_warning(
         .get("gate_trips")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if advisory == "none" && !gate_trips {
-        return None;
-    }
-
-    let total = entries(count(staleness, "baseline_entries"));
+    let baseline_entries = count(staleness, "baseline_entries");
+    let total = entries(baseline_entries);
     let stale = count(staleness, "stale_entries");
     let subject = analysis.map_or_else(
         || "the loaded baseline".to_string(),
         |analysis| format!("the {analysis} baseline"),
     );
+    if staleness
+        .get("unrecognised_format")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let mut message = format!(
+            "Baseline staleness: {subject} has no entries this command recognises. It may be a \
+             baseline saved by another command, or an empty file. Either way it suppresses \
+             nothing."
+        );
+        // The gate rule holds on such a file, so the clause belongs here too:
+        // without it an agent reads a sentence about a harmless empty file while
+        // the same run would fail a repository that armed the gate.
+        if gate_trips && gate_runs {
+            message.push_str(" --fail-on-stale-baseline fails a run in this state.");
+        }
+        return Some(message);
+    }
+    if advisory == "none" && !gate_trips {
+        return unjudged_baseline_warning(staleness, &subject, &total, baseline_entries);
+    }
 
     let mut message = match advisory {
         "zero-overlap" => format!(
@@ -280,11 +274,83 @@ fn baseline_warning(
             "Baseline staleness: {stale} of {total} in {subject} matched no current {noun}."
         ),
     };
-    if gate_trips {
+    if gate_trips && gate_runs {
         message.push_str(" --fail-on-stale-baseline fails a run in this state.");
     }
     message.push_str(" Re-save it with the save_baseline parameter (CLI --save-baseline).");
     Some(message)
+}
+
+/// Whether the command that produced this envelope runs the stale-baseline gate
+/// at all.
+///
+/// False only when the envelope says the gate stood down for every baseline it
+/// loaded. That command is `fallow audit`: every audit is change-scoped, the gate
+/// is inert by design, and the flag is rejected. An envelope with no entry
+/// predates `gate_outcomes` or armed no gate, and there the clause is correct.
+fn stale_baseline_gate_runs(root: &Map<String, Value>) -> bool {
+    root.get("gate_outcomes")
+        .and_then(Value::as_object)
+        .and_then(|gates| gates.get("stale-baseline"))
+        .and_then(|outcome| outcome.get("status"))
+        .and_then(Value::as_str)
+        != Some("skipped")
+}
+
+/// One sentence for a baseline this run could not judge at all, which neither
+/// advisory covers.
+///
+/// Reached only with a non-empty baseline; a zero-entry one is reported by its
+/// own sentence before this, because "nothing was judged" and "there was
+/// nothing to judge" are different problems with different remedies.
+///
+/// A change-scoped run compares a whole-project baseline against a slice of
+/// it, so the advisory and the gate both stand down by construction and a
+/// rotting baseline stays silent for as long as every run is narrowed. The
+/// parenthetical names `scope_reasons`; an envelope from a version that
+/// predates that member drops the clause rather than guessing.
+fn unjudged_baseline_warning(
+    staleness: &Value,
+    subject: &str,
+    total: &str,
+    baseline_entries: u64,
+) -> Option<String> {
+    if baseline_entries == 0 {
+        return None;
+    }
+    if !staleness
+        .get("change_scoped")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let reasons = scope_reasons(staleness);
+    let scope = if reasons.is_empty() {
+        "only part of the project".to_string()
+    } else {
+        format!("only part of the project ({reasons})")
+    };
+    Some(format!(
+        "Baseline staleness: {subject} has {total} and was not judged on this run, which \
+         analyzed {scope}. Run the command over the whole project to judge it."
+    ))
+}
+
+/// The run's `scope_reasons` as a comma-joined list, empty when the member is
+/// absent or carries nothing readable.
+fn scope_reasons(staleness: &Value) -> String {
+    staleness
+        .get("scope_reasons")
+        .and_then(Value::as_array)
+        .map(|reasons| {
+            reasons
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
 }
 
 fn count(value: &Value, key: &str) -> u64 {
@@ -408,7 +474,7 @@ fn number(value: f64) -> String {
 fn degraded_analysis_warning(root: &Map<String, Value>) -> Option<String> {
     let counts = DIAGNOSTIC_SITES
         .iter()
-        .filter_map(|path| lookup(root, path)?.as_array())
+        .filter_map(|path| fallow_types::envelope_sites::lookup(root, path)?.as_array())
         .map(|diagnostics| degrading_kinds(diagnostics))
         .find(|counts| !counts.is_empty())?;
     let kinds = counts
@@ -484,6 +550,39 @@ fn unapplied_request_warning(root: &Map<String, Value>) -> Option<String> {
     (!sentences.is_empty()).then(|| sentences.join(" "))
 }
 
+/// One sentence for a narrowing request the run DID apply over a scope it
+/// measured as empty.
+///
+/// The opposite shape of [`unapplied_request_warning`], and the one a clean
+/// report cannot state for itself: every finding filters out of an empty scope,
+/// so the agent is handed a report with nothing in it for a run that analyzed
+/// nothing. Keyed on `scope_size == 0` beside `status == "applied"`, so an
+/// envelope from a binary that publishes no such member says nothing here.
+///
+/// Restricted to `affects == "scope"`: a request that writes a file beside the
+/// report never narrows what was analyzed, so a size it measured says nothing
+/// about the findings.
+fn empty_scope_request_warning(root: &Map<String, Value>) -> Option<String> {
+    let requests = root.get("request_outcomes")?.as_object()?;
+    let empty: Vec<&str> = requests
+        .iter()
+        .filter(|(_, outcome)| {
+            outcome.get("status").and_then(Value::as_str) == Some("applied")
+                && outcome.get("affects").and_then(Value::as_str) == Some("scope")
+                && outcome.get("scope_size").and_then(Value::as_u64) == Some(0)
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    (!empty.is_empty()).then(|| {
+        format!(
+            "Requests applied over an empty scope: {}. No finding can survive a scope that \
+             measured nothing, so this report is clean because nothing in it was analyzable, not \
+             because the code is clean; check the diff or ref the run was given.",
+            empty.join(", ")
+        )
+    })
+}
+
 fn degrading_kinds(diagnostics: &[Value]) -> BTreeMap<&str, usize> {
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for diagnostic in diagnostics {
@@ -504,7 +603,11 @@ mod tests {
     use super::*;
 
     fn warnings_of(envelope: &Value) -> Vec<String> {
-        let annotated = annotate_envelope(&envelope.to_string()).expect("envelope is annotated");
+        // `None` means the run had nothing to state, which is a verdict of its
+        // own and must read as an empty list rather than as a broken envelope.
+        let Some(annotated) = annotate_envelope(&envelope.to_string()) else {
+            return Vec::new();
+        };
         let value: Value = serde_json::from_str(&annotated).expect("annotated body parses");
         value["warnings"]
             .as_array()
@@ -526,6 +629,223 @@ mod tests {
             "gate_trips": gate_trips,
             "moved_entries": 0,
         })
+    }
+
+    /// A narrowed run compares a whole-project baseline against a slice of it,
+    /// so the advisory and the gate both stand down by construction. Without a
+    /// third sentence such a baseline rots without a word for as long as every
+    /// run is narrowed, which is every merge-request pipeline.
+    #[test]
+    fn a_baseline_no_run_could_judge_is_still_reported() {
+        let warnings = warnings_of(&serde_json::json!({
+            "kind": "dead-code",
+            "baseline_staleness": {
+                "baseline_entries": 8,
+                "matched_entries": 0,
+                "stale_entries": 8,
+                "current_findings": 0,
+                "change_scoped": true,
+                "stale": false,
+                "warning": "none",
+                "gate_trips": false,
+                "moved_entries": 0,
+                "scope_reasons": ["changed-since", "production"],
+            },
+        }));
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(
+            warnings[0],
+            "Baseline staleness: the loaded baseline has 8 entries and was not judged on this \
+             run, which analyzed only part of the project (changed-since, production). Run the \
+             command over the whole project to judge it."
+        );
+    }
+
+    /// An envelope from a version that predates `scope_reasons` still gets the
+    /// sentence, minus the clause it cannot fill.
+    #[test]
+    fn an_unjudged_baseline_without_scope_reasons_drops_the_clause() {
+        let warnings = warnings_of(&serde_json::json!({
+            "kind": "dupes",
+            "baseline_staleness": {
+                "baseline_entries": 3,
+                "matched_entries": 0,
+                "stale_entries": 3,
+                "current_findings": 0,
+                "change_scoped": true,
+                "stale": false,
+                "warning": "none",
+                "gate_trips": false,
+                "moved_entries": 0,
+            },
+        }));
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("analyzed only part of the project. Run the command"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_baseline_on_a_narrowed_run_says_nothing_about_staleness() {
+        let warnings = warnings_of(&serde_json::json!({
+            "kind": "dead-code",
+            "baseline_staleness": {
+                "baseline_entries": 0,
+                "matched_entries": 0,
+                "stale_entries": 0,
+                "current_findings": 0,
+                "change_scoped": true,
+                "stale": false,
+                "warning": "none",
+                "gate_trips": false,
+                "moved_entries": 0,
+                "scope_reasons": ["production"],
+            },
+        }));
+
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.contains("was not judged")),
+            "{warnings:?}"
+        );
+    }
+
+    /// A baseline written by another command earns every green verdict below
+    /// honestly and would otherwise say nothing, so an agent handed the report
+    /// cannot tell a working baseline from one saved by another command.
+    #[test]
+    fn a_baseline_with_no_recognised_entries_is_reported() {
+        let mut unrecognised = staleness("none", 0, 0, false);
+        unrecognised["unrecognised_format"] = serde_json::json!(true);
+        let warnings = warnings_of(&serde_json::json!({
+            "kind": "dupes",
+            "baseline_staleness": unrecognised,
+        }));
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(
+            warnings[0],
+            "Baseline staleness: the loaded baseline has no entries this command recognises. It \
+             may be a baseline saved by another command, or an empty file. Either way it \
+             suppresses nothing."
+        );
+    }
+
+    /// The gate rule holds on such a file, so the sentence carries the clause the
+    /// count sentences carry. Without it an agent reads about a harmless empty
+    /// file while the same run fails a repository that armed the gate.
+    #[test]
+    fn a_baseline_with_no_recognised_entries_says_the_gate_fails_on_it() {
+        let mut unrecognised = staleness("none", 0, 0, true);
+        unrecognised["unrecognised_format"] = serde_json::json!(true);
+        let warnings = warnings_of(&serde_json::json!({
+            "kind": "dupes",
+            "baseline_staleness": unrecognised,
+        }));
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].ends_with(" --fail-on-stale-baseline fails a run in this state."),
+            "{warnings:?}"
+        );
+    }
+
+    /// `fallow audit` reports the gate rule on a file it cannot read as the
+    /// section's own. The same envelope reports the gate as stood down for every
+    /// baseline, because every audit is change-scoped and the flag is rejected.
+    /// The clause would name a flag that run never accepts.
+    #[test]
+    fn an_audit_baseline_says_nothing_about_a_gate_that_never_runs() {
+        let mut unrecognised = staleness("none", 0, 0, true);
+        unrecognised["unrecognised_format"] = serde_json::json!(true);
+        unrecognised["change_scoped"] = serde_json::json!(true);
+        let warnings = warnings_of(&serde_json::json!({
+            "kind": "audit",
+            "verdict": "pass",
+            "complexity": { "summary": { "baseline_staleness": unrecognised } },
+            "gate_outcomes": {
+                "stale-baseline": { "status": "skipped", "enforced": false },
+                "audit-verdict": { "status": "pass", "enforced": true },
+            },
+        }));
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("no entries this command recognises"),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings[0].contains("--fail-on-stale-baseline"),
+            "audit never runs that gate: {warnings:?}"
+        );
+    }
+
+    /// A command that does run the gate keeps the clause. The suppression above
+    /// therefore reads the published verdict, not the recognition member.
+    #[test]
+    fn a_standalone_run_whose_gate_reports_a_verdict_keeps_the_clause() {
+        let mut unrecognised = staleness("none", 0, 0, true);
+        unrecognised["unrecognised_format"] = serde_json::json!(true);
+        let warnings = warnings_of(&serde_json::json!({
+            "kind": "dupes",
+            "baseline_staleness": unrecognised,
+            "gate_outcomes": {
+                "stale-baseline": { "status": "fail", "enforced": false },
+            },
+        }));
+
+        assert!(
+            warnings[0].ends_with(" --fail-on-stale-baseline fails a run in this state."),
+            "{warnings:?}"
+        );
+    }
+
+    /// The same numbers with the member absent describe a baseline saved on a
+    /// project that had nothing to record, which is not a mistake and must not
+    /// be reported as one.
+    #[test]
+    fn an_empty_baseline_of_this_command_is_not_reported() {
+        let warnings = warnings_of(&serde_json::json!({
+            "kind": "dupes",
+            "baseline_staleness": staleness("none", 0, 0, false),
+        }));
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// The unrecognised sentence wins over the unjudged one: "this is not a
+    /// baseline of mine" and "nothing judged it" are different problems with
+    /// different remedies, and re-running unscoped would not fix the first.
+    #[test]
+    fn a_zero_entry_baseline_on_a_narrowed_run_reports_the_empty_baseline() {
+        let warnings = warnings_of(&serde_json::json!({
+            "kind": "health",
+            "summary": {
+                "baseline_staleness": {
+                    "baseline_entries": 0,
+                    "matched_entries": 0,
+                    "stale_entries": 0,
+                    "current_findings": 0,
+                    "change_scoped": true,
+                    "stale": false,
+                    "warning": "none",
+                    "gate_trips": false,
+                    "moved_entries": 0,
+                    "unrecognised_format": true,
+                    "scope_reasons": ["production"],
+                },
+            },
+        }));
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("no entries this command recognises"),
+            "{warnings:?}"
+        );
     }
 
     #[test]
@@ -771,11 +1091,12 @@ mod tests {
     /// the diagnostics sit under `dead_code` and the only staleness object
     /// audit publishes sits under `complexity.summary`, with
     /// `change_scoped: true` because every audit is change-scoped. So a real
-    /// audit reports its degraded run and stays silent about its baseline, and
-    /// that silence is the contract rather than a miss: a change-scoped run
-    /// cannot judge a whole-project baseline.
+    /// audit reports its degraded run, and now also reports the baseline no
+    /// audit can judge. A change-scoped run cannot judge a whole-project
+    /// baseline, which used to be stated as silence; a baseline every run
+    /// stands down on rots without a word, so it gets the unjudged sentence.
     #[test]
-    fn an_audit_envelope_reports_its_degraded_run_and_not_its_scoped_baseline() {
+    fn an_audit_envelope_reports_its_degraded_run_and_its_unjudged_baseline() {
         let warnings = warnings_of(&serde_json::json!({
             "kind": "audit",
             "verdict": "pass",
@@ -801,9 +1122,13 @@ mod tests {
             },
         }));
 
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
-            warnings[0].contains("node-modules-missing (1)"),
+            warnings[0].contains("the complexity baseline has 1 entry and was not judged"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("node-modules-missing (1)"),
             "{warnings:?}"
         );
     }
@@ -1013,22 +1338,67 @@ mod tests {
     }
 
     /// A run that applied everything it was asked adds nothing, so the object
-    /// appearing on every scoped CI run cannot make every response noisy.
+    /// appearing on every scoped CI run cannot make every response noisy. A
+    /// measured non-empty scope and an unmeasured one are both silent.
     #[test]
     fn a_run_that_applied_everything_it_was_asked_adds_no_warning() {
         let envelope = serde_json::json!({
             "kind": "dead-code",
             "request_outcomes": {
+                "changed-since": {
+                    "status": "applied",
+                    "affects": "scope",
+                    "requested": "origin/main"
+                },
                 "diff-filter": {
                     "status": "applied",
                     "affects": "scope",
-                    "requested": "--diff-stdin"
+                    "requested": "--diff-stdin",
+                    "scope_size": 12
                 }
             },
         });
         assert!(
             annotate_envelope(&envelope.to_string()).is_none(),
             "nothing to add must pass the original bytes through"
+        );
+    }
+
+    /// The Action and the GitLab template warn on this shape, and MCP runs the
+    /// CLI with `--quiet`, so without this sentence the agent is handed a clean
+    /// report for a run that analyzed nothing.
+    #[test]
+    fn a_narrowing_request_applied_over_an_empty_scope_says_the_report_covered_nothing() {
+        let warnings = warnings_of(&serde_json::json!({
+            "kind": "dead-code",
+            "request_outcomes": {
+                "diff-filter": {
+                    "status": "applied",
+                    "affects": "scope",
+                    "requested": "--diff-stdin",
+                    "scope_size": 0
+                },
+                "sarif-file": {
+                    "status": "applied",
+                    "affects": "artifact",
+                    "requested": "out.sarif",
+                    "scope_size": 0
+                }
+            },
+        }));
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("Requests applied over an empty scope: diff-filter."),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings[0].contains("sarif-file"),
+            "a file written beside the report narrows nothing: {warnings:?}"
+        );
+        assert!(
+            !warnings[0].contains("WIDER"),
+            "the report is not wider than asked, it is empty: {warnings:?}"
         );
     }
 

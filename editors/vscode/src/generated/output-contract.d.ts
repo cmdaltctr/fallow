@@ -421,6 +421,22 @@ export type DependencyOverrideMisconfigReason = ("unparsable-key" | "empty-value
  */
 export type BaselineStalenessAdvisory = ("none" | "zero-overlap" | "partial")
 /**
+ * One channel that narrowed a run to part of the project.
+ *
+ * Serialized as kebab-case inside `scope_reasons` and published as an OPEN
+ * set, the same tolerate-unknown contract `gate_outcomes` keys carry: a name
+ * this build does not emit means "some narrowing", not an error.
+ *
+ * Which names a command can emit differs per command, because the three
+ * narrowing predicates see different state. `dead-code` reads the flags
+ * themselves and can name every channel. `dupes` and `health` see an already
+ * resolved changed-file set and report `changed-files`, because at that point
+ * the flag that produced it is gone. `health` reports `workspace` for both
+ * `--workspace` and `--changed-workspaces` for the same reason. A consumer
+ * must therefore not assume a given command emits a given name.
+ */
+export type ScopeReason = ("diff" | "changed-since" | "changed-files" | "workspace" | "changed-workspaces" | "scope" | "file" | "issue-type-filter" | "production")
+/**
  * Status of a regression-check pass.
  */
 export type RegressionStatus = ("pass" | "exceeded" | "skipped")
@@ -600,6 +616,17 @@ kind: "no-source-files-analyzed"
 error: string
 kind: "file-scores-unavailable"
 } | {
+/**
+ * Which input stopped it, as a kebab-case token: `not-a-repository`,
+ * `invalid-since` or `churn-file-unreadable`. The set is open.
+ *
+ * The cause decides the remedy, which is why it is on the wire: a run
+ * outside a repository is fixed by running fallow inside one, a
+ * malformed `--since` by respelling the flag, and a churn file that
+ * changed under the run by rerunning it. A consumer reading only the
+ * kind would offer the first remedy for all three.
+ */
+cause: string
 kind: "hotspots-skipped"
 } | {
 /**
@@ -627,6 +654,50 @@ kind: "ownership-unavailable"
  */
 error: string
 kind: "trend-snapshot-unreadable"
+} | {
+/**
+ * The plugin that read the config, as it labels itself:
+ * `module-federation` for a standalone `module-federation.config.*`,
+ * or the bundler plugin (`webpack`, `rspack`, `rsbuild`, `vite`) that
+ * read the same options inline from its own config.
+ */
+plugin: string
+/**
+ * The config key that was present and not fully readable (`exposes`,
+ * `remotes`). The set is open.
+ */
+key: string
+/**
+ * Why it could not be read, as a kebab-case token:
+ * `not-object-literal`, `array-form`, `spread` or
+ * `unreadable-entries`. The set is open.
+ *
+ * The reason decides the remedy, which is why it is on the wire: a
+ * value that is not an object literal is fixed by writing one, while
+ * unreadable entries are fixed by naming those entries in the config
+ * option the message points at.
+ */
+reason: string
+kind: "plugin-config-unreadable"
+} | {
+/**
+ * The plugin that read the config, as it labels itself (`nuxt`).
+ */
+plugin: string
+/**
+ * The config key whose effect is not modeled (`components`,
+ * `imports`). The set is open.
+ */
+key: string
+/**
+ * Why the effect is not modeled, as a kebab-case token:
+ * `key-effect-not-modeled` when the key's own value is the reason,
+ * `config-property-unreadable` when a top-level property of the same
+ * config file could not be read statically, so no surface in it can
+ * be classified at all. The set is open.
+ */
+reason: string
+kind: "plugin-effect-not-modeled"
 } | {
 kind: "coverage-auto-detected"
 })
@@ -2907,10 +2978,12 @@ _meta?: (Meta | null)
  *   `source-parse-degraded`;
  * - dead-code analysis, from the dependency-catalog and override
  *   detectors: `malformed-pnpm-workspace-yaml`,
- *   `bun-lockb-override-resolution-skipped`.
+ *   `bun-lockb-override-resolution-skipped`;
+ * - framework plugins, while they read their own build configs:
+ *   `plugin-config-unreadable`, `plugin-effect-not-modeled`.
  *
- * Analysis-stage kinds therefore reach only the envelopes whose run
- * includes a dead-code analyze pass, never a standalone
+ * Analysis-stage and plugin-stage kinds therefore reach only the envelopes
+ * whose run includes a dead-code analyze pass, never a standalone
  * `fallow dupes --format json`. `path` is project-root-relative with
  * forward slashes; the array is omitted when empty. The same list is
  * repeated on each top-level command's envelope so single-command
@@ -5358,7 +5431,8 @@ current_findings: number
  * differ per command and include a diff, a base ref, `--changed-since`,
  * `--workspace`, `--changed-workspaces`, `--scope`, `--file`, an
  * issue-type filter, and production mode. Both `stale` and `gate_trips`
- * are false whenever this is true.
+ * are false whenever this is true. `scope_reasons` names the channels
+ * that fired.
  */
 change_scoped: boolean
 /**
@@ -5370,13 +5444,21 @@ change_scoped: boolean
 stale: boolean
 warning: BaselineStalenessAdvisory
 /**
- * True exactly when
- * `!change_scoped && baseline_entries > 0 && matched_entries < baseline_entries`,
- * which is the rule `--fail-on-stale-baseline` applies. Deliberately
- * stricter than `stale`: any unmatched entry counts. It describes the
- * baseline, not the run's exit code: `health --report-only` is an explicit
- * request never to fail, so that run exits 0 and says so on stderr while
- * still reporting `gate_trips: true` here.
+ * True exactly when `unrecognised_format` is true, or
+ * `!change_scoped && baseline_entries > 0 && matched_entries < baseline_entries`.
+ * That is the rule `--fail-on-stale-baseline` applies. Deliberately
+ * stricter than `stale`: any unmatched entry counts, and so does a file
+ * this command could not read as its own, which protects nothing at all.
+ * The second half is suppressed by `change_scoped` and the first is not:
+ * which command wrote a file does not depend on how much of the project
+ * the run looked at.
+ *
+ * It describes the baseline, not the run's exit code: `health
+ * --report-only` is an explicit request never to fail, so that run exits 0
+ * and says so on stderr while still reporting `gate_trips: true` here, and
+ * `fallow audit` never judges a baseline at all, so its
+ * `gate_outcomes["stale-baseline"]` stands down beside a section that
+ * reports `true`.
  */
 gate_trips: boolean
 /**
@@ -5386,6 +5468,37 @@ gate_trips: boolean
  * `0`. Always `0` in health's count mode too.
  */
 moved_entries: number
+/**
+ * True when the loaded file is not a baseline of the command that read it:
+ * it names another command in its top-level `kind`, or it names none and
+ * carries no key this command's own format writes. Read this, not
+ * `baseline_entries == 0`, before telling anyone their baseline is the
+ * wrong file: a baseline saved from a project that had nothing to record
+ * is legitimately empty and is not a mistake.
+ *
+ * Present only when true, so an envelope from a run that loaded its own
+ * baseline is unchanged. All three commands set it, including `dead-code`,
+ * which classifies the file before its required fields could reject it.
+ * A file with no `kind` is the reading a baseline saved before that member
+ * existed gets, which is why the keys remain the fallback.
+ */
+unrecognised_format?: boolean
+/**
+ * Which channels narrowed this run, present and non-empty exactly when
+ * `change_scoped` is true. Both members are derived from one function, so
+ * the boolean and the array cannot disagree.
+ *
+ * Read it to decide whether the narrowing is removable: a run narrowed
+ * only by `diff`, `changed-since`, `changed-files`, `scope`, `file` or
+ * `issue-type-filter` can be repeated unscoped to judge the baseline,
+ * while `production`, `workspace` and `changed-workspaces` are the
+ * caller's own choice about what to analyze and an unscoped repeat would
+ * contradict it.
+ *
+ * The name set is OPEN and the names a command can emit differ per
+ * command; see [`ScopeReason`].
+ */
+scope_reasons?: ScopeReason[]
 }
 /**
  * Result of regression detection (`--fail-on-regression`). Compares current
@@ -5453,6 +5566,10 @@ reason?: (string | null)
  * whole object narrows the report tells its reader an unwritten SARIF file
  * widened the analysis, which is what `affects` exists to prevent.
  *
+ * `scope_size` is emitted for `diff-filter` only today, in added lines. A
+ * consumer reads the unit off the name, so a name that starts measuring its
+ * own scope in a later release needs no change here.
+ *
  * `invalid-ref` is reachable only through the programmatic API. The
  * `--changed-since` flag validates its value before a run starts and fails
  * with exit 2 and an error document, which is the right side to err on: a
@@ -5480,6 +5597,27 @@ affects: RequestEffect
  * other path-shaped field.
  */
 requested: string
+/**
+ * How much this request left in scope, in the request's own unit, when the
+ * run applied it AND measured that scope. Absent otherwise, including on
+ * every unapplied entry: a request that stood down narrowed nothing, so a
+ * number there would describe a scope nobody applied.
+ *
+ * The unit belongs to the name. `diff-filter` counts added lines, which is
+ * what its filter keeps a finding for. Read the unit off the name the entry
+ * is keyed under, never across names, and read an absent member as "not
+ * measured" rather than as zero.
+ *
+ * The count is what the run INDEXED rather than the true total:
+ * `diff-filter` indexes at most one million added lines and reports that
+ * cap for a larger diff, so read any non-zero value as a lower bound.
+ *
+ * `0` is the case this member exists for: a request that applied over an
+ * EMPTY scope. Every finding then filters out and the report reads clean,
+ * so a consumer that sees no findings beside `scope_size: 0` learns that
+ * nothing was analyzable rather than that the code is clean.
+ */
+scope_size?: (number | null)
 /**
  * Why the request was not applied, as a kebab-case token. Present exactly
  * when `status` is not `applied`. The set is open per request name; the
@@ -13262,6 +13400,22 @@ schema_version: FeatureFlagsSchemaVersion
 version: ToolVersion
 elapsed_ms: ElapsedMs
 /**
+ * What the run was asked to narrow and whether it did. See
+ * [`crate::RequestOutcomes`] for the full contract.
+ *
+ * `fallow flags` accepts `--changed-since`, and an unresolvable ref widens
+ * the scan to the whole project rather than failing the run. Until this
+ * member existed the only account of that was a stderr line, which `--quiet`
+ * removes, so a flag inventory read as scoped to the change could silently
+ * be the whole project's (issue #2734).
+ *
+ * The command applies no diff filter, so the object carries the
+ * `changed-since` entry only. Omitted when the run was asked for nothing,
+ * which keeps a scan that passed no narrowing flag byte-identical and moves
+ * no `schema_version`.
+ */
+request_outcomes?: (RequestOutcomes | null)
+/**
  * Detected feature-flag findings.
  */
 feature_flags: FeatureFlagFinding[]
@@ -14597,6 +14751,22 @@ invalid_value?: (string | null)
  */
 export interface SuppressionInventoryOutput {
 schema_version: SuppressionInventorySchemaVersion
+/**
+ * What the run was asked to narrow and whether it did. See
+ * [`crate::RequestOutcomes`] for the full contract.
+ *
+ * `fallow suppressions` accepts `--changed-since`, and an unresolvable ref
+ * widens the inventory to the whole project rather than failing the run.
+ * Until this member existed the only account of that was a stderr line,
+ * which `--quiet` removes, so an inventory read as scoped to the change
+ * could silently be the whole project's (issue #2734).
+ *
+ * The command applies no diff filter, so the object carries the
+ * `changed-since` entry only. Omitted when the run was asked for nothing,
+ * which keeps an inventory that passed no narrowing flag byte-identical and
+ * leaves `schema_version` at `1`.
+ */
+request_outcomes?: (RequestOutcomes | null)
 summary: SuppressionInventorySummary
 /**
  * Per-file suppression listings, sorted by path then line.

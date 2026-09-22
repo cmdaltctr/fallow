@@ -23,6 +23,37 @@ invariants in this file.
      repos/fallow-rs/fallow/immutable-releases --jq '.enabled')"
    [ "$enabled" = "true" ] || { echo "Release immutability is not enabled" >&2; exit 1; }
    ```
+
+   Require the `release` environment to admit `main` only, and check where each
+   publication secret lives. GitHub never returns a secret value, so a secret
+   moves into the environment only when its value is entered again, which in
+   practice means at its next rotation. Until then it stays a repository
+   secret, readable by a workflow on any ref, and the environment does not
+   protect it: the check names those secrets instead of failing. Once a secret
+   is in the environment the repository copy must be gone, and the check fails
+   on a secret that exists at both levels or at neither:
+
+   ```bash
+   custom="$(gh api repos/fallow-rs/fallow/environments/release \
+     --jq '.deployment_branch_policy.custom_branch_policies')"
+   [ "$custom" = "true" ] || { echo "release environment has no custom branch policy" >&2; exit 1; }
+   branches="$(gh api repos/fallow-rs/fallow/environments/release/deployment-branch-policies \
+     --jq '[.branch_policies[].name] | join(",")')"
+   [ "$branches" = "main" ] || { echo "release environment admits: ${branches:-nothing}" >&2; exit 1; }
+   repo_secrets="$(gh secret list --repo fallow-rs/fallow --json name --jq '.[].name')"
+   env_secrets="$(gh secret list --repo fallow-rs/fallow --env release --json name --jq '.[].name')"
+   for name in VSCE_PAT OVSX_PAT ED25519_BINARY_SIGNING_PRIVATE_KEY; do
+     in_repo=0; in_env=0
+     grep -qx "$name" <<<"$repo_secrets" && in_repo=1
+     grep -qx "$name" <<<"$env_secrets" && in_env=1
+     case "${in_env}${in_repo}" in
+       10) ;;
+       11) echo "$name exists at both levels; delete the repository copy" >&2; exit 1 ;;
+       01) echo "NOTE: $name is a repository secret, unprotected by the release environment; move it at its next rotation" >&2 ;;
+       *) echo "$name is missing" >&2; exit 1 ;;
+     esac
+   done
+   ```
 4. Derive the semantic-version bump from every commit since the prior release
    unless the user supplied an explicit bump. Confirm a major bump before
    mutating versions unless the user explicitly requested it.
@@ -168,22 +199,71 @@ invariants in this file.
     The workflow deliberately has no tag trigger and never creates a tag or
     GitHub Release. It validates and builds the release, stores the complete
     flattened GitHub asset bundle as the `release-assets` Actions artifact, and
-    publishes registries while the tag remains absent. The VS Code release is
+    publishes registries while the tag remains absent. The `fallow` npm root is
+    the exception: the workflow stages it and step 11 approves it. The VS Code release is
     published by separate Marketplace and Open VSX jobs. A credential-free
     public verifier checks every exact target before the final release gate.
-11. Monitor the specific workflow run through `status=completed` and
-    `conclusion=success`; a successful watch command alone is not sufficient
-    evidence. Require `similar-code-conformance` to validate the exact Linux x64
-    sidecar artifact against the committed F32 Candle baseline before
-    `release-verified` passes. Also require the `Publish VS Code Marketplace
-    targets`, `Publish Open VSX targets`, `Verify public VS Code registry targets`,
-    and `Release ready for signed tag` jobs to pass. The public verifier requires
-    the exact universal plus six platform tuples and normalized payloads from
-    both registries, without accepting a universal fallback.
+11. The run pauses once, in `Wait for the approved fallow root`, and the
+    maintainer approval is what lets it continue. Monitor the run until the
+    `Publish to npm` job has completed successfully; the crates publish in
+    parallel and the wait job is then running.
+
+    The workflow stages the `fallow` npm root instead of publishing it. Its
+    trusted publisher grants stage publish only, so the version becomes
+    installable only when the maintainer approves the stage with npm 2FA. The
+    VSIX publishers wait for that approval because the VS Code extension
+    downloads its binary from the GitHub Release of its own version, and that
+    release is created after the approval. Before approving, prove that the
+    staged bytes are the tarball this exact run built:
+
+    ```bash
+    STAGE_LIST="$(npm stage list fallow)"
+    test "$(grep -c '^id: ' <<<"$STAGE_LIST")" -eq 1
+    grep -qx "version: ${VERSION}" <<<"$STAGE_LIST"
+    STAGE_ID="$(sed -n 's/^id: //p' <<<"$STAGE_LIST")"
+
+    NPM_DIR="$(mktemp -d)"
+    STAGE_DIR="$(mktemp -d)"
+    gh run download "$RUN_ID" --name npm-tarballs --dir "$NPM_DIR"
+    (cd "$STAGE_DIR" && npm stage download "$STAGE_ID")
+    BUILT="$(shasum -a 256 < "$NPM_DIR/20-cli-root/fallow-${VERSION}.tgz")"
+    STAGED="$(shasum -a 256 < "$STAGE_DIR/fallow-${VERSION}-${STAGE_ID}.tgz")"
+    test "$BUILT" = "$STAGED"
+
+    npm stage approve "$STAGE_ID"   # interactive npm 2FA
+    test "$(npm view "fallow@${VERSION}" version)" = "$VERSION"
+    test "$(npm view "fallow@${VERSION}" dist.attestations.provenance.predicateType)" \
+      = "https://slsa.dev/provenance/v1"
+    ```
+
+    A digest mismatch, a second stage, or a stage at another version means the
+    stage did not come from this run: reject it with `npm stage reject` and
+    investigate before anything else. A rejected version can be staged again, so
+    recovery is a rerun of the `Publish to npm` job, which skips every package
+    that already landed. No tag exists yet, so nothing is burned.
+
+    After the approval the wait job downloads the public tarball, requires its
+    sha256 to equal the digest `Publish to npm` recorded, and releases both VSIX
+    publishers; a public tarball with other bytes fails the run instead. The
+    wait gives up after a bounded time with the recovery in its message:
+    approve, then rerun the failed jobs of the same run. Monitor the run through
+    `status=completed` and `conclusion=success`; a successful watch command
+    alone is not sufficient evidence. Require `similar-code-conformance` to have
+    validated the exact Linux x64 sidecar artifact against the committed F32
+    Candle baseline before `release-verified`, and require the `Publish VS Code Marketplace
+    targets`, `Publish Open VSX targets`, `Verify public VS Code registry
+    targets`, and `Release ready for signed tag` jobs to pass. The
+    public verifier requires the exact universal plus six platform tuples and
+    normalized payloads from both registries, without accepting a universal
+    fallback.
+
     Download the `release-assets` artifact from that exact run and confirm it
     is non-empty. Confirm it contains the seven target VSIX files,
     `inventory.json`, and `SHA256SUMS`. Only then create and push the signed tag
-    and create the immutable GitHub Release:
+    and create the immutable GitHub Release. Do this right after
+    `release-ready` without other work in between: from the moment the VSIX is
+    public until the GitHub Release exists, an extension that updates cannot
+    fetch its binary.
 
     ```bash
     ASSET_DIR="$(mktemp -d)"

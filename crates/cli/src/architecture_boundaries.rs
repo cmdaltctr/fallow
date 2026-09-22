@@ -54,6 +54,7 @@ fn architecture_invariants_doc_tracks_guarded_boundaries() {
         "`fallow-core` is a backend implementation crate",
         "`fallow-process` is an independent infrastructure foundation",
         "must not fork their own timeout, process-tree setup",
+        "owns git ref and root detection",
     ] {
         assert!(
             doc.contains(required),
@@ -1143,6 +1144,8 @@ fn audit_repo_ref_orchestration_routes_through_engine() {
         "fn git_upstream_ref",
         "fn git_merge_base",
         "fn detect_remote_default_ref",
+        "fn get_head_sha",
+        "Command::new(\"git\")",
     ] {
         assert!(
             !cli_source.contains(forbidden),
@@ -1162,6 +1165,110 @@ fn audit_repo_ref_orchestration_routes_through_engine() {
             && !decision_surface.contains("super::audit::base_analysis_root"),
         "{decision_surface_path} must not depend on audit-internal base-worktree helpers"
     );
+}
+
+/// Each CLI file that spawns git, and the git fact it owns. The engine owns ref
+/// and root detection, so a CLI spawn is for work `repo_refs` does not model.
+/// Two entries are test-only helpers that build repository fixtures.
+const CLI_GIT_SPAWN_OWNERS: &[(&str, &str)] = &[
+    (
+        "crates/cli/src/agent_install/mcp.rs",
+        "whether an installed agent file is tracked",
+    ),
+    (
+        "crates/cli/src/audit.rs",
+        "one long-lived cat-file reader for base file contents",
+    ),
+    (
+        "crates/cli/src/base_worktree.rs",
+        "base worktree lifecycle and the diff base",
+    ),
+    (
+        "crates/cli/src/coverage/analyze.rs",
+        "the origin remote of a coverage upload",
+    ),
+    (
+        "crates/cli/src/coverage/mod.rs",
+        "the committer address of a coverage upload",
+    ),
+    (
+        "crates/cli/src/coverage/upload_common.rs",
+        "the full commit sha and working-tree state of a coverage upload",
+    ),
+    (
+        "crates/cli/src/coverage/upload_inventory.rs",
+        "repository fixtures in its own tests",
+    ),
+    (
+        "crates/cli/src/coverage/upload_source_maps.rs",
+        "the origin remote and full commit sha of a source-map upload",
+    ),
+    (
+        "crates/cli/src/coverage/upload_static_findings.rs",
+        "repository fixtures in its own tests",
+    ),
+    (
+        "crates/cli/src/init.rs",
+        "hook scaffolding and the default branch it writes into a hook",
+    ),
+    (
+        "crates/cli/src/regression/baseline.rs",
+        "whether a baseline path is ignored, and the full commit sha",
+    ),
+];
+
+/// The CLI is a protocol adapter, so `fallow_engine::repo_refs` owns git ref and
+/// root detection. A second CLI copy is how `fallow security --base` and
+/// `fallow audit` drifted into resolving different base analysis roots for one
+/// repository (#2740), after the base-ref detection drifted the same way
+/// (#2699). Legitimate CLI git use stays legitimate: each such file is named in
+/// `CLI_GIT_SPAWN_OWNERS` with the fact it owns.
+#[test]
+fn cli_does_not_own_git_ref_or_root_detection() {
+    let base_worktree_path = "crates/cli/src/base_worktree.rs";
+    for source_path in rust_sources_under(["crates/cli/src"]) {
+        if source_path == "crates/cli/src/architecture_boundaries.rs" {
+            continue;
+        }
+        let source = read_source_without_line_comments(&source_path)
+            .unwrap_or_else(|error| panic!("read {source_path}: {error}"));
+
+        assert!(
+            !source.contains("\"rev-parse\", \"--short\", \"HEAD\""),
+            "{source_path} probes the short HEAD sha; use fallow_engine::repo_refs::short_head_sha"
+        );
+        assert!(
+            source_path == base_worktree_path || !source.contains("--show-toplevel"),
+            "{source_path} resolves the repository top level; use fallow_engine::repo_refs::base_analysis_root, or {base_worktree_path} for worktree lifecycle work"
+        );
+
+        if is_cli_test_source(&source_path) {
+            continue;
+        }
+        assert!(
+            !source.contains("Command::new(\"git\")")
+                || CLI_GIT_SPAWN_OWNERS
+                    .iter()
+                    .any(|(owner, _)| *owner == source_path),
+            "{source_path} spawns git; route ref and root detection through fallow_engine::repo_refs, or name the fact it owns in CLI_GIT_SPAWN_OWNERS"
+        );
+    }
+
+    for (owner, fact) in CLI_GIT_SPAWN_OWNERS {
+        assert!(!fact.is_empty(), "{owner} must state the git fact it owns");
+        let source = read_source_without_line_comments(owner)
+            .unwrap_or_else(|error| panic!("read {owner}: {error}"));
+        assert!(
+            source.contains("Command::new(\"git\")"),
+            "{owner} no longer spawns git; remove its CLI_GIT_SPAWN_OWNERS entry"
+        );
+    }
+}
+
+/// Whether a CLI source file holds tests only. Test helpers may build
+/// repository fixtures with git.
+fn is_cli_test_source(source_path: &str) -> bool {
+    source_path.ends_with("_tests.rs") || source_path.ends_with("/tests.rs")
 }
 
 #[test]
@@ -2084,6 +2191,74 @@ fn analysis_stage_diagnostics_are_recorded_only_from_the_dead_code_analyze_pass(
             "the dead-code analyze pass must reach the {recorder} detector"
         );
     }
+}
+
+/// Issue #2736: the plugin stage has exactly one registry writer, and it is the
+/// point where the root and workspace plugin results have converged.
+///
+/// A second writer would either publish a partial set (a workspace result before
+/// the merge) or be wiped by the first one, because the write REPLACES the
+/// stage's set so a fixed config drops out. The stage predicate in `fallow-types`
+/// forces a new KIND to be classified; nothing there notices a new writer, so pin
+/// the writer set here. `fallow list` runs plugins on its own path and
+/// deliberately records nothing, which is the gap this guard also documents.
+#[test]
+fn plugin_stage_diagnostics_have_one_writer_at_the_end_of_the_plugin_run() {
+    let exempt = [
+        "crates/config/src/workspace/diagnostics.rs",
+        "crates/cli/src/architecture_boundaries.rs",
+    ];
+    let mut writers: Vec<String> = rust_sources_under(["crates"])
+        .into_iter()
+        .filter(|path| !exempt.contains(&path.as_str()))
+        .filter(|path| {
+            read_source_without_line_comments(path)
+                .expect("read crate source")
+                .contains("record_plugin_config_diagnostics(")
+        })
+        .collect();
+    writers.sort();
+    assert_eq!(
+        writers,
+        ["crates/core/src/lib.rs"],
+        "the plugin stage writes its diagnostics once, at the end of the plugin run; a second \
+         writer publishes a partial set or is replaced by the first"
+    );
+
+    let core =
+        read_source_without_line_comments("crates/core/src/lib.rs").expect("read core library");
+    // run_plugins has two exits: the early return for a project with no
+    // workspaces, and the tail after the workspace merge. Both exits gate the
+    // auto-import surfaces and then write. This guard matches on the calls, not
+    // on their indentation, which differs between the two exits.
+    const GATE: &str = "gate_auto_import_entry_patterns(&mut result, config, workspaces);";
+    const WRITE: &str = "record_plugin_config_diagnostics(&result, &config.root);";
+    let body = core
+        .split_once("fn run_plugins(")
+        .expect("run_plugins in the core library")
+        .1
+        .split_once("\nfn ")
+        .expect("an item after run_plugins")
+        .0;
+    let gates = body.matches(GATE).count();
+    let exits = body.matches("Ok(result)").count();
+    let pairs = body
+        .split(GATE)
+        .skip(1)
+        .filter(|tail| tail.trim_start().starts_with(WRITE))
+        .count();
+    assert!(gates > 0, "run_plugins must gate the auto-import surfaces");
+    assert_eq!(
+        gates, exits,
+        "every run_plugins exit must gate the auto-import surfaces, the no-workspace early return \
+         included. An exit without the gate drops the Nuxt surfaces from the set"
+    );
+    assert_eq!(
+        pairs, gates,
+        "the plugin-stage write must follow each gate call directly, in the no-workspace early \
+         return and in the tail after the workspace merge. A gated surface that nothing writes \
+         reaches no envelope"
+    );
 }
 
 /// Issue #2366: source-discovery diagnostics must reach an analysis by value

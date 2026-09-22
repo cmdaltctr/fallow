@@ -17,7 +17,8 @@ creates, moves, or publishes Git tags or GitHub Releases.
 | `release-ready` | Join publication jobs and prove the tag is still absent | Read only |
 | `publish-crates` | Publish prevalidated crates in dependency order | crates.io OIDC |
 | `npm-prep` | Install, assemble, and pack npm artifacts | Read only |
-| `npm-publish` | Publish downloaded tarballs | npm publication |
+| `npm-publish` | Publish downloaded tarballs and stage the `fallow` root | npm OIDC, stage-only for `fallow` |
+| `npm-root-approved` | Wait until the maintainer-approved `fallow` root is public with the staged bytes | Read only |
 | `vscode-prep` | Build seven VSIX targets plus their inventory and checksums | Read only |
 | `vscode-host-smoke` | Run the exact prepared x64 target VSIX on Linux, Windows, and macOS with matching release binaries | Read only |
 | `vscode-publish-marketplace` | Publish the closed VSIX set to Visual Studio Marketplace | VSCE token only |
@@ -32,11 +33,65 @@ globally with `--ignore-scripts`.
 
 ## Invariants
 
+- Run every credential-bearing job in the `release` environment: `build`
+  (binary signing key), `publish-crates`, `npm-publish`, and both VSIX
+  publisher jobs. Its deployment branch policy admits `main` only. The ref
+  check in `release-context` is part of the workflow file, so it stops a
+  mistaken dispatch but not an edited copy of the workflow on another ref; the
+  environment is enforced by GitHub outside the file.
+- Move `VSCE_PAT`, `OVSX_PAT`, and `ED25519_BINARY_SIGNING_PRIVATE_KEY` into the
+  `release` environment as each one is rotated, and delete the repository copy
+  in the same pass. GitHub never returns a secret value, so a move needs the
+  value entered again. A secret that is still at repository level is readable
+  by any workflow on any ref: the environment does not protect it. The
+  maintainer preflight verifies the branch policy, names every secret that is
+  still unprotected, and fails on a secret that exists at both levels, because
+  the workflow token cannot read environment settings.
+- Pin the crates.io trusted publishing configs to the `release` environment.
+  crates.io accepts an environment claim when a config sets none, and rejects a
+  token without the matching claim once it does, so the pin is what stops an
+  edited workflow on another ref from publishing crates over OIDC.
 - Keep every checkout at `persist-credentials: false`.
 - Keep repository dependency installation out of `npm-publish`, both VSIX
   publisher jobs, and `publish-crates`.
 - Keep `--ignore-scripts` on every privileged `npm publish`.
 - Keep global publication tools pinned to reviewed versions.
+- Stage the `fallow` npm root, never publish it from the workflow. `fallow` pins
+  its platform packages and `fallow-type-aware` to the exact release version,
+  so those reach users only through a new root. The `fallow` trusted publisher
+  grants stage publish only, and npm refuses a direct publish over OIDC with
+  HTTP 403. The maintainer approves the stage with npm 2FA before the signed
+  tag, after comparing `npm stage download` with the `20-cli-root` tarball in
+  the `npm-tarballs` artifact of the same run. The published version keeps the
+  workflow provenance attestation.
+- Make exactly one `npm stage publish` call per staged name per run and never
+  probe with a direct publish. Every attempt, including a refused one, signs
+  and logs a provenance statement before the registry answers.
+- Clear `NODE_AUTH_TOKEN` for the stage call so a bootstrap token never reaches
+  a staged name.
+- Treat npm error code `E409` from the stage call as already staged. The job
+  has no npm login, so it cannot read stages, and the `npm view` precheck does
+  not see a staged version. The maintainer digest comparison is what proves
+  which run built the staged bytes.
+- Keep staged publishing on a reviewed npm pin of at least 11.15.0.
+- Publish no VSIX before the approved `fallow` root is public. The VS Code
+  extension downloads its binary from the GitHub Release of its own version and
+  purges an installed binary of another version, and that release is created
+  after the approval. Both VSIX publishers and `release-ready` need
+  `npm-root-approved`, which polls the public registry without credentials,
+  downloads the public tarball, and requires its sha256 to equal the digest
+  `npm-publish` recorded for the tarball it staged. Other bytes under the
+  released version fail the run. The wait is bounded below GitHub's job limit
+  and names its recovery: approve, then rerun the failed jobs of the same run.
+- Keep `publish-crates` and the direct npm publishes ahead of the approval.
+  They do not depend on the GitHub Release, and gating them would only extend
+  the time between the VSIX publication and the release.
+- The residual window is the VSIX publication plus the public verification
+  plus the maintainer's tag step. The maintainer flow creates the tag and the
+  release immediately after `release-ready`. Inside that window the extension
+  keeps serving its previously installed, verified binary and retries the
+  download once the release exists, so the window delays the update instead
+  of stranding the install.
 - Keep the VSIX artifact closed to the seven universal and platform-specific
   packages, `inventory.json`, and `SHA256SUMS`. The inventory is universal
   first and publication follows that order.
@@ -84,8 +139,9 @@ globally with `--ignore-scripts`.
   starts, then reconfirm tag absence before staging the final asset bundle.
 - Flatten the complete binary inventory into the `release-assets` Actions
   artifact. Reject an empty inventory or duplicate asset name.
-- Keep the version tag absent until validation, asset staging, and every
-  registry and marketplace publication have completed successfully.
+- Keep the version tag absent until validation, asset staging, every registry
+  and marketplace publication, and the maintainer approval of the staged
+  `fallow` root have completed successfully.
 - Create and push the signed version tag near the end of the maintainer flow.
   Immediately create the GitHub Release with the curated notes and the exact
   `release-assets` bundle. GitHub CLI creates a draft, uploads every asset, and

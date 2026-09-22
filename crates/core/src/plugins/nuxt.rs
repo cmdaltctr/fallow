@@ -17,9 +17,10 @@ use std::path::{Path, PathBuf};
 use fallow_config::{AutoImportKind, AutoImportRule};
 use fallow_types::discover::FileId;
 use fallow_types::extract::ExportName;
+use oxc_ast::ast::{Expression, ObjectExpression, ObjectPropertyKind, PropertyKey, PropertyKind};
 
 use super::config_parser;
-use super::{Plugin, PluginResult};
+use super::{Plugin, PluginResult, has_glob_syntax};
 
 const ENABLERS: &[&str] = &["nuxt"];
 
@@ -38,10 +39,22 @@ const SCRIPT_AUTO_IMPORT_RECURSIVE_DIRS: &[&str] = &["shared/utils", "shared/typ
 /// File extensions Nuxt treats as components, matching the component entry glob.
 const COMPONENT_EXTS: &[&str] = &["vue", "ts", "tsx", "js", "jsx"];
 
-/// Filename suffixes Nuxt strips before deriving the component name
-/// (`Comments.client.vue` and `Comments.server.vue` both become `<Comments>`;
-/// `Foo.global.vue` becomes `<Foo>`).
-const COMPONENT_NAME_SUFFIXES: &[&str] = &["client", "server", "global"];
+/// Filename suffixes Nuxt strips before deriving the component name.
+///
+/// Nuxt accepts one rendering-mode suffix followed by any number of registration
+/// suffixes, so `Comments.client.vue`, `Comments.server.vue`, `Foo.global.vue`,
+/// `Foo.island.vue` and `Foo.client.global.vue` all resolve to one name. The two
+/// lists are stripped in that order, matching Nuxt's own suffix pattern.
+const COMPONENT_MODE_SUFFIXES: &[&str] = &["client", "server"];
+const COMPONENT_REGISTRATION_SUFFIXES: &[&str] = &["global", "island"];
+
+/// Component directories Nuxt scans as roots of their own, so their name is not
+/// part of the component name: `components/global/Foo.vue` is `<Foo>` and
+/// `components/islands/Isle.vue` is `<Isle>`. Nuxt registers both ahead of the
+/// components root and derives each name relative to the deepest directory that
+/// covers the file. Only a direct child of a components root counts, so
+/// `components/base/global/Card.vue` stays `<BaseGlobalCard>`. See issue #2737.
+const OWN_BASE_SUBDIRS: &[&str] = &["global", "islands"];
 
 /// Secondary enabler for Nuxt module authoring projects.
 /// `@nuxt/kit` is the standard API for building Nuxt modules.
@@ -234,6 +247,9 @@ impl Plugin for NuxtPlugin {
             ("@@/", String::new()),
             ("#shared/", "shared".to_string()),
             ("#server/", "server".to_string()),
+            // A local layer is addressed as `#layers/<name>/...`, and its name
+            // defaults to its directory under the root `layers/` tree.
+            ("#layers/", "layers".to_string()),
         ];
         aliases.push(("#shared", "shared".to_string()));
         aliases.push(("#server", "server".to_string()));
@@ -697,10 +713,6 @@ fn imports_dir_pattern(normalized: &str) -> String {
     }
 }
 
-fn has_glob_syntax(pattern: &str) -> bool {
-    pattern.contains('*') || pattern.contains('?') || pattern.contains('[') || pattern.contains('{')
-}
-
 fn path_looks_like_file_pattern(pattern: &str) -> bool {
     pattern
         .rsplit('/')
@@ -733,7 +745,15 @@ fn collect_component_auto_imports(base: &Path, dir: &Path, rules: &mut Vec<AutoI
             continue;
         };
         if file_type.is_dir() {
-            collect_component_auto_imports(base, &path, rules);
+            // `components/global` and `components/islands` are scan roots of
+            // their own, so a file under them is named relative to that
+            // directory instead of to the components root.
+            let child_base = if dir == base && is_own_base_subdir(&path) {
+                path.as_path()
+            } else {
+                base
+            };
+            collect_component_auto_imports(child_base, &path, rules);
             continue;
         }
         if !has_component_extension(&path) {
@@ -747,6 +767,14 @@ fn collect_component_auto_imports(base: &Path, dir: &Path, rules: &mut Vec<AutoI
         };
         push_component_rule(rules, name, path);
     }
+}
+
+/// Whether a directory is one of the component subdirectories Nuxt scans as a
+/// root of its own.
+fn is_own_base_subdir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| OWN_BASE_SUBDIRS.contains(&name))
 }
 
 /// Push the canonical rule and its `Lazy`-prefixed dynamic-import variant.
@@ -864,8 +892,9 @@ fn has_auto_import_script_extension(path: &Path) -> bool {
 /// Mirrors Nuxt's directory-prefixed PascalCase convention with the
 /// prefix-overlap dedup: `base/foo/Button.vue` becomes `BaseFooButton`,
 /// `foo/Foo.vue` becomes `Foo` (not `FooFoo`), and `base/BaseButton.vue` becomes
-/// `BaseButton` (not `BaseBaseButton`). `.client` / `.server` / `.global`
-/// suffixes are stripped before deriving so paired files map to one name.
+/// `BaseButton` (not `BaseBaseButton`). `.client`, `.server`, `.global` and
+/// `.island` suffixes are stripped before deriving so paired files map to one
+/// name.
 fn derive_component_name(rel: &Path) -> Option<String> {
     let stem = rel.file_stem().and_then(|s| s.to_str())?;
     let stem = strip_component_suffix(stem);
@@ -884,16 +913,24 @@ fn derive_component_name(rel: &Path) -> Option<String> {
     Some(resolve_component_name(&dir_segments, stem))
 }
 
-/// Strip a single trailing `.client` / `.server` / `.global` segment.
+/// Strip the trailing run of `.global` / `.island` segments and then one
+/// optional `.client` / `.server` segment, the order Nuxt's suffix pattern
+/// accepts. `Foo.client.global` and `Foo.island` both become `Foo`, while
+/// `Foo.global.client` keeps `Foo.global` exactly as Nuxt does.
 fn strip_component_suffix(stem: &str) -> &str {
-    if let Some((head, tail)) = stem.rsplit_once('.')
-        && COMPONENT_NAME_SUFFIXES
-            .iter()
-            .any(|s| tail.eq_ignore_ascii_case(s))
-    {
-        return head;
+    let mut stem = stem;
+    while let Some(head) = strip_one_suffix(stem, COMPONENT_REGISTRATION_SUFFIXES) {
+        stem = head;
     }
-    stem
+    strip_one_suffix(stem, COMPONENT_MODE_SUFFIXES).unwrap_or(stem)
+}
+
+fn strip_one_suffix<'a>(stem: &'a str, suffixes: &[&str]) -> Option<&'a str> {
+    let (head, tail) = stem.rsplit_once('.')?;
+    suffixes
+        .iter()
+        .any(|suffix| tail.eq_ignore_ascii_case(suffix))
+        .then_some(head)
 }
 
 /// Combine PascalCase directory segments with the filename, removing the overlap
@@ -1012,48 +1049,363 @@ pub fn is_script_auto_import_entry_pattern(pattern: &str) -> bool {
     })
 }
 
-/// Conservative guard for the `autoImports` flag: whether the root `nuxt.config`
-/// declares a `components:` key. When it does, custom `prefix` / `pathPrefix` /
-/// `dirs` settings (which `auto_imports` does not model) may be in play, so the
-/// component entry patterns are kept rather than dropped, avoiding false
-/// `unused-file` reports. Conservative on purpose: any `components:` property key
-/// keeps the patterns. See issue #704.
-pub fn config_declares_components(root: &Path) -> bool {
-    for name in ["nuxt.config.ts", "nuxt.config.js"] {
-        let path = root.join(name);
-        let Ok(source) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        if source_has_components_key(&source) {
-            return true;
-        }
-    }
-    false
+/// How a root `nuxt.config` configures one auto-import surface.
+///
+/// The `autoImports` flag drops the modeled Nuxt convention entry patterns so an
+/// unreferenced convention file can report as `unused-file`. That is only sound
+/// when the modeled directories are the ones Nuxt actually scans, so each
+/// surface is classified first and only a non-custom surface loses its patterns.
+///
+/// `Disabled` means the surface scans no more than the modeled defaults. It needs
+/// static proof, read from the top-level object of the resolved config:
+/// - components: the single `components` property is `false`, `null`, an empty
+///   array literal, or an object literal whose `dirs` is an empty array literal
+///   (other keys in that object do not matter: an empty `dirs` scans nothing).
+///   `components: true` counts too: Nuxt resolves it to the same default
+///   directories as an absent key;
+/// - composables and utils: the single `imports` property is an object literal
+///   with `scan: false` and with `dirs` absent or empty (`imports.dirs` entries
+///   are scanned even when `scan` is off), an object literal with no properties,
+///   or one whose only property is an empty `dirs` array literal. The last two
+///   are Nuxt's own defaults (`imports.dirs` defaults to `[]` and the convention
+///   directories are registered by Nuxt itself). The patterns this surface gates
+///   also cover `shared/utils` and `shared/types`, as
+///   [`is_script_auto_import_entry_pattern`] shows. A lone `imports.autoImport: false`
+///   stays `Custom`: it switches the injection off, not the scan, so the same
+///   directories stay registered and are consumed through `#imports`, which
+///   resolves to no file and credits nothing.
+///
+/// Everything else stays `Custom` and keeps its patterns: a value that is not one
+/// of those literals, a config object the parser cannot resolve, a parse failure,
+/// a top-level `extends` (layers merge by concatenating arrays, so a base layer
+/// can re-add directories on top of an empty `dirs`), a spread in either object,
+/// and a repeated key. `components: {}` stays `Custom` as well, because that
+/// object can carry `pathPrefix: false`, which renames every scanned component.
+///
+/// A top-level property whose key or value this reader cannot resolve statically
+/// (a spread, a computed key such as `['imports']`, an accessor, a shorthand
+/// method) puts both surfaces on `Custom`, whether or not a key regex matched:
+/// the property can configure either surface. See issue #2737.
+///
+/// The synthesized auto-import edges are never affected by this classification. A
+/// local module or an unimport preset can register directories that never appear
+/// in `nuxt.config`, so a template tag or a composable call still credits its
+/// file and only genuinely unreferenced files surface. See issues #704 and #2695.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoImportSetting {
+    /// No key for this surface, so Nuxt's defaults apply and `auto_imports`
+    /// models them.
+    Default,
+    /// The config statically proves the surface scans nothing.
+    Disabled,
+    /// A key is present and its effect is not modeled.
+    Custom,
 }
 
-/// Conservative guard for script auto-import fallbacks: whether the root
-/// `nuxt.config` declares an `imports:` key. When it does, custom `dirs` or
-/// `scan` settings may be in play, so composable/util entry patterns are kept.
-pub fn config_declares_imports(root: &Path) -> bool {
+impl AutoImportSetting {
+    /// Whether the surface must keep its convention entry patterns.
+    pub fn is_custom(self) -> bool {
+        self == Self::Custom
+    }
+
+    /// Fold two verdicts for the same surface, keeping the more conservative one.
+    fn most_conservative(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Custom, _) | (_, Self::Custom) => Self::Custom,
+            (Self::Disabled, _) | (_, Self::Disabled) => Self::Disabled,
+            (Self::Default, Self::Default) => Self::Default,
+        }
+    }
+}
+
+/// Per-surface auto-import classification of a root `nuxt.config`.
+pub struct AutoImportSettings {
+    /// Classification of the `components:` surface.
+    pub components: AutoImportSetting,
+    /// Classification of the `imports:` (composable and util) surface.
+    pub scripts: AutoImportSetting,
+    /// The `nuxt.config` these verdicts were read from, absent for a root that
+    /// has none. Carried so the advisory a retained surface records names the
+    /// file the user has to edit: a monorepo classifies each root on its own,
+    /// and the gate that consumes the verdict holds patterns, not paths.
+    pub config_path: Option<PathBuf>,
+    /// `true` when a top-level property this reader cannot resolve statically
+    /// is what put a surface on [`AutoImportSetting::Custom`], rather than the
+    /// surface's own key. The two need different remedies: a spread or computed
+    /// key has to become static properties before any surface in that file can
+    /// be classified at all.
+    pub unreadable_property: bool,
+}
+
+impl AutoImportSettings {
+    /// Both surfaces at their default: what a root without a `nuxt.config` gets.
+    fn defaults() -> Self {
+        Self {
+            components: AutoImportSetting::Default,
+            scripts: AutoImportSetting::Default,
+            config_path: None,
+            unreadable_property: false,
+        }
+    }
+
+    /// Whether either surface is more conservative than `other`'s.
+    fn is_stricter_than(&self, other: &Self) -> bool {
+        rank(self.components) > rank(other.components) || rank(self.scripts) > rank(other.scripts)
+    }
+}
+
+/// Conservatism rank, so a fold can say which of two verdicts is stricter.
+const fn rank(setting: AutoImportSetting) -> u8 {
+    match setting {
+        AutoImportSetting::Default => 0,
+        AutoImportSetting::Disabled => 1,
+        AutoImportSetting::Custom => 2,
+    }
+}
+
+/// Classify both auto-import surfaces of the `nuxt.config` under `root`.
+///
+/// Reads and parses each candidate config once and folds the per-file verdicts
+/// by conservatism. See [`AutoImportSetting`] for the classification rules.
+///
+/// `config_path` and `unreadable_property` describe the file that produced the
+/// strictest verdict, which is the file a reader has to edit; the first config
+/// read supplies them when no file is stricter than another.
+pub fn auto_import_settings(root: &Path) -> AutoImportSettings {
+    let mut settings = AutoImportSettings::defaults();
     for name in ["nuxt.config.ts", "nuxt.config.js"] {
         let path = root.join(name);
         let Ok(source) = std::fs::read_to_string(&path) else {
             continue;
         };
-        if source_has_imports_key(&source) {
-            return true;
+        let file = classify_config_source(&source, &path);
+        if settings.config_path.is_none() || file.is_stricter_than(&settings) {
+            settings.config_path.clone_from(&file.config_path);
+            settings.unreadable_property = file.unreadable_property;
         }
+        settings.components = settings.components.most_conservative(file.components);
+        settings.scripts = settings.scripts.most_conservative(file.scripts);
     }
-    false
+    settings
+}
+
+/// Classify both auto-import surfaces of one `nuxt.config` source.
+///
+/// The key regexes are one net: a surface whose key they match starts at
+/// `Custom`, and the AST can narrow it to `Disabled`. The AST is the second net:
+/// a top-level property it cannot resolve statically hides a key the regexes
+/// cannot see, so it puts both surfaces on `Custom`.
+fn classify_config_source(source: &str, path: &Path) -> AutoImportSettings {
+    let proof = read_config_proof(source, path);
+    let components_key = proof.unresolvable || source_has_components_key(source);
+    let imports_key = proof.unresolvable || source_has_imports_key(source);
+    let read = AutoImportSettings {
+        config_path: Some(path.to_path_buf()),
+        unreadable_property: proof.unresolvable,
+        ..AutoImportSettings::defaults()
+    };
+    if !components_key && !imports_key {
+        return read;
+    }
+
+    AutoImportSettings {
+        components: surface_setting(components_key, proof.components_disabled),
+        scripts: surface_setting(imports_key, proof.scripts_disabled),
+        ..read
+    }
+}
+
+/// What the top-level object of one `nuxt.config` proves about both surfaces.
+#[derive(Default)]
+struct ConfigProof {
+    /// The object carries a property this reader cannot resolve statically, so
+    /// either surface may be configured by it.
+    unresolvable: bool,
+    /// The `components` surface scans no more than the modeled defaults.
+    components_disabled: bool,
+    /// The `imports` surface scans no more than the modeled defaults.
+    scripts_disabled: bool,
+}
+
+/// Parse one config source and read what its top-level object proves. A source
+/// the parser cannot resolve into a config object proves nothing, which leaves
+/// every present key `Custom`.
+fn read_config_proof(source: &str, path: &Path) -> ConfigProof {
+    config_parser::extract_from_source(source, path, |program| {
+        let obj = config_parser::find_config_object(program)?;
+        if has_unresolvable_top_level_property(obj) {
+            return Some(ConfigProof {
+                unresolvable: true,
+                ..ConfigProof::default()
+            });
+        }
+        if !matches!(sole_static_property(obj, "extends"), PropertyLookup::Absent) {
+            return Some(ConfigProof::default());
+        }
+        Some(ConfigProof {
+            unresolvable: false,
+            components_disabled: match sole_static_property(obj, "components") {
+                PropertyLookup::Found(expr) => components_value_proves_disabled(expr),
+                PropertyLookup::Absent | PropertyLookup::Unknown => false,
+            },
+            scripts_disabled: match sole_static_property(obj, "imports") {
+                PropertyLookup::Found(expr) => config_parser::object_expression(expr)
+                    .is_some_and(imports_object_proves_disabled),
+                PropertyLookup::Absent | PropertyLookup::Unknown => false,
+            },
+        })
+    })
+    .unwrap_or_default()
+}
+
+/// Whether the top-level config object carries a property this reader cannot
+/// resolve statically: a spread, a computed key such as `['imports']`, an
+/// accessor, or a shorthand method. The key regexes miss those spellings, so the
+/// AST has to report them.
+fn has_unresolvable_top_level_property(obj: &ObjectExpression<'_>) -> bool {
+    obj.properties.iter().any(|property| {
+        let ObjectPropertyKind::ObjectProperty(property) = property else {
+            return true;
+        };
+        property.kind != PropertyKind::Init
+            || property.method
+            || property.computed
+            || !matches!(
+                property.key,
+                PropertyKey::StaticIdentifier(_) | PropertyKey::StringLiteral(_)
+            )
+    })
+}
+
+fn surface_setting(key_present: bool, proven_disabled: bool) -> AutoImportSetting {
+    match (key_present, proven_disabled) {
+        (false, _) => AutoImportSetting::Default,
+        (true, true) => AutoImportSetting::Disabled,
+        (true, false) => AutoImportSetting::Custom,
+    }
+}
+
+/// Whether a top-level `components` value proves that no component directory
+/// beyond the modeled defaults is scanned.
+fn components_value_proves_disabled(expr: &Expression<'_>) -> bool {
+    if is_false_literal(expr) || is_null_literal(expr) || is_true_literal(expr) {
+        return true;
+    }
+    if is_empty_array_literal(expr) {
+        return true;
+    }
+    config_parser::object_expression(expr).is_some_and(|obj| {
+        matches!(
+            sole_static_property(obj, "dirs"),
+            PropertyLookup::Found(dirs) if is_empty_array_literal(dirs)
+        )
+    })
+}
+
+/// Whether an `imports` object literal proves that no composable or util
+/// directory beyond the modeled defaults is scanned.
+///
+/// An object with no properties, and one whose only property is an empty `dirs`
+/// array literal, are Nuxt's own defaults: `imports.dirs` defaults to `[]` and
+/// the convention directories are registered by Nuxt itself. Beyond those, only
+/// `scan: false` proves it. `autoImport: false` switches the injection off while
+/// the scan keeps registering the same directories, and Nuxt's documented
+/// replacement is an explicit `import { useThing } from '#imports'`, a bare
+/// specifier that resolves to no file and therefore credits nothing.
+fn imports_object_proves_disabled(obj: &ObjectExpression<'_>) -> bool {
+    if obj.properties.is_empty() {
+        return true;
+    }
+    if obj.properties.len() == 1
+        && matches!(
+            sole_static_property(obj, "dirs"),
+            PropertyLookup::Found(expr) if is_empty_array_literal(expr)
+        )
+    {
+        return true;
+    }
+    let scan_off = matches!(
+        sole_static_property(obj, "scan"),
+        PropertyLookup::Found(expr) if is_false_literal(expr)
+    );
+    if !scan_off {
+        return false;
+    }
+    match sole_static_property(obj, "dirs") {
+        PropertyLookup::Absent => true,
+        PropertyLookup::Found(expr) => is_empty_array_literal(expr),
+        PropertyLookup::Unknown => false,
+    }
+}
+
+/// Outcome of looking up one statically decidable object property.
+enum PropertyLookup<'a> {
+    /// Exactly one property carries this key and nothing can override it.
+    Found(&'a Expression<'a>),
+    /// No property carries this key and nothing can introduce one.
+    Absent,
+    /// A spread, a repeated key, or a non-literal key makes the effective value
+    /// unknowable.
+    Unknown,
+}
+
+/// Look up `key` in an object literal, refusing to guess when another property
+/// could override the result at runtime.
+fn sole_static_property<'a>(obj: &'a ObjectExpression<'a>, key: &str) -> PropertyLookup<'a> {
+    let mut found = None;
+    for prop in &obj.properties {
+        let ObjectPropertyKind::ObjectProperty(property) = prop else {
+            return PropertyLookup::Unknown;
+        };
+        match &property.key {
+            PropertyKey::StaticIdentifier(id) if id.name == key => {}
+            PropertyKey::StringLiteral(literal) if literal.value == key => {}
+            PropertyKey::StaticIdentifier(_) | PropertyKey::StringLiteral(_) => continue,
+            _ => return PropertyLookup::Unknown,
+        }
+        if found.is_some() {
+            return PropertyLookup::Unknown;
+        }
+        found = Some(&property.value);
+    }
+    found.map_or(PropertyLookup::Absent, PropertyLookup::Found)
+}
+
+fn is_false_literal(expr: &Expression<'_>) -> bool {
+    matches!(unwrap_expression(expr), Expression::BooleanLiteral(literal) if !literal.value)
+}
+
+fn is_true_literal(expr: &Expression<'_>) -> bool {
+    matches!(unwrap_expression(expr), Expression::BooleanLiteral(literal) if literal.value)
+}
+
+fn is_null_literal(expr: &Expression<'_>) -> bool {
+    matches!(unwrap_expression(expr), Expression::NullLiteral(_))
+}
+
+fn is_empty_array_literal(expr: &Expression<'_>) -> bool {
+    config_parser::array_expression(expr).is_some_and(|array| array.elements.is_empty())
+}
+
+/// Strip parentheses and TypeScript `as` / `satisfies` wrappers.
+fn unwrap_expression<'a>(expr: &'a Expression<'a>) -> &'a Expression<'a> {
+    match expr {
+        Expression::ParenthesizedExpression(paren) => unwrap_expression(&paren.expression),
+        Expression::TSSatisfiesExpression(satisfies) => unwrap_expression(&satisfies.expression),
+        Expression::TSAsExpression(as_expr) => unwrap_expression(&as_expr.expression),
+        _ => expr,
+    }
 }
 
 /// Whether the source declares a `components` property key in any position.
 ///
 /// Tolerant on purpose: matches `components:`, `"components":`, `'components':`,
 /// and inline shapes like `defineNuxtConfig({ components: [...] })` regardless of
-/// line position or quoting. It can also match `components:` inside a comment or
-/// string literal, but that only keeps the entry patterns (the safe direction:
-/// no false `unused-file` reports), so over-matching is acceptable. See issue #704.
+/// line position or quoting. It can also match `components:` inside a comment, a
+/// string literal, or a nested module's options, but a match only asks
+/// [`classify_config_source`] to look closer and otherwise keeps the entry
+/// patterns (the safe direction: no false `unused-file` reports), so
+/// over-matching is acceptable. See issue #704.
 fn source_has_components_key(source: &str) -> bool {
     COMPONENTS_KEY_RE.is_match(source)
 }
@@ -1161,6 +1513,18 @@ mod tests {
         let aliases = plugin.path_aliases(Path::new("/project"));
         assert!(aliases.iter().any(|(prefix, _)| *prefix == "@/"));
         assert!(aliases.iter().any(|(prefix, _)| *prefix == "@@/"));
+    }
+
+    #[test]
+    fn path_aliases_map_layers_to_the_layers_tree() {
+        let plugin = NuxtPlugin;
+        let aliases = plugin.path_aliases(Path::new("/project"));
+        assert!(
+            aliases
+                .iter()
+                .any(|(prefix, target)| *prefix == "#layers/" && target == "layers"),
+            "a local layer is addressed through #layers/<name>/: {aliases:?}"
+        );
     }
 
     #[test]
@@ -2001,6 +2365,63 @@ mod tests {
         assert_eq!(name_of("Comments.client.vue"), "Comments");
         assert_eq!(name_of("Comments.server.vue"), "Comments");
         assert_eq!(name_of("Banner.global.vue"), "Banner");
+        assert_eq!(name_of("Banner.island.vue"), "Banner");
+        assert_eq!(name_of("Banner.client.global.vue"), "Banner");
+    }
+
+    #[test]
+    fn auto_imports_name_global_and_island_components_after_their_own_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("components/global")).unwrap();
+        std::fs::create_dir_all(root.join("components/islands")).unwrap();
+        std::fs::create_dir_all(root.join("components/base")).unwrap();
+        std::fs::write(
+            root.join("components/global/Foo.vue"),
+            "<template></template>",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("components/islands/Isle.vue"),
+            "<template></template>",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("components/base/Button.vue"),
+            "<template></template>",
+        )
+        .unwrap();
+
+        let rules = NuxtPlugin.auto_imports(root);
+        let names: std::collections::BTreeSet<&str> =
+            rules.iter().map(|r| r.name.as_str()).collect();
+
+        assert!(names.contains("Foo"), "global component keeps its own name");
+        assert!(names.contains("LazyFoo"));
+        assert!(names.contains("Isle"), "island keeps its own name");
+        assert!(names.contains("BaseButton"), "other dirs still prefix");
+        assert!(!names.contains("GlobalFoo"));
+        assert!(!names.contains("IslandsIsle"));
+    }
+
+    #[test]
+    fn auto_imports_prefix_a_nested_global_directory_like_any_other() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("components/base/global")).unwrap();
+        std::fs::write(
+            root.join("components/base/global/Card.vue"),
+            "<template></template>",
+        )
+        .unwrap();
+
+        let names: std::collections::BTreeSet<String> = NuxtPlugin
+            .auto_imports(root)
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert!(names.contains("BaseGlobalCard"));
+        assert!(!names.contains("Card"));
     }
 
     #[test]
@@ -2162,8 +2583,13 @@ mod tests {
         ));
     }
 
+    fn classify(body: &str) -> AutoImportSettings {
+        let source = format!("export default defineNuxtConfig({{ {body} }})\n");
+        classify_config_source(&source, Path::new("nuxt.config.ts"))
+    }
+
     #[test]
-    fn config_declares_components_detects_key() {
+    fn auto_import_settings_reads_config_from_disk() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         std::fs::write(
@@ -2171,7 +2597,142 @@ mod tests {
             "export default defineNuxtConfig({\n  components: [{ path: '~/ui', prefix: 'U' }],\n})\n",
         )
         .unwrap();
-        assert!(config_declares_components(root));
+        let settings = auto_import_settings(root);
+        assert_eq!(settings.components, AutoImportSetting::Custom);
+        assert_eq!(settings.scripts, AutoImportSetting::Default);
+    }
+
+    #[test]
+    fn auto_import_settings_without_config_is_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let settings = auto_import_settings(tmp.path());
+        assert_eq!(settings.components, AutoImportSetting::Default);
+        assert_eq!(settings.scripts, AutoImportSetting::Default);
+    }
+
+    #[test]
+    fn auto_import_settings_folds_disabled_config_from_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(
+            root.join("nuxt.config.ts"),
+            "export default defineNuxtConfig({\n  components: { dirs: [] },\n  imports: { scan: false },\n})\n",
+        )
+        .unwrap();
+        let settings = auto_import_settings(root);
+        assert_eq!(settings.components, AutoImportSetting::Disabled);
+        assert_eq!(settings.scripts, AutoImportSetting::Disabled);
+    }
+
+    #[test]
+    fn classify_config_source_classifies_component_shapes() {
+        let cases: &[(&str, AutoImportSetting)] = &[
+            ("modules: ['@nuxt/image']", AutoImportSetting::Default),
+            ("components: { dirs: [] }", AutoImportSetting::Disabled),
+            ("components: []", AutoImportSetting::Disabled),
+            ("components: false", AutoImportSetting::Disabled),
+            ("components: null", AutoImportSetting::Disabled),
+            (
+                "components: { dirs: [], global: true }",
+                AutoImportSetting::Disabled,
+            ),
+            (r#""components": false"#, AutoImportSetting::Disabled),
+            ("components: true", AutoImportSetting::Disabled),
+            ("components: { dirs: ['~/ui'] }", AutoImportSetting::Custom),
+            ("components: {}", AutoImportSetting::Custom),
+            (
+                "['components']: { dirs: ['~/ui'] }",
+                AutoImportSetting::Custom,
+            ),
+            ("get components() { return {} }", AutoImportSetting::Custom),
+            ("components: [{ path: '~/ui' }]", AutoImportSetting::Custom),
+            (
+                "components: { pathPrefix: false }",
+                AutoImportSetting::Custom,
+            ),
+            ("components: componentsFromEnv", AutoImportSetting::Custom),
+            (
+                "myModule: { components: { dirs: [] } }",
+                AutoImportSetting::Custom,
+            ),
+            (
+                "...base, components: { dirs: [] }",
+                AutoImportSetting::Custom,
+            ),
+            (
+                "components: { ...base, dirs: [] }",
+                AutoImportSetting::Custom,
+            ),
+            (
+                "components: false, components: { dirs: ['~/ui'] }",
+                AutoImportSetting::Custom,
+            ),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(
+                classify(body).components,
+                *expected,
+                "components verdict for `{body}`"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_config_source_classifies_script_shapes() {
+        let cases: &[(&str, AutoImportSetting)] = &[
+            ("modules: ['@nuxt/image']", AutoImportSetting::Default),
+            ("imports: { scan: false }", AutoImportSetting::Disabled),
+            (
+                "imports: { scan: false, dirs: [] }",
+                AutoImportSetting::Disabled,
+            ),
+            (
+                "imports: { scan: false, autoImport: false }",
+                AutoImportSetting::Disabled,
+            ),
+            ("imports: { autoImport: false }", AutoImportSetting::Custom),
+            (
+                "imports: { scan: false, dirs: ['app/extra'] }",
+                AutoImportSetting::Custom,
+            ),
+            ("imports: { dirs: ['custom'] }", AutoImportSetting::Custom),
+            ("imports: { scan: true }", AutoImportSetting::Custom),
+            ("imports: {}", AutoImportSetting::Disabled),
+            ("imports: { dirs: [] }", AutoImportSetting::Disabled),
+            (
+                "['imports']: { autoImport: false }",
+                AutoImportSetting::Custom,
+            ),
+            ("get imports() { return {} }", AutoImportSetting::Custom),
+            (
+                "imports: { ...base, scan: false }",
+                AutoImportSetting::Custom,
+            ),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(
+                classify(body).scripts,
+                *expected,
+                "scripts verdict for `{body}`"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_config_source_keeps_layer_configs_custom() {
+        let settings =
+            classify("components: { dirs: [] }, imports: { scan: false }, extends: ['../base']");
+        assert_eq!(settings.components, AutoImportSetting::Custom);
+        assert_eq!(settings.scripts, AutoImportSetting::Custom);
+    }
+
+    #[test]
+    fn classify_config_source_keeps_unresolvable_config_custom() {
+        let settings = classify_config_source(
+            "const config = { components: { dirs: [] } }\n",
+            Path::new("nuxt.config.ts"),
+        );
+        assert_eq!(settings.components, AutoImportSetting::Custom);
     }
 
     #[test]
@@ -2189,7 +2750,7 @@ mod tests {
     }
 
     #[test]
-    fn config_declares_components_false_without_key() {
+    fn auto_import_settings_default_without_surface_keys() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         std::fs::write(
@@ -2197,11 +2758,13 @@ mod tests {
             "export default defineNuxtConfig({\n  modules: ['@nuxt/image'],\n})\n",
         )
         .unwrap();
-        assert!(!config_declares_components(root));
+        let settings = auto_import_settings(root);
+        assert_eq!(settings.components, AutoImportSetting::Default);
+        assert_eq!(settings.scripts, AutoImportSetting::Default);
     }
 
     #[test]
-    fn config_declares_imports_detects_key() {
+    fn auto_import_settings_custom_for_explicit_import_dirs() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         std::fs::write(
@@ -2209,7 +2772,9 @@ mod tests {
             "export default defineNuxtConfig({ imports: { dirs: ['custom'] } })\n",
         )
         .unwrap();
-        assert!(config_declares_imports(root));
+        let settings = auto_import_settings(root);
+        assert_eq!(settings.scripts, AutoImportSetting::Custom);
+        assert_eq!(settings.components, AutoImportSetting::Default);
     }
 
     #[test]

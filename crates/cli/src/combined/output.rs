@@ -84,7 +84,7 @@ fn machine_combined_code_with_stale_baseline_gate(
     let failed = crate::baseline_gate::gate_failed(
         check_result.and_then(|result| result.baseline_staleness.as_ref()),
         opts.fail_on_stale_baseline,
-        crate::baseline_gate::DEAD_CODE_NOUN,
+        fallow_engine::baseline::BaselineKind::DeadCode,
     );
     if failed { code.max(1) } else { code }
 }
@@ -257,13 +257,20 @@ fn build_combined_pr_decision(
     let issues = report::ci::diff_filter::filter_issues_for_summary(
         issues_from_codeclimate_issues(&codeclimate),
     );
-    let gates =
+    let mut gates =
         combined_pr_summary_areas(fail_on_issues, check_result, dupes_result, health_result)
             .into_iter()
             .map(pr_decision_gate_from_summary_area)
             .collect::<Vec<_>>();
+    // Both derived from the per-area rows alone, and both before the gate rows
+    // join them: the check-run `conclusion` is a documented non-blocker, and a
+    // failing gate row appended first would silently turn every combined run
+    // that armed a gate into a merge blocker.
     let conclusion = combined_decision_conclusion(&gates);
     let summary_markdown = combined_decision_summary(conclusion, issues.len(), &gates);
+    gates.extend(report::gate_outcome_text::gate_rows_for_gates(
+        combined_gate_outcomes(check_result, dupes_result, health_result).as_ref(),
+    ));
 
     PrDecisionSurface {
         schema: PR_DECISION_SCHEMA.to_owned(),
@@ -673,6 +680,7 @@ fn print_health_section(
             explain: opts.explain,
             gates: fallow_engine::health::HealthGateOptions::default(),
             baseline_path: None,
+            baseline_saved_by: None,
             summary: opts.summary,
             summary_heading: !show_headers,
             show_explain_tip: false,
@@ -882,7 +890,11 @@ fn build_combined_json_output(
     let workspace_diagnostics = combined_workspace_diagnostics(&input);
 
     fallow_api::serialize_combined_json(CombinedJsonOutputInput {
-        gate_outcomes: combined_gate_outcomes(&input),
+        gate_outcomes: combined_gate_outcomes(
+            input.check_result,
+            input.dupes_result,
+            input.health_result,
+        ),
         request_outcomes: crate::requests::request_outcomes(),
         check: input.check_result.map(|result| CombinedCheckJsonSection {
             results: &result.results,
@@ -990,10 +1002,12 @@ pub fn combined_type_aware_gate_failed(
 /// `--min-severity`, `--threshold`), so the health sub-analysis arms nothing
 /// here; the gates below are the ones combined mode can actually arm.
 fn combined_gate_outcomes(
-    input: &CombinedJsonPrintInput<'_>,
+    check_result: Option<&CheckResult>,
+    dupes_result: Option<&DupesResult>,
+    health_result: Option<&HealthResult>,
 ) -> Option<fallow_output::GateOutcomes> {
     let mut gates = fallow_output::GateOutcomes::new();
-    if let Some(result) = input.check_result {
+    if let Some(result) = check_result {
         gates.insert_if(
             fallow_output::GateName::Regression,
             crate::gates::regression_outcome(result.regression.as_ref(), true),
@@ -1004,25 +1018,25 @@ fn combined_gate_outcomes(
                 result
                     .baseline_staleness
                     .as_ref()
-                    .map(|loaded| loaded.staleness.to_envelope(0))
+                    .map(|loaded| loaded.to_envelope(0))
                     .as_ref(),
                 result.fail_on_stale_baseline,
             ),
         );
     }
-    if combined_type_aware_requested(input) {
+    if combined_type_aware_requested(check_result, health_result) {
         gates.insert(
             fallow_output::GateName::TypeAwareRequire,
             fallow_output::GateOutcome::new(
                 crate::gates::status_of(combined_type_aware_gate_failed(
-                    input.check_result,
-                    input.health_result,
+                    check_result,
+                    health_result,
                 )),
                 true,
             ),
         );
     }
-    if let Some(result) = input.dupes_result {
+    if let Some(result) = dupes_result {
         gates.insert_if(
             fallow_output::GateName::DuplicationThreshold,
             crate::gates::duplication_threshold_outcome(
@@ -1032,9 +1046,7 @@ fn combined_gate_outcomes(
             ),
         );
     }
-    let armed_by_flag = input
-        .check_result
-        .is_some_and(|result| result.fail_on_issues);
+    let armed_by_flag = check_result.is_some_and(|result| result.fail_on_issues);
     if gates.is_empty() && !armed_by_flag {
         return None;
     }
@@ -1042,7 +1054,7 @@ fn combined_gate_outcomes(
     // The rule that decides this run's exit code, so the object can explain the
     // status beside it. Evaluated only once a gate armed the object, because
     // it walks every findings array and an unarmed run publishes nothing.
-    if let Some(result) = input.check_result {
+    if let Some(result) = check_result {
         let has_error_severity = crate::check::rules::has_error_severity_issues(
             &result.results,
             &crate::check::effective_check_rules(result),
@@ -1065,15 +1077,13 @@ fn combined_gate_outcomes(
 
 /// Whether the combined run asked for the type-aware completeness gate at all,
 /// read from the same config the exit path resolves it from.
-fn combined_type_aware_requested(input: &CombinedJsonPrintInput<'_>) -> bool {
-    input
-        .check_result
+fn combined_type_aware_requested(
+    check_result: Option<&CheckResult>,
+    health_result: Option<&HealthResult>,
+) -> bool {
+    check_result
         .map(|result| result.config.type_aware.require)
-        .or_else(|| {
-            input
-                .health_result
-                .map(|result| result.config.type_aware.require)
-        })
+        .or_else(|| health_result.map(|result| result.config.type_aware.require))
         == Some(fallow_config::TypeAwareRequire::Complete)
 }
 
@@ -1094,7 +1104,7 @@ fn check_json_extras_for_combined(result: &CheckResult) -> fallow_api::CheckJson
         result
             .baseline_staleness
             .as_ref()
-            .map(|loaded| loaded.staleness.to_envelope(0)),
+            .map(|loaded| loaded.to_envelope(0)),
     )
 }
 

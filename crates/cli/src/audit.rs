@@ -234,7 +234,7 @@ mod cache;
 
 #[cfg(test)]
 use base_ref::parse_audit_base_override;
-use base_ref::{get_head_sha, resolve_base_ref};
+use base_ref::resolve_base_ref;
 #[cfg(test)]
 use cache::{
     AUDIT_BASE_SNAPSHOT_CACHE_VERSION, CachedAuditKeySnapshot, audit_base_snapshot_cache_dir,
@@ -245,6 +245,7 @@ use cache::{
     AuditBaseSnapshotCacheKey, audit_base_snapshot_cache_key, load_cached_base_snapshot,
     save_cached_base_snapshot, sorted_keys,
 };
+use fallow_engine::repo_refs::short_head_sha;
 
 /// Whether a styling finding's per-rule severity escalates to `error` (and thus
 /// gates the verdict). Styling is verdict-NEUTRAL by default (rule `warn`); each
@@ -331,7 +332,7 @@ fn compute_base_snapshot(
         }
         return Err(emit_error(&message, 2, opts.output));
     };
-    let base_root = base_analysis_root(opts.root, worktree.path());
+    let base_root = fallow_engine::repo_refs::base_analysis_root(opts.root, worktree.path());
     let base_cache_dir = remap_cache_dir_for_base_worktree(opts.root, &base_root, opts.cache_dir);
     let current_config_path = opts
         .config_path
@@ -638,26 +639,6 @@ fn build_base_audit_options<'a>(
         // pass is already scope-narrowed; a full base snapshot joins correctly
         // against it.
         scope: None,
-    }
-}
-
-fn base_analysis_root(current_root: &Path, base_worktree_root: &Path) -> PathBuf {
-    let Some(git_root) = git_toplevel(current_root) else {
-        return base_worktree_root.to_path_buf();
-    };
-    let current_root =
-        dunce::canonicalize(current_root).unwrap_or_else(|_| current_root.to_path_buf());
-    match current_root.strip_prefix(&git_root) {
-        Ok(relative) => base_worktree_root.join(relative),
-        Err(err) => {
-            tracing::warn!(
-                current_root = %current_root.display(),
-                git_root = %git_root.display(),
-                error = %err,
-                "Could not remap audit base root into the base worktree; falling back to worktree root"
-            );
-            base_worktree_root.to_path_buf()
-        }
     }
 }
 
@@ -1645,7 +1626,7 @@ audit.typeAware: false or pass --no-type-aware to keep the gate syntactic"
     }
 
     let head_sha = match input.head_sha {
-        AuditHeadSha::Production => get_head_sha(opts.root),
+        AuditHeadSha::Production => short_head_sha(opts.root),
         AuditHeadSha::Preloaded(head_sha) => head_sha,
     };
     let brief = build_brief(AuditBriefDataInput {
@@ -2844,7 +2825,7 @@ fn empty_audit_result(
 ) -> AuditResult {
     crate::telemetry::note_final_result_count(0);
 
-    let head_sha = get_head_sha(opts.root);
+    let head_sha = short_head_sha(opts.root);
     // An empty changeset is a valid graph state: pin a hash on the brief path so
     // the walkthrough guide still carries a stable snapshot pin (no findings, so
     // the hash folds only the base ref + head sha).
@@ -2941,6 +2922,7 @@ fn run_audit_check<'a>(
         diff_index: None,
         use_shared_diff_index: true,
         baseline: opts.dead_code_baseline,
+        baseline_flag: "--dead-code-baseline",
         save_baseline: None,
         // The gate is answered once by `note_stale_baseline_gate_inert`;
         // this sub-pass is change-scoped and could only stand down again.
@@ -3058,6 +3040,7 @@ fn build_audit_dupes_options<'a>(
         ignore_imports: Some(dupes_cfg.ignore_imports),
         top: None,
         baseline_path: opts.dupes_baseline,
+        baseline_flag: "--dupes-baseline",
         save_baseline_path: None,
         // See the dead-code sub-pass: audit answers the flag once itself.
         fail_on_stale_baseline: false,
@@ -3111,7 +3094,19 @@ fn run_audit_health<'a>(
         crate::health::execute_health(&health_opts)
     };
     match health_run {
-        Ok(r) => Ok(Some(r)),
+        Ok(r) => {
+            // The standalone command says this at its own print site, which
+            // audit never reaches, so an audit pointed at another command's
+            // health baseline was the one of its three that stayed silent about
+            // it. The dead-code and duplication notes come from the load sites
+            // audit shares.
+            crate::health::note_unrecognised_health_baseline(
+                &r,
+                opts.health_baseline,
+                "--health-baseline",
+            );
+            Ok(Some(r))
+        }
         Err(code) => Err(code),
     }
 }

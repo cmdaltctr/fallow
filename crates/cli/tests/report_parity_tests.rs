@@ -168,6 +168,139 @@ fn saved_reports_preserve_native_health_duplication_and_combined_output() {
     );
 }
 
+/// The two GitHub-native targets build their own render input. They do not read
+/// the report the JSON format serializes. A member the live call leaves out is
+/// therefore absent from the body they write, and `report --from` renders it from
+/// the saved envelope.
+///
+/// They are not in the byte-parity list, because both bodies carry the run's
+/// elapsed time, and two runs never share one value. This test asserts the verdict
+/// line on its own instead.
+fn assert_live_github_native_states_the_gate(root: &Path, extra: &[&str]) {
+    for format in ["github-summary", "github-annotations"] {
+        let direct = run(root, &analysis_args(Some("check"), root, format, extra));
+        assert!(matches!(direct.status.code(), Some(0 | 1)), "{format}");
+        let rendered = String::from_utf8_lossy(&direct.stdout);
+        assert!(
+            rendered.contains("stale-baseline"),
+            "the live {format} render must state the gate it failed: {rendered}"
+        );
+    }
+}
+
+/// The baseline advisory and the gate rows are rendered from typed state on a
+/// direct run and read back off the envelope by `report --from`. This is the
+/// one test that catches a divergence between the two, and the integrations
+/// post whatever the saved path produced.
+#[test]
+fn saved_stale_baseline_surfaces_match_direct_rendering() {
+    let project = tempfile::tempdir().expect("stale baseline project");
+    let root = project.path();
+    std::fs::create_dir(root.join("src")).expect("create source directory");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"stale-baseline-parity","private":true,"main":"src/index.ts"}"#,
+    )
+    .expect("write manifest");
+    std::fs::write(root.join("src/index.ts"), "export const entry = true;\n")
+        .expect("write entrypoint");
+    for name in ["a", "b", "c"] {
+        std::fs::write(
+            root.join(format!("src/{name}.ts")),
+            format!("export const {name} = true;\n"),
+        )
+        .expect("write unused source");
+    }
+
+    let baseline = root.join("baseline.json");
+    let saved = run(
+        root,
+        &analysis_args(
+            Some("check"),
+            root,
+            "json",
+            &["--save-baseline", baseline.to_str().expect("utf8")],
+        ),
+    );
+    assert!(
+        matches!(saved.status.code(), Some(0 | 1)),
+        "saving a baseline failed: {}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+    // Remove what the baseline recorded, so every entry goes unmatched and the
+    // gate rule holds on a run with nothing left to report.
+    for name in ["a", "b", "c"] {
+        std::fs::remove_file(root.join(format!("src/{name}.ts"))).expect("clean the project");
+    }
+
+    let baseline_args = [
+        "--baseline",
+        baseline.to_str().expect("utf8"),
+        "--fail-on-stale-baseline",
+    ];
+    assert_saved_report_parity_with_args(root, Some("check"), &baseline_args);
+
+    assert_live_github_native_states_the_gate(root, &baseline_args);
+
+    // The bodies agreeing is only half of the render: the Check Run the action
+    // posts is built from the decision sidecar, whose gate rows the saved path
+    // fills from the envelope. A run with an armed gate is the only shape that
+    // puts a row in it.
+    let json = run(
+        root,
+        &analysis_args(Some("check"), root, "json", &baseline_args),
+    );
+    assert!(matches!(json.status.code(), Some(0 | 1)));
+    let saved_path = root.join("results.json");
+    std::fs::write(&saved_path, &json.stdout).expect("write saved results");
+    let direct_decision = root.join("direct-decision.json");
+    let saved_decision = root.join("saved-decision.json");
+
+    let direct = run_with_env(
+        root,
+        &analysis_args(Some("check"), root, "pr-comment-github", &baseline_args),
+        &[(
+            "FALLOW_PR_DECISION_FILE",
+            direct_decision.to_str().expect("utf8"),
+        )],
+    );
+    assert!(matches!(direct.status.code(), Some(0 | 1)));
+    let rendered = run_with_env(
+        root,
+        &[
+            "report".to_owned(),
+            "--from".to_owned(),
+            saved_path.display().to_string(),
+            "--root".to_owned(),
+            root.display().to_string(),
+            "--quiet".to_owned(),
+            "--format".to_owned(),
+            "pr-comment-github".to_owned(),
+        ],
+        &[(
+            "FALLOW_PR_DECISION_FILE",
+            saved_decision.to_str().expect("utf8"),
+        )],
+    );
+    assert!(rendered.status.success());
+
+    let direct_sidecar: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(direct_decision).expect("read direct decision"))
+            .expect("parse direct decision");
+    let saved_sidecar: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(saved_decision).expect("read saved decision"))
+            .expect("parse saved decision");
+    assert_eq!(saved_sidecar, direct_sidecar);
+    assert!(
+        saved_sidecar["gates"]
+            .as_array()
+            .expect("the sidecar carries gate rows")
+            .iter()
+            .any(|gate| gate["id"] == "stale-baseline"),
+        "the armed gate must reach the saved Check Run: {saved_sidecar}"
+    );
+}
+
 #[test]
 fn saved_owner_grouped_dead_code_matches_direct_rendering() {
     let project = tempfile::tempdir().expect("owner-grouped project");
@@ -848,4 +981,59 @@ fn impact_rerun_is_byte_identical() {
 
     let args = analysis_args(Some("impact"), root, "json", &[]);
     assert_rerun_is_byte_identical(root, &args, env, "impact");
+}
+
+/// The combined comment is the one surface `fallow report --from` does not
+/// reproduce, and the exclusion above is easy to read as an oversight. Naming the
+/// divergence pins it: the combined renderer carries a multi-gate presentation
+/// the generic saved renderer has no input for, so a combined body is produced by
+/// the direct run and reproduced by `report --from` only for the machine formats.
+///
+/// A repository that needs a combined comment rendered from a saved envelope runs
+/// `fallow report --from` and gets the generic body, which is a documented
+/// difference rather than a parity failure (issue #2735).
+#[test]
+fn a_combined_comment_diverges_from_the_saved_render_by_design() {
+    let root = workspace_fixture("tests/fixtures/basic-project");
+    let json = run(&root, &analysis_args(None, &root, "json", &[]));
+    assert!(
+        matches!(json.status.code(), Some(0 | 1)),
+        "combined analysis failed: {}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let saved_dir = tempfile::tempdir().expect("saved report tempdir");
+    let saved_path = saved_dir.path().join("results.json");
+    std::fs::write(&saved_path, &json.stdout).expect("write saved report");
+
+    for format in ["pr-comment-github", "pr-comment-gitlab"] {
+        let direct = run(&root, &analysis_args(None, &root, format, &[]));
+        let saved = run(
+            &root,
+            &[
+                "report".to_string(),
+                "--from".to_string(),
+                saved_path.display().to_string(),
+                "--root".to_string(),
+                root.display().to_string(),
+                "--quiet".to_string(),
+                "--format".to_string(),
+                format.to_string(),
+            ],
+        );
+        assert!(
+            saved.status.success(),
+            "saved {format} failed: {}",
+            String::from_utf8_lossy(&saved.stderr)
+        );
+        assert!(
+            matches!(direct.status.code(), Some(0 | 1)),
+            "direct {format} failed: {}",
+            String::from_utf8_lossy(&direct.stderr)
+        );
+        assert_ne!(
+            saved.stdout, direct.stdout,
+            "if a combined {format} ever matches its saved render, add it to the parity list \
+             above instead of leaving this test to assert a difference that no longer exists"
+        );
+    }
 }

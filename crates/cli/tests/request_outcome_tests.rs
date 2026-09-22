@@ -143,6 +143,15 @@ fn a_run_asked_for_nothing_emits_no_request_outcomes_key() {
         vec!["dupes", "--root", root, "--format", "json", "--quiet"],
         vec!["health", "--root", root, "--format", "json", "--quiet"],
         vec!["security", "--root", root, "--format", "json", "--quiet"],
+        vec!["flags", "--root", root, "--format", "json", "--quiet"],
+        vec![
+            "suppressions",
+            "--root",
+            root,
+            "--format",
+            "json",
+            "--quiet",
+        ],
         vec!["--root", root, "--format", "json", "--quiet"],
     ] {
         let envelope = parse_json(&run(&args));
@@ -166,6 +175,8 @@ fn an_unresolvable_changed_since_reports_not_applied_on_every_carrying_command()
         vec!["dupes"],
         vec!["health"],
         vec!["security"],
+        vec!["flags"],
+        vec!["suppressions"],
         vec![],
     ] {
         let mut args = command.clone();
@@ -500,6 +511,157 @@ fn an_honoured_request_reports_applied_with_no_reason_and_no_message() {
     );
 }
 
+/// The two inventory commands resolve the same ref as the analysis commands and
+/// widen the same way, and until now neither said so anywhere but stderr. A
+/// resolvable ref reports the positive case, which is what lets a reader treat
+/// the inventory as scoped.
+#[test]
+fn the_inventory_commands_report_a_resolved_ref_as_applied() {
+    let repo = committed_project();
+    let root = root_arg(&repo);
+    for command in ["flags", "suppressions"] {
+        let envelope = parse_json(&run(&[
+            command,
+            "--root",
+            root,
+            "--changed-since",
+            "HEAD",
+            "--format",
+            "json",
+            "--quiet",
+        ]));
+        let entry = request(&envelope, "changed-since");
+        assert_eq!(entry["status"], "applied", "`{command}`: {entry}");
+        assert_eq!(entry["requested"], "HEAD");
+        assert!(
+            entry["reason"].is_null() && entry["message"].is_null(),
+            "`{command}` did what it was told and states nothing else: {entry}"
+        );
+    }
+}
+
+/// The trap the fix has to avoid: the CLI resolves the diff source for EVERY
+/// command before dispatch, and neither of these two applies a diff filter. A
+/// broader reader would publish `diff-filter: applied` and claim a narrowing
+/// that never happened, which is worse than the silence it replaced.
+#[test]
+fn the_inventory_commands_never_claim_a_diff_filter_they_do_not_apply() {
+    let project = project();
+    let root_path = project.path();
+    let root = root_arg(&project);
+    let diff = placeable_diff(root_path);
+    for command in ["flags", "suppressions"] {
+        let envelope = parse_json(&run(&[
+            command,
+            "--root",
+            root,
+            "--diff-file",
+            &diff,
+            "--format",
+            "json",
+            "--quiet",
+        ]));
+        assert!(
+            envelope["request_outcomes"]["diff-filter"].is_null(),
+            "`{command}` applies no diff filter and must claim none: {}",
+            envelope["request_outcomes"]
+        );
+    }
+}
+
+/// The scope a filter left, when the run measured it. An empty scope is the
+/// case a clean report cannot state for itself: the filter applied, so `status`
+/// stays `applied` and every consumer selector is unchanged, and the zero is
+/// what says the report covered nothing.
+#[test]
+fn an_applied_diff_filter_publishes_the_scope_it_left() {
+    let project = project();
+    let root_path = project.path();
+    let root = root_arg(&project);
+
+    let empty = root_path.join("deletion-only.diff");
+    std::fs::write(
+        &empty,
+        "diff --git a/src/gone.ts b/src/gone.ts\n\
+         deleted file mode 100644\n\
+         --- a/src/gone.ts\n\
+         +++ /dev/null\n\
+         @@ -1,1 +0,0 @@\n\
+         -export const gone = (): number => 3;\n",
+    )
+    .expect("deletion-only diff");
+    let envelope = parse_json(&run(&[
+        "dead-code",
+        "--root",
+        root,
+        "--diff-file",
+        empty.to_str().expect("utf8"),
+        "--format",
+        "json",
+        "--quiet",
+    ]));
+    let entry = request(&envelope, "diff-filter");
+    assert_eq!(
+        entry["status"], "applied",
+        "an empty scope is a scope, not a stand-down: {entry}"
+    );
+    assert_eq!(
+        entry["scope_size"], 0,
+        "the report below covered nothing and must say so: {entry}"
+    );
+    assert!(
+        entry["reason"].is_null() && entry["message"].is_null(),
+        "an applied request carries neither: {entry}"
+    );
+
+    let placeable = placeable_diff(root_path);
+    let envelope = parse_json(&run(&[
+        "dead-code",
+        "--root",
+        root,
+        "--diff-file",
+        &placeable,
+        "--format",
+        "json",
+        "--quiet",
+    ]));
+    let entry = request(&envelope, "diff-filter");
+    assert_eq!(entry["status"], "applied", "{entry}");
+    assert_eq!(
+        entry["scope_size"], 1,
+        "a measured scope carries the real count, not a flag: {entry}"
+    );
+}
+
+/// Absent is not zero. A request nothing measured the scope of carries no
+/// member, so a consumer cannot read "not measured" as "the scope was empty".
+#[test]
+fn a_request_with_no_measured_scope_carries_no_scope_size() {
+    let project = project();
+    let root_path = project.path();
+    let root = root_arg(&project);
+    let foreign = foreign_diff(root_path);
+    let envelope = parse_json(&run(&[
+        "dead-code",
+        "--root",
+        root,
+        "--changed-since",
+        "refs/heads/does-not-exist",
+        "--diff-file",
+        &foreign,
+        "--format",
+        "json",
+        "--quiet",
+    ]));
+    for name in ["changed-since", "diff-filter"] {
+        let entry = request(&envelope, name);
+        assert!(
+            entry.get("scope_size").is_none(),
+            "`{name}` narrowed nothing and must not claim a scope: {entry}"
+        );
+    }
+}
+
 /// The test that would have caught the whole class. `$FALLOW_DIFF_FILE` plus
 /// `--quiet` is the exact shape the GitHub Action and the GitLab template use,
 /// and it is the one shape where the CLI prints nothing at all.
@@ -596,6 +758,60 @@ fn the_rendered_pr_comment_body_names_the_unapplied_request() {
     assert!(
         out.stdout.contains("wider than requested"),
         "and what that means for the findings under it: {}",
+        out.stdout
+    );
+}
+
+/// The opposite shape on the same surface: the filter applied, over a scope it
+/// measured as empty, so every finding filtered out and the comment under this
+/// line is clean because nothing reached the analysis. The reviewer has no other
+/// way to tell that from a clean project.
+#[test]
+fn the_rendered_pr_comment_body_says_an_applied_filter_measured_an_empty_scope() {
+    let project = project();
+    let root_path = project.path();
+    let root = root_arg(&project);
+
+    let empty = root_path.join("deletion-only.diff");
+    std::fs::write(
+        &empty,
+        "diff --git a/src/gone.ts b/src/gone.ts\n\
+         deleted file mode 100644\n\
+         --- a/src/gone.ts\n\
+         +++ /dev/null\n\
+         @@ -1,1 +0,0 @@\n\
+         -export const gone = (): number => 3;\n",
+    )
+    .expect("deletion-only diff");
+    let out = run(&[
+        "dead-code",
+        "--root",
+        root,
+        "--diff-file",
+        empty.to_str().expect("utf8"),
+        "--format",
+        "pr-comment-github",
+        "--quiet",
+    ]);
+    assert!(
+        out.stdout
+            .contains("Request outcomes: applied diff-filter."),
+        "the body must state the honoured request: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("applied over an empty scope"),
+        "and that the scope it applied over was empty: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("nothing in it was analyzable"),
+        "and what that means for the clean report under it: {}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout.contains("wider than requested"),
+        "nothing stood down, so the widened clause must not fire: {}",
         out.stdout
     );
 }
@@ -699,6 +915,88 @@ fn a_written_sarif_file_reports_applied_with_its_path() {
         "an honoured request carries neither: {entry}"
     );
     assert!(sarif.is_file(), "the file the entry claims must exist");
+}
+
+/// `fallow security` owns its own SARIF writer, whose fate is settled AFTER the
+/// envelope is assembled. Nothing said the document was written, so a consumer
+/// could not tell a run that produced the artefact from one never asked for it.
+///
+/// The entry's path is canonicalized here because `requested` is echoed as the
+/// user spelled it, and a temp root reached through a symlink otherwise makes the
+/// assertion pass on one platform and fail on the other.
+#[test]
+fn a_security_run_reports_the_sarif_file_it_wrote() {
+    let project = project();
+    let canonical = project.path().canonicalize().expect("canonical root");
+    let root = canonical.to_str().expect("utf8");
+    let sarif = canonical.join("out").join("security.sarif");
+    let sarif_arg = sarif.to_str().expect("utf8");
+    let out = run(&[
+        "security",
+        "--root",
+        root,
+        "--sarif-file",
+        sarif_arg,
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    let envelope = parse_json(&out);
+    let entry = request(&envelope, "sarif-file");
+    assert_eq!(entry["status"], "applied", "{entry}");
+    assert_eq!(entry["requested"], sarif_arg);
+    assert_eq!(entry["affects"], "artifact", "{entry}");
+    assert!(
+        entry["reason"].is_null() && entry["message"].is_null(),
+        "an honoured request carries neither: {entry}"
+    );
+    assert!(
+        entry.get("scope_size").is_none(),
+        "an artefact request narrows nothing and measures no scope: {entry}"
+    );
+    assert!(sarif.is_file(), "the file the entry claims must exist");
+}
+
+/// This command's writer exits 2 rather than warning and continuing, which the
+/// issue asks to keep: the error document is the report, and it names the cause.
+#[cfg(unix)]
+#[test]
+fn a_security_sarif_write_failure_still_exits_two_with_the_error_document() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = project();
+    let canonical = project.path().canonicalize().expect("canonical root");
+    let root = canonical.to_str().expect("utf8");
+    let locked = canonical.join("locked");
+    std::fs::create_dir_all(&locked).expect("locked dir");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555))
+        .expect("drop write permission");
+
+    let out = run(&[
+        "security",
+        "--root",
+        root,
+        "--sarif-file",
+        locked.join("security.sarif").to_str().expect("utf8"),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    assert_eq!(
+        out.code, 2,
+        "this command refuses rather than continuing: {}{}",
+        out.stdout, out.stderr
+    );
+    let envelope = parse_json(&out);
+    assert_eq!(envelope["error"], true, "{envelope}");
+    let message = envelope["message"].as_str().expect("an error document");
+    assert!(
+        message.contains("Failed to write SARIF file"),
+        "the document names what failed: {message}"
+    );
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+        .expect("restore permission");
 }
 
 /// The defect itself: the document on stdout is complete, the exit code is the

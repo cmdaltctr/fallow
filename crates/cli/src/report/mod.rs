@@ -1,4 +1,5 @@
 mod badge;
+pub mod baseline_advisory_text;
 pub mod ci;
 pub(crate) mod codeclimate;
 mod compact;
@@ -453,13 +454,17 @@ fn print_check_github_format(
         ctx.elapsed,
         ctx.config_fixable,
         None,
-        // Only the request outcomes: this envelope is a render input for the
-        // GitHub-native targets and has never carried the baseline or the
-        // gates. Whether the run did what it was asked belongs here anyway,
-        // because the annotation stream and the job summary are where a
-        // reviewer reads the scope (issues #2687, #2688).
+        // This envelope is a render input for the GitHub-native targets, so it
+        // carries exactly what those two surfaces state: the scope the run
+        // covered (issues #2687, #2688), the gate inventory, and this run's view
+        // of the loaded baseline. Leaving the last two defaulted made the
+        // `Gate outcomes:` line and the baseline advisory reachable only through
+        // `fallow report --from`, so a direct run and a re-render of its own
+        // envelope disagreed (issue #2734).
         fallow_api::CheckJsonExtraOutputs {
             request_outcomes: crate::requests::request_outcomes(),
+            baseline_staleness: ctx.baseline_staleness,
+            gate_outcomes: ctx.gate_outcomes.clone(),
             ..Default::default()
         },
         ctx.workspace_diagnostics,
@@ -478,8 +483,8 @@ fn print_check_github_format(
 }
 
 /// The note a CI comment or review body carries: the type-aware message, the
-/// gate verdict, whether the run did what it was asked, a grouping this target
-/// cannot carry, or any combination.
+/// baseline advisory, the gate verdict, whether the run did what it was asked,
+/// a grouping this target cannot carry, or any combination of them.
 ///
 /// Shared by the live renderers and by `fallow report --from`, because the two
 /// must produce byte-identical bodies for one envelope and that parity has its
@@ -488,26 +493,40 @@ fn print_check_github_format(
 ///
 /// `grouping_dropped` is the `--group-by` mode when one was requested, because
 /// every target this note reaches renders one flat document (issue #2691).
-pub(crate) fn ci_status_note(
+pub fn ci_status_note(
     existing: Option<&'static str>,
+    baseline_advisory: Option<&str>,
     gates: Option<&fallow_output::GateOutcomes>,
     requests: Option<&fallow_output::RequestOutcomes>,
     grouping_dropped: Option<&str>,
 ) -> Option<String> {
-    let joined = [
-        existing.map(str::to_owned),
-        gate_outcome_text::summary_line_for_gates(gates),
-        request_outcome_text::summary_line_for_requests(requests),
-        grouping_dropped.map(grouping_note::dropped_grouping_clause),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(" ");
-    if joined.is_empty() {
-        return None;
-    }
-    Some(joined)
+    let gate_summary = gate_outcome_text::summary_line_for_gates(gates);
+    let request_summary = request_outcome_text::summary_line_for_requests(requests);
+    let grouping_clause = grouping_dropped.map(grouping_note::dropped_grouping_clause);
+    join_status_clauses(&[
+        existing,
+        baseline_advisory,
+        gate_summary.as_deref(),
+        request_summary.as_deref(),
+        grouping_clause.as_deref(),
+    ])
+}
+
+/// Space-join the clauses a status note is made of, dropping the absent ones.
+///
+/// Order is fixed: the type-aware message first because it says the analysis
+/// was incomplete, then the baseline advisory as the specific fact, then the
+/// gate inventory as the summary, then what the run was asked to do, and last
+/// the grouping this target could not carry. Both comment renderers emit the
+/// note as a single `> ` blockquote line, so the join is a space rather than a
+/// newline.
+pub(crate) fn join_status_clauses(clauses: &[Option<&str>]) -> Option<String> {
+    let joined = clauses
+        .iter()
+        .filter_map(|clause| clause.filter(|value| !value.is_empty()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!joined.is_empty()).then_some(joined)
 }
 
 /// Render the CI comment / review / badge fallback arms for dead-code results.
@@ -523,10 +542,13 @@ fn print_results_ci_comment(
     let value = fallow_output::codeclimate_issues_to_value(&issues);
     let incomplete = ci::required_type_aware_incomplete(ctx.type_aware);
     let conclusion = incomplete.then_some(fallow_output::PrDecisionConclusion::Failure);
+    let advisory =
+        baseline_advisory_text::advisory_line_for_staleness(ctx.baseline_staleness.as_ref());
     let requests = crate::requests::request_outcomes();
     let grouping_dropped = dropped_grouping_mode(ctx, output);
     let status_message = ci_status_note(
         incomplete.then_some(ci::TYPE_AWARE_INCOMPLETE_MESSAGE),
+        advisory.as_deref(),
         ctx.gate_outcomes.as_ref(),
         requests.as_ref(),
         grouping_dropped,
@@ -536,7 +558,10 @@ fn print_results_ci_comment(
         &value,
         output,
         conclusion,
-        status_message.as_deref(),
+        ci::pr_comment::PrCommentStatus {
+            message: status_message.as_deref(),
+            gates: &gate_outcome_text::gate_rows_for_gates(ctx.gate_outcomes.as_ref()),
+        },
     )
     .unwrap_or_else(|| {
         eprintln!("Error: badge format is only supported for the health command");
@@ -679,13 +704,7 @@ pub(crate) fn print_duplication_report(
         OutputFormat::GithubSummary => {
             print_dupes_github_format(report, ctx, GithubTarget::Summary)
         }
-        ci_format => print_duplication_ci_comment(
-            report,
-            ctx.root,
-            ci_format,
-            ctx.gate_outcomes.as_ref(),
-            None,
-        ),
+        ci_format => print_duplication_ci_comment(report, ctx.root, ci_format, ctx, None),
     }
 }
 
@@ -726,18 +745,35 @@ fn print_duplication_ci_comment(
     report: &DuplicationReport,
     root: &Path,
     output: OutputFormat,
-    gates: Option<&fallow_output::GateOutcomes>,
+    ctx: &ReportContext<'_>,
     grouping_dropped: Option<&str>,
 ) -> ExitCode {
     let issues = codeclimate::api_duplication_codeclimate_issues(report, root);
     let value = fallow_output::codeclimate_issues_to_value(&issues);
+    let advisory =
+        baseline_advisory_text::advisory_line_for_staleness(ctx.baseline_staleness.as_ref());
     let requests = crate::requests::request_outcomes();
-    let status_note = ci_status_note(None, gates, requests.as_ref(), grouping_dropped);
-    print_ci_comment_format_with_status("dupes", &value, output, None, status_note.as_deref())
-        .unwrap_or_else(|| {
-            eprintln!("Error: badge format is only supported for the health command");
-            ExitCode::from(2)
-        })
+    let note = ci_status_note(
+        None,
+        advisory.as_deref(),
+        ctx.gate_outcomes.as_ref(),
+        requests.as_ref(),
+        grouping_dropped,
+    );
+    print_ci_comment_format_with_status(
+        "dupes",
+        &value,
+        output,
+        None,
+        ci::pr_comment::PrCommentStatus {
+            message: note.as_deref(),
+            gates: &gate_outcome_text::gate_rows_for_gates(ctx.gate_outcomes.as_ref()),
+        },
+    )
+    .unwrap_or_else(|| {
+        eprintln!("Error: badge format is only supported for the health command");
+        ExitCode::from(2)
+    })
 }
 
 /// Render grouped duplication results across all output formats.
@@ -785,7 +821,7 @@ fn print_grouped_duplication_report(
             report,
             ctx.root,
             output,
-            ctx.gate_outcomes.as_ref(),
+            ctx,
             note_dropped_grouping(Some(grouping.mode), output),
         ),
         // The GitHub-native formats have no grouping concept, so they render
@@ -828,7 +864,7 @@ fn print_ci_comment_format_with_status(
     value: &serde_json::Value,
     output: OutputFormat,
     conclusion: Option<fallow_output::PrDecisionConclusion>,
-    status_message: Option<&str>,
+    status: ci::pr_comment::PrCommentStatus<'_>,
 ) -> Option<ExitCode> {
     let exit = match output {
         OutputFormat::PrCommentGithub => conclusion.map_or_else(
@@ -837,7 +873,7 @@ fn print_ci_comment_format_with_status(
                     analysis,
                     ci::pr_comment::Provider::Github,
                     value,
-                    status_message,
+                    status,
                 )
             },
             |conclusion| {
@@ -846,7 +882,7 @@ fn print_ci_comment_format_with_status(
                     ci::pr_comment::Provider::Github,
                     value,
                     conclusion,
-                    status_message,
+                    status,
                 )
             },
         ),
@@ -856,7 +892,7 @@ fn print_ci_comment_format_with_status(
                     analysis,
                     ci::pr_comment::Provider::Gitlab,
                     value,
-                    status_message,
+                    status,
                 )
             },
             |conclusion| {
@@ -865,7 +901,7 @@ fn print_ci_comment_format_with_status(
                     ci::pr_comment::Provider::Gitlab,
                     value,
                     conclusion,
-                    status_message,
+                    status,
                 )
             },
         ),
@@ -875,7 +911,7 @@ fn print_ci_comment_format_with_status(
                     analysis,
                     ci::pr_comment::Provider::Github,
                     value,
-                    status_message,
+                    status.message,
                 )
             },
             |conclusion| {
@@ -884,7 +920,7 @@ fn print_ci_comment_format_with_status(
                     ci::pr_comment::Provider::Github,
                     value,
                     conclusion,
-                    status_message,
+                    status.message,
                 )
             },
         ),
@@ -894,7 +930,7 @@ fn print_ci_comment_format_with_status(
                     analysis,
                     ci::pr_comment::Provider::Gitlab,
                     value,
-                    status_message,
+                    status.message,
                 )
             },
             |conclusion| {
@@ -903,7 +939,7 @@ fn print_ci_comment_format_with_status(
                     ci::pr_comment::Provider::Gitlab,
                     value,
                     conclusion,
-                    status_message,
+                    status.message,
                 )
             },
         ),
@@ -1023,7 +1059,7 @@ pub(crate) fn print_health_report(
             report,
             ctx.root,
             output,
-            ctx.gate_outcomes.as_ref(),
+            ctx,
             dropped_health_grouping_mode(grouping, output),
         ),
         // The GitHub-native formats have no grouping concept, so they render
@@ -1104,18 +1140,39 @@ fn print_health_ci_comment(
     report: &fallow_output::HealthReport,
     root: &Path,
     output: OutputFormat,
-    gates: Option<&fallow_output::GateOutcomes>,
+    ctx: &ReportContext<'_>,
     grouping_dropped: Option<&str>,
 ) -> ExitCode {
     let issues = codeclimate::api_health_codeclimate_issues(report, root);
     let value = fallow_output::codeclimate_issues_to_value(&issues);
+    // Health's own summary is the carrier on the envelope, and the report in
+    // hand is the same object, so read it from there rather than from the
+    // context: a grouped render rebuilds the report but not the context.
+    let advisory = baseline_advisory_text::advisory_line_for_staleness(
+        report.summary.baseline_staleness.as_ref(),
+    );
     let requests = crate::requests::request_outcomes();
-    let status_note = ci_status_note(None, gates, requests.as_ref(), grouping_dropped);
-    print_ci_comment_format_with_status("health", &value, output, None, status_note.as_deref())
-        .unwrap_or_else(|| {
-            eprintln!("Error: badge format is only supported for the health command");
-            ExitCode::from(2)
-        })
+    let note = ci_status_note(
+        None,
+        advisory.as_deref(),
+        ctx.gate_outcomes.as_ref(),
+        requests.as_ref(),
+        grouping_dropped,
+    );
+    print_ci_comment_format_with_status(
+        "health",
+        &value,
+        output,
+        None,
+        ci::pr_comment::PrCommentStatus {
+            message: note.as_deref(),
+            gates: &gate_outcome_text::gate_rows_for_gates(ctx.gate_outcomes.as_ref()),
+        },
+    )
+    .unwrap_or_else(|| {
+        eprintln!("Error: badge format is only supported for the health command");
+        ExitCode::from(2)
+    })
 }
 
 /// The requested health `--group-by` mode when this target cannot carry it.

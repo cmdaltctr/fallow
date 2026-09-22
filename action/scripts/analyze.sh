@@ -18,6 +18,36 @@ artifact_path() {
   fi
 }
 
+# Replay a captured stderr file into the step log as ::debug:: lines, then
+# remove the file. A discarded stderr is why a degraded change scope, a
+# truncated envelope or a failed capability probe reaches the log with no
+# cause (issues #2673, #2704, #2740). ::debug:: keeps a green run quiet: the
+# lines appear only when the command wrote something, and only for a run with
+# ACTIONS_STEP_DEBUG.
+replay_stderr_as_debug() {
+  local file=$1 label=$2
+  if [ -s "$file" ]; then
+    while IFS= read -r line; do
+      echo "::debug::${label}: ${line}" >&2
+    done < "$file"
+  fi
+  rm -f "$file"
+}
+
+# Run jq and keep its stderr in the step log. Every envelope read in this
+# script discarded it, so a truncated or unreadable `fallow-results.json` read
+# as "no findings": jq wrote the cause to stderr and the caller saw an empty
+# value. Only stdout is captured by a command substitution, so the replay is
+# safe inside one. jq is silent on success.
+jq_debug() {
+  local error_file status
+  error_file=$(mktemp)
+  jq "$@" 2> "$error_file"
+  status=$?
+  replay_stderr_as_debug "$error_file" "jq"
+  return $status
+}
+
 is_dead_code_baseline_command() {
   [ -n "${INPUT_BASELINE:-}" ] || return 1
   case "${INPUT_COMMAND:-}" in
@@ -58,6 +88,8 @@ repo_relative_root() {
   local abs_root
   local abs_workspace
   [ -n "$workspace" ] || return 1
+  # The stderr of `cd` is discarded because it restates the test: the `return 1`
+  # is the answer, and the caller warns on it.
   abs_root=$(cd "$root" 2>/dev/null && pwd -P) || return 1
   abs_workspace=$(cd "$workspace" 2>/dev/null && pwd -P) || return 1
 
@@ -79,6 +111,8 @@ normalize_config_path() {
 
   if [[ "$path" = /* ]]; then
     local abs_root
+    # The stderr of `cd` is discarded because a missing root is reported by the
+    # command that needs it, not by this path normalizer.
     abs_root=$(cd "${INPUT_ROOT:-.}" 2>/dev/null && pwd -P)
     if [ -n "$abs_root" ] && [[ "$path" == "$abs_root/"* ]]; then
       path="${path#"$abs_root/"}"
@@ -364,6 +398,16 @@ if [ -n "${INPUT_MIN_SCORE:-}${INPUT_MIN_SEVERITY:-}" ] \
   exit 2
 fi
 
+# `fallow audit` cannot judge a whole-project baseline, and the `baseline` input
+# is already rejected for it above, so the pair is unreachable through the
+# inputs. It is still reachable through `args`, where it buys a green run plus a
+# note this script replays as `::debug::`. Grep for it the way the
+# `--report-only` check above does.
+if [ "$INPUT_COMMAND" = "audit" ] && printf '%s' "${INPUT_ARGS:-}" | grep -q -- '--fail-on-stale-baseline'; then
+  echo "::error::--fail-on-stale-baseline in args: cannot apply to command: audit, which analyzes only the files that changed against its base and cannot judge a whole-project baseline. Run the gate on dead-code, dupes or health."
+  exit 2
+fi
+
 # The stale-baseline gate reads the analysis envelope, so it needs a baseline to
 # judge and a command that reports one. Saying so here beats a silent pass.
 if [ "${INPUT_FAIL_ON_STALE_BASELINE:-}" = "true" ]; then
@@ -462,7 +506,9 @@ fi
 HAS_SARIF_FILE=false
 if { [ "$INPUT_COMMAND" = "dead-code" ] || [ "$INPUT_COMMAND" = "check" ] || [ -z "$INPUT_COMMAND" ]; }; then
   HELP_TMP=$(mktemp)
-  fallow dead-code --help > "$HELP_TMP" 2>/dev/null || true
+  HELP_ERR=$(mktemp)
+  fallow dead-code --help > "$HELP_TMP" 2> "$HELP_ERR" || true
+  replay_stderr_as_debug "$HELP_ERR" "fallow dead-code --help"
   if /usr/bin/grep -q -- '--sarif-file' "$HELP_TMP"; then
     HAS_SARIF_FILE=true
   fi
@@ -488,9 +534,11 @@ fi
 
 HAS_NO_TYPE_AWARE=false
 if [ "${INPUT_TYPE_AWARE:-}" = "false" ]; then
-  if fallow dead-code --help 2>/dev/null | /usr/bin/grep -q -- '--no-type-aware'; then
+  TYPE_AWARE_PROBE_ERR=$(mktemp)
+  if fallow dead-code --help 2> "$TYPE_AWARE_PROBE_ERR" | /usr/bin/grep -q -- '--no-type-aware'; then
     HAS_NO_TYPE_AWARE=true
   fi
+  replay_stderr_as_debug "$TYPE_AWARE_PROBE_ERR" "fallow dead-code --help"
 fi
 if [ -n "${GITHUB_ENV:-}" ]; then
   printf '%s\n' "HAS_NATIVE_REPORT=${HAS_NATIVE_REPORT}" >> "$GITHUB_ENV"
@@ -532,14 +580,22 @@ if [ -n "${INPUT_CHANGED_SINCE:-}" ]; then
   _CHANGED_JSON=""
 
   # Try three-dot diff (precise: changes since merge-base, needs full history)
-  _CHANGED_JSON=$(cd "$_ROOT" && git diff --name-only -z --relative "${INPUT_CHANGED_SINCE}...HEAD" -- . 2>/dev/null | jq -Rs 'split("\u0000") | map(select(length > 0))' || true)
+  _SCOPE_ERR=$(mktemp)
+  _CHANGED_JSON=$(cd "$_ROOT" && git diff --name-only -z --relative "${INPUT_CHANGED_SINCE}...HEAD" -- . 2> "$_SCOPE_ERR" | jq -Rs 'split("\u0000") | map(select(length > 0))' || true)
+  replay_stderr_as_debug "$_SCOPE_ERR" "git diff --name-only"
 
   # Shallow clone fallback: fetch the base commit and try two-dot diff
   if ! printf '%s' "$_CHANGED_JSON" | jq -e 'length > 0' >/dev/null 2>&1; then
+    # The stderr of `git cat-file -e` is discarded because it is a pure
+    # existence test and the fetch below is the answer to a missing commit.
     if ! git cat-file -e "${INPUT_CHANGED_SINCE}^{commit}" 2>/dev/null; then
-      git fetch --depth=1 origin "$INPUT_CHANGED_SINCE" 2>/dev/null || true
+      _FETCH_ERR=$(mktemp)
+      git fetch --depth=1 origin "$INPUT_CHANGED_SINCE" 2> "$_FETCH_ERR" || true
+      replay_stderr_as_debug "$_FETCH_ERR" "git fetch"
     fi
-    _CHANGED_JSON=$(cd "$_ROOT" && git diff --name-only -z --relative "${INPUT_CHANGED_SINCE}" HEAD -- . 2>/dev/null | jq -Rs 'split("\u0000") | map(select(length > 0))' || true)
+    _SCOPE_ERR=$(mktemp)
+    _CHANGED_JSON=$(cd "$_ROOT" && git diff --name-only -z --relative "${INPUT_CHANGED_SINCE}" HEAD -- . 2> "$_SCOPE_ERR" | jq -Rs 'split("\u0000") | map(select(length > 0))' || true)
+    replay_stderr_as_debug "$_SCOPE_ERR" "git diff --name-only"
   fi
 
   # Last resort: GitHub API (works regardless of clone depth).
@@ -638,22 +694,32 @@ if [ -n "${INPUT_CHANGED_SINCE:-}" ] && [ -z "${FALLOW_DIFF_FILE:-}" ]; then
   _DIFF_PATH="$AUTO_DIFF_FILE"
 
   # Three-dot diff (precise: changes since merge-base, needs full history).
-  if (cd "$_ROOT" && git diff --unified=0 --relative "${INPUT_CHANGED_SINCE}...HEAD" -- .) > "$_DIFF_PATH" 2>/dev/null; then
+  _DIFF_ERR=$(mktemp)
+  if (cd "$_ROOT" && git diff --unified=0 --relative "${INPUT_CHANGED_SINCE}...HEAD" -- .) > "$_DIFF_PATH" 2> "$_DIFF_ERR"; then
     :
   fi
+  replay_stderr_as_debug "$_DIFF_ERR" "git diff --unified=0"
 
   # Shallow-clone fallback: fetch the base commit, retry two-dot diff.
   if [ ! -s "$_DIFF_PATH" ]; then
+    # The stderr of `git cat-file -e` is discarded because it is a pure
+    # existence test and the fetch below is the answer to a missing commit.
     if ! git cat-file -e "${INPUT_CHANGED_SINCE}^{commit}" 2>/dev/null; then
-      git fetch --depth=1 origin "$INPUT_CHANGED_SINCE" 2>/dev/null || true
+      _FETCH_ERR=$(mktemp)
+      git fetch --depth=1 origin "$INPUT_CHANGED_SINCE" 2> "$_FETCH_ERR" || true
+      replay_stderr_as_debug "$_FETCH_ERR" "git fetch"
     fi
-    (cd "$_ROOT" && git diff --unified=0 --relative "${INPUT_CHANGED_SINCE}" HEAD -- .) > "$_DIFF_PATH" 2>/dev/null || true
+    _DIFF_ERR=$(mktemp)
+    (cd "$_ROOT" && git diff --unified=0 --relative "${INPUT_CHANGED_SINCE}" HEAD -- .) > "$_DIFF_PATH" 2> "$_DIFF_ERR" || true
+    replay_stderr_as_debug "$_DIFF_ERR" "git diff --unified=0"
   fi
 
   # Last resort: GitHub API. `gh pr diff` returns the same unified-diff
   # format git produces, so the downstream DiffIndex parser is identical.
   if [ ! -s "$_DIFF_PATH" ] && [ -n "${GH_TOKEN:-}" ] && [ -n "${PR_NUMBER:-}" ] && [ -n "${GH_REPO:-}" ]; then
-    gh pr diff "$PR_NUMBER" --repo "$GH_REPO" > "$_DIFF_PATH" 2>/dev/null || true
+    _GH_DIFF_ERR=$(mktemp)
+    gh pr diff "$PR_NUMBER" --repo "$GH_REPO" > "$_DIFF_PATH" 2> "$_GH_DIFF_ERR" || true
+    replay_stderr_as_debug "$_GH_DIFF_ERR" "gh pr diff"
   fi
 
   if [ -s "$_DIFF_PATH" ]; then
@@ -774,13 +840,30 @@ BASELINE_STALENESS_JQ='.baseline_staleness // .summary.baseline_staleness // .ch
 
 # Read one member of the staleness object from an envelope file. Prints nothing
 # when the object or the member is absent.
+#
+# `section` selects which staleness object to read: empty for the single-analysis
+# commands, whose object the `//` chain finds, or one section prefix for `audit`,
+# which carries up to three and whose first-match chain would report one of them
+# under every label.
 read_staleness_field() {
-  local file=$1 field=$2
+  local file=$1 field=$2 section=${3:-}
+  local selector="${BASELINE_STALENESS_JQ}"
+  if [ -n "$section" ]; then
+    selector="${section}.baseline_staleness // empty"
+  fi
   # `// empty` cannot be used here: jq treats `false` as absent, which would
   # silently blank `change_scoped: false` and `gate_trips: false`.
-  jq -r --arg field "$field" \
-    "(${BASELINE_STALENESS_JQ}) | if has(\$field) then .[\$field] else empty end" \
-    "$file" 2>/dev/null || true
+  jq_debug -r --arg field "$field" \
+    "(${selector}) | if has(\$field) then .[\$field] else empty end" \
+    "$file" || true
+}
+
+# `scope_reasons` needs its own reader: it is an array, and the scalar reader
+# above returns the raw jq rendering of one, which is not a log line.
+read_staleness_scope_reasons() {
+  local file=$1
+  jq_debug -r "(${BASELINE_STALENESS_JQ}) | (.scope_reasons // []) | join(\", \")" \
+    "$file" || true
 }
 
 read_all_staleness_fields() {
@@ -791,15 +874,35 @@ read_all_staleness_fields() {
   BASELINE_ADVISORY=$(read_staleness_field "$file" warning)
   BASELINE_GATE_TRIPS=$(read_staleness_field "$file" gate_trips)
   BASELINE_CHANGE_SCOPED=$(read_staleness_field "$file" change_scoped)
+  BASELINE_UNRECOGNISED=$(read_staleness_field "$file" unrecognised_format)
+  BASELINE_SCOPE_REASONS=$(read_staleness_scope_reasons "$file")
 }
 
 read_all_staleness_fields "$RESULTS_FILE"
 
-# True when this script is the reason the run was narrowed, so removing what it
-# added can produce a run that CAN judge the baseline. Production mode and
-# workspace scoping are the user's own choice about what to analyze and are
-# never removed, so a run narrowed by those stands down instead.
+# True when every channel that narrowed the run is one this script added, so
+# removing them can produce a run that CAN judge the baseline. Production mode
+# and workspace scoping are the user's own choice about what to analyze, are
+# never removed, and make the re-read pointless.
+#
+# Driven by the run's own scope_reasons when the binary reports them, so
+# scoping smuggled through the 'args' input is visible here instead of sending
+# the script into a re-read that comes back narrowed anyway. A binary that
+# predates the member falls back to the input-based guess, which is the only
+# reading available there.
+BASELINE_REMOVABLE_SCOPE_REASONS="diff changed-since changed-files scope file issue-type-filter"
+
 action_can_rerun_unscoped() {
+  if [ -n "${BASELINE_SCOPE_REASONS:-}" ]; then
+    local reason
+    for reason in $(printf '%s' "$BASELINE_SCOPE_REASONS" | tr ',' ' '); do
+      case " ${BASELINE_REMOVABLE_SCOPE_REASONS} " in
+        *" ${reason} "*) ;;
+        *) return 1 ;;
+      esac
+    done
+    return 0
+  fi
   if [ "${INPUT_PRODUCTION:-}" = "true" ]; then return 1; fi
   if [ "${INPUT_PRODUCTION_DEAD_CODE:-}" = "true" ]; then return 1; fi
   if [ "${INPUT_PRODUCTION_HEALTH:-}" = "true" ]; then return 1; fi
@@ -807,6 +910,24 @@ action_can_rerun_unscoped() {
   if [ -n "${INPUT_WORKSPACE:-}" ]; then return 1; fi
   if [ -n "${INPUT_CHANGED_WORKSPACES:-}" ]; then return 1; fi
   return 0
+}
+
+# The channels that narrowed the run, as a parenthetical for a log line. Empty
+# when the binary does not report them.
+baseline_scope_clause() {
+  if [ -n "${BASELINE_SCOPE_REASONS:-}" ]; then
+    printf ' (%s)' "$BASELINE_SCOPE_REASONS"
+  fi
+}
+
+# Why a narrowed run cannot be re-read unscoped. Falls back to the two inputs
+# the guess is built from, for a binary that reports no scope_reasons.
+baseline_unremovable_scope_clause() {
+  if [ -n "${BASELINE_SCOPE_REASONS:-}" ]; then
+    printf ' (%s)' "$BASELINE_SCOPE_REASONS"
+  else
+    printf ' (production mode or workspace scoping)'
+  fi
 }
 
 # Build the re-read's argv as an element-wise copy of the analysis argv with
@@ -905,7 +1026,7 @@ run_stale_gate_analysis() {
   if [ ! -s "$GATE_RESULTS_RAW_FILE" ] || ! jq -e '.' "$GATE_RESULTS_RAW_FILE" > /dev/null 2>&1; then
     return 1
   fi
-  jq -s 'last' "$GATE_RESULTS_RAW_FILE" > "$GATE_RESULTS_FILE" 2>/dev/null || return 1
+  jq_debug -s 'last' "$GATE_RESULTS_RAW_FILE" > "$GATE_RESULTS_FILE" || return 1
   if jq -e '.error == true' "$GATE_RESULTS_FILE" > /dev/null 2>&1; then
     return 1
   fi
@@ -940,22 +1061,111 @@ elif [ "$BASELINE_CHANGE_SCOPED" = "true" ]; then
     if run_stale_gate_analysis; then
       read_all_staleness_fields "$GATE_RESULTS_FILE"
       if [ "$BASELINE_CHANGE_SCOPED" = "true" ]; then
-        stale_baseline_stand_down "the unscoped re-read was still narrowed to part of the project" "Remove the positional path from the 'args' input to judge the baseline."
+        stale_baseline_stand_down "the unscoped re-read was still narrowed to part of the project$(baseline_scope_clause)" "Remove the positional path from the 'args' input to judge the baseline."
       fi
     else
       stale_baseline_stand_down "the unscoped baseline re-read produced no readable result" "The primary analysis is unaffected; the step debug log carries its stderr."
     fi
     rm -f "$GATE_RESULTS_RAW_FILE" "$GATE_RESULTS_FILE" "$GATE_STDERR_FILE"
   else
-    stale_baseline_stand_down "it analyzed only part of the project (production mode or workspace scoping)" "Run an unscoped job to judge the baseline."
+    stale_baseline_stand_down "it analyzed only part of the project$(baseline_unremovable_scope_clause)" "Run an unscoped job to judge the baseline."
   fi
 fi
 
+# `fallow audit` loads up to three baselines and judges none of them: every
+# audit narrows to the files that changed against its base, so a whole-project
+# baseline matches less of the run for reasons that are not rot. It says so once
+# on stderr, which `--quiet` removes and this script replays as `::debug::`, so
+# an audit user never learned that the baseline they pass is inert (issue
+# #2677).
+#
+# Read each section separately rather than lengthening the single-analysis `//`
+# chain: that chain is first-match, so an audit with three baselines would
+# report one of them and hide the other two. One notice per object found, and
+# the single-analysis step outputs stay bound to their own read, because
+# overloading them would make `baseline-stale-entries` mean a different baseline
+# from one run to the next.
+#
+# A notice, not a warning: nobody asked for a judgement here, and the CLI itself
+# is silent unless the gate flag was passed. The unreachable-combination check
+# at input validation already rejects `command: audit` with the gate.
+audit_baseline_notices() {
+  local file=$1 row label command input section entries unrecognised path
+  # label:jq-prefix:command:input-variable. The label names the envelope
+  # section a reader goes looking in; the command is what they have to run, and
+  # the two differ:
+  # `duplication` is served by `fallow dupes` and `complexity` by
+  # `fallow health`.
+  for row in \
+    'dead-code:.dead_code:dead-code:INPUT_DEAD_CODE_BASELINE' \
+    'duplication:.duplication:dupes:INPUT_DUPES_BASELINE' \
+    'complexity:.complexity.summary:health:INPUT_HEALTH_BASELINE'
+  do
+    label=${row%%:*}
+    section=$(printf '%s' "$row" | cut -d: -f2)
+    command=$(printf '%s' "$row" | cut -d: -f3)
+    input=${row##*:}
+    # Through the shared reader, so this loop reads a member the same way the
+    # single-analysis path does. The reader guards with `has`, which keeps a
+    # literal `false` distinct from an absent member. The inline `// empty` it
+    # replaces collapsed the two. No consumer here saw a difference, because each
+    # one compares the value against the string `true`.
+    entries=$(read_staleness_field "$file" baseline_entries "$section")
+    # Absent means that baseline was never loaded, which is not worth a line.
+    if [ -z "$entries" ]; then
+      continue
+    fi
+    unrecognised=$(read_staleness_field "$file" unrecognised_format "$section")
+    # Audit resolves all three from project config as well as from inputs, so
+    # there is not always a path to echo back.
+    path=$(eval "printf '%s' \"\${${input}:-}\"")
+    if [ "$unrecognised" = "true" ]; then
+      if [ -n "$path" ]; then
+        echo "::warning::fallow: the ${label} baseline at ${path} has no entries this command recognises. It may be a baseline saved by another command, or an empty file. Either way it suppresses nothing."
+      else
+        echo "::warning::fallow: the ${label} baseline has no entries this command recognises. It may be a baseline saved by another command, or an empty file. Either way it suppresses nothing."
+      fi
+      continue
+    fi
+    if [ -n "$path" ]; then
+      echo "::notice::fallow: the ${label} baseline (${path}) has ${entries} entries and was not judged on this run: fallow audit analyzes only the files that changed against its base. Run 'fallow ${command} --baseline ${path}' over the whole project to check it."
+    else
+      echo "::notice::fallow: the ${label} baseline has ${entries} entries and was not judged on this run: fallow audit analyzes only the files that changed against its base. Run 'fallow ${command}' with that baseline over the whole project to check it."
+    fi
+  done
+}
+
+if [ "$INPUT_COMMAND" = "audit" ]; then
+  audit_baseline_notices "$RESULTS_FILE"
+fi
+
+# A baseline written by another command suppresses nothing, so the counts below
+# are all zero and read exactly like a baseline saved on a project that had
+# nothing to record. A repository that pointed `baseline` at the wrong file
+# would otherwise gate on it forever. Distinct from the `-z` branch above, which
+# means the run reported no staleness at all.
+#
+# Ahead of the advisory rather than beside it: the binary now trips the gate on
+# such a file, so the `*)` arm below would add "0 of 0 baseline entries matched
+# nothing this run" next to the line that says what is actually wrong.
+#
+# Keyed on the binary's own verdict rather than on a zero entry count, which a
+# baseline saved on a green main with nothing to record carries too: warning on
+# every run about a correctly saved baseline is noise the repository cannot turn
+# off. Not gated on the `baseline` input either, so a baseline passed through
+# `args` earns the same line; the path is named only when this script knows it.
+#
 # The advisory and the gate answer different questions and legitimately
 # disagree, so warn on either. A rotted baseline on a project with nothing left
 # to report is `warning: none` with `gate_trips: true`, and that is exactly the
 # case issue #2673 was filed about.
-if [ -n "$BASELINE_ENTRIES" ]; then
+if [ "${BASELINE_UNRECOGNISED:-}" = "true" ]; then
+  if [ -n "${INPUT_BASELINE:-}" ]; then
+    echo "::warning::fallow: the baseline at ${INPUT_BASELINE} has no entries this command recognises. It may be a baseline saved by another command, or an empty file. Either way it suppresses nothing."
+  else
+    echo "::warning::fallow: the loaded baseline has no entries this command recognises. It may be a baseline saved by another command, or an empty file. Either way it suppresses nothing."
+  fi
+elif [ -n "$BASELINE_ENTRIES" ]; then
   case "$BASELINE_ADVISORY" in
     partial)
       echo "::warning::fallow: baseline is partially stale: ${BASELINE_STALE_ENTRIES} of ${BASELINE_ENTRIES} entries matched nothing this run, so it protects less than what was saved. Re-save it with the save-baseline input."
@@ -1035,12 +1245,12 @@ gate_name_is_safe() {
 # `has()` rather than `// empty`: jq treats a `false` value as absent under the
 # alternative operator, which would blank every `enforced: false`.
 read_gate_member() {
-  jq -r --arg gate "$1" --arg member "$2" '
+  jq_debug -r --arg gate "$1" --arg member "$2" '
     (.gate_outcomes // {}) as $gates
     | if ($gates | has($gate)) and ($gates[$gate] | has($member))
       then ($gates[$gate][$member] | tostring)
       else "" end
-  ' "$RESULTS_FILE" 2>/dev/null || true
+  ' "$RESULTS_FILE" || true
 }
 
 # Which input owns which gate. A gate with no owning input set is reported and
@@ -1082,9 +1292,9 @@ gate_detail() {
   case "$1" in
     regression)
       local baseline current delta
-      baseline=$(jq -r '(.regression.baseline_total // .check.regression.baseline_total // "") | tostring' "$RESULTS_FILE" 2>/dev/null || true)
-      current=$(jq -r '(.regression.current_total // .check.regression.current_total // "") | tostring' "$RESULTS_FILE" 2>/dev/null || true)
-      delta=$(jq -r '(.regression.delta // .check.regression.delta // "") | tostring' "$RESULTS_FILE" 2>/dev/null || true)
+      baseline=$(jq_debug -r '(.regression.baseline_total // .check.regression.baseline_total // "") | tostring' "$RESULTS_FILE" || true)
+      current=$(jq_debug -r '(.regression.current_total // .check.regression.current_total // "") | tostring' "$RESULTS_FILE" || true)
+      delta=$(jq_debug -r '(.regression.delta // .check.regression.delta // "") | tostring' "$RESULTS_FILE" || true)
       if [ -n "$delta" ]; then
         printf 'issue count rose from %s to %s (delta %s, tolerance %s)' \
           "${baseline:-?}" "${current:-?}" "$delta" "${INPUT_TOLERANCE:-0}"
@@ -1110,7 +1320,7 @@ gate_detail() {
       ;;
     security)
       local new_count
-      new_count=$(jq -r '(.gate.new_count // "") | tostring' "$RESULTS_FILE" 2>/dev/null || true)
+      new_count=$(jq_debug -r '(.gate.new_count // "") | tostring' "$RESULTS_FILE" || true)
       [ -n "$new_count" ] && printf '%s new security candidate(s) on changed lines (gate: %s)' "$new_count" "${INPUT_SECURITY_GATE:-}"
       ;;
     stale-baseline)
@@ -1155,6 +1365,13 @@ record_gate_failure() {
   # are user-facing strings a repository may already match on.
   case "$gate" in
     stale-baseline)
+      # The gate also trips on a file this command cannot read as its own, whose
+      # counts are all zero: re-saving is not the remedy there, and "0 of 0
+      # entries matched nothing" names nothing the reader can act on.
+      if [ "${BASELINE_UNRECOGNISED:-}" = "true" ]; then
+        GATE_FAILURES+=("Fallow baseline gate failed: the baseline ${INPUT_BASELINE:-passed to this run} has no entries this command recognises, so it suppresses nothing. Point the baseline input at this command's own baseline, or set fail-on-stale-baseline: false.")
+        return
+      fi
       GATE_FAILURES+=("Fallow baseline gate failed: ${BASELINE_STALE_ENTRIES} of ${BASELINE_ENTRIES} entries in ${INPUT_BASELINE} matched nothing this run. Re-save the baseline, or set fail-on-stale-baseline: false.")
       return
       ;;
@@ -1248,7 +1465,7 @@ if [ "$HAS_GATE_OUTCOMES" = "true" ]; then
       continue
     fi
     classify_gate "$gate_key" "$(read_gate_member "$gate_key" status)" "$(read_gate_member "$gate_key" enforced)"
-  done < <(jq -r '(.gate_outcomes // {}) | keys[]?' "$RESULTS_FILE" 2>/dev/null || true)
+  done < <(jq_debug -r '(.gate_outcomes // {}) | keys[]?' "$RESULTS_FILE" || true)
 else
   # A pinned binary older than the gate index. Read the feature-local field each
   # gate already published, and fail OPEN for the three that never had one. The
@@ -1310,12 +1527,12 @@ fi
 # competing with the baseline advisory for the same budget.
 ANALYSIS_DEGRADED=false
 EMPTY_ANALYSIS=false
-DEGRADED_SUMMARY=$(jq -r '
+DEGRADED_SUMMARY=$(jq_debug -r '
   [ (.workspace_diagnostics // .dead_code.workspace_diagnostics // [])[] | select(.degrades_analysis == true) ]
   | group_by(.kind)
   | map("\(.[0].kind) (\(length))")
   | join(", ")
-' "$RESULTS_FILE" 2>/dev/null || true)
+' "$RESULTS_FILE" || true)
 if [ -n "$DEGRADED_SUMMARY" ]; then
   ANALYSIS_DEGRADED=true
   echo "::warning::Fallow ran with degraded inputs: ${DEGRADED_SUMMARY}. Some findings or scores were computed over less than the whole project, or from an input that did not load."
@@ -1338,14 +1555,28 @@ fi
 # happened, and the SARIF-absence warning below already owns that case. A
 # request name added in a later release carries its own class, so this selector
 # keeps saying the right thing about it.
-REQUESTS_UNAPPLIED=$(jq -r '
+REQUESTS_UNAPPLIED=$(jq_debug -r '
   [ (.request_outcomes // {}) | to_entries[]
     | select(.value.status != "applied" and .value.affects == "scope")
     | if .value.reason then "\(.key) (\(.value.reason))" else .key end ]
   | join(", ")
-' "$RESULTS_FILE" 2>/dev/null || true)
+' "$RESULTS_FILE" || true)
 if [ -n "$REQUESTS_UNAPPLIED" ]; then
   echo "::warning::Fallow could not apply: ${REQUESTS_UNAPPLIED}. The findings below cover more of the project than was requested, so do not read this run as scoped to the change."
+fi
+# The opposite shape, and the one a green report cannot state for itself: a
+# narrowing request that DID apply, over a scope it measured as empty. Every
+# finding then filters out, so the clean report below covered nothing (issue
+# #2734). Keyed on `scope_size == 0` beside `status == "applied"`, so a binary
+# that publishes no such member says nothing here.
+REQUESTS_EMPTY_SCOPE=$(jq_debug -r '
+  [ (.request_outcomes // {}) | to_entries[]
+    | select(.value.status == "applied" and .value.affects == "scope" and .value.scope_size == 0)
+    | .key ]
+  | join(", ")
+' "$RESULTS_FILE" || true)
+if [ -n "$REQUESTS_EMPTY_SCOPE" ]; then
+  echo "::warning::Fallow applied ${REQUESTS_EMPTY_SCOPE} over an empty scope, so no finding could survive it and the report below is clean because nothing was analyzable. Check the diff or ref this run was given before reading it as a clean result."
 fi
 
 if jq -e '[ (.workspace_diagnostics // .dead_code.workspace_diagnostics // [])[] | select(.kind == "no-source-files-analyzed") ] | length > 0' "$RESULTS_FILE" > /dev/null 2>&1; then
@@ -1411,10 +1642,10 @@ if { [ "${INPUT_FORMAT:-}" = "sarif" ] || [ "${INPUT_SARIF:-}" = "true" ]; } && 
     # publishes no `request_outcomes` (issue #2690).
     # Root only: `--sarif-file` is rejected for command: audit, which is the one
     # envelope with a nested dead_code section, so there is no second carrier.
-    SARIF_FILE_REASON=$(jq -r '
+    SARIF_FILE_REASON=$(jq_debug -r '
       (.request_outcomes // {})["sarif-file"]
       | if . == null or .status == "applied" then empty else (.message // .reason) end
-    ' "$RESULTS_FILE" 2>/dev/null || true)
+    ' "$RESULTS_FILE" || true)
     echo "::warning::Fallow produced no SARIF document, so this run uploads nothing and code scanning keeps the alerts from the previous upload.${SARIF_FILE_REASON:+ ${SARIF_FILE_REASON}} Check the earlier log lines for the cause, or drop format: sarif if code scanning is not wanted."
     rm -f "$SARIF_FILE"
   fi
@@ -1474,6 +1705,9 @@ fi
     "baseline_stale_entries=${BASELINE_STALE_ENTRIES}" \
     "baseline_advisory=${BASELINE_ADVISORY}" \
     "baseline_change_scoped=${BASELINE_CHANGE_SCOPED}" \
+    "baseline_scope_reasons=${BASELINE_SCOPE_REASONS}" \
+    "baseline_unrecognised=${BASELINE_UNRECOGNISED}" \
+    "baseline_path=${INPUT_BASELINE:-}" \
     "baseline_gate_trips=${BASELINE_GATE_TRIPS}" \
     "gates_failed=$(join_gate_names "${GATE_FAILED_NAMES[@]:-}")" \
     "gates_warned=$(join_gate_names "${GATE_WARNED_NAMES[@]:-}")" \
