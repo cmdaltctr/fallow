@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.28.0] - 2026-09-22
+
 ### Added
 
 - **Saved baselines say which command wrote them.** Every baseline
@@ -9408,7 +9410,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[unreleased]: https://github.com/fallow-rs/fallow/compare/v3.25.0...HEAD
+[unreleased]: https://github.com/fallow-rs/fallow/compare/v3.28.0...HEAD
+[3.28.0]: https://github.com/fallow-rs/fallow/compare/v3.27.0...v3.28.0
 [3.27.0]: https://github.com/fallow-rs/fallow/compare/v3.26.0...v3.27.0
 [3.26.0]: https://github.com/fallow-rs/fallow/compare/v3.25.0...v3.26.0
 [3.25.0]: https://github.com/fallow-rs/fallow/compare/v3.24.1...v3.25.0
