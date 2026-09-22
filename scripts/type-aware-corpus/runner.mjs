@@ -88,25 +88,21 @@ const parseSidecarResponse = (stdout, fail) => {
 };
 
 const validEnvelope = (response, protocolVersion, isObject) =>
-  [
-    isObject(response),
-    response.protocol_version === protocolVersion,
-    response.operation === "semantic-queries",
-    typeof response.sidecar_version === "string",
-    response.backend === "typescript-go",
-    typeof response.backend_version === "string",
-    Array.isArray(response.results),
-  ].every(Boolean);
+  isObject(response) &&
+  response.protocol_version === protocolVersion &&
+  response.operation === "semantic-queries" &&
+  typeof response.sidecar_version === "string" &&
+  response.backend === "typescript-go" &&
+  typeof response.backend_version === "string" &&
+  Array.isArray(response.results);
 
 const validEvidenceLocation = (location, normalizedRelativePath, isObject, index) =>
-  [
-    isObject(location),
-    normalizedRelativePath(location.path, `results evidence ${index} path`) === location.path,
-    Number.isInteger(location.line),
-    location.line >= 1,
-    Number.isInteger(location.col),
-    location.col >= 0,
-  ].every(Boolean);
+  isObject(location) &&
+  normalizedRelativePath(location.path, `results evidence ${index} path`) === location.path &&
+  Number.isInteger(location.line) &&
+  location.line >= 1 &&
+  Number.isInteger(location.col) &&
+  location.col >= 0;
 
 const validateEvidence = (evidence, dependencies) => {
   for (const [index, location] of evidence.entries()) {
@@ -124,14 +120,13 @@ const validateEvidence = (evidence, dependencies) => {
 };
 
 const validateResult = (queryResult, expected, seen, dependencies) => {
-  const valid = [
-    dependencies.isObject(queryResult),
-    expected.has(queryResult.query_id),
-    expected.get(queryResult.query_id) === queryResult.operation,
-    !seen.has(queryResult.query_id),
-    dependencies.queryStatuses.has(queryResult.status),
-    Array.isArray(queryResult.evidence),
-  ].every(Boolean);
+  const valid =
+    dependencies.isObject(queryResult) &&
+    expected.has(queryResult.query_id) &&
+    expected.get(queryResult.query_id) === queryResult.operation &&
+    !seen.has(queryResult.query_id) &&
+    dependencies.queryStatuses.has(queryResult.status) &&
+    Array.isArray(queryResult.evidence);
   if (!valid)
     dependencies.fail(
       "type-aware evidence sidecar response has invalid query identity or evidence",

@@ -280,8 +280,10 @@ const getLockPath = (dir: string): string => path.join(dir, INSTALL_LOCK_FILE);
  * back to a lock-free install.
  */
 export const tryAcquireInstallLock = (lockPath: string): boolean => {
+  let created = false;
   try {
     const fd = fs.openSync(lockPath, "wx");
+    created = true;
     try {
       fs.writeSync(fd, `${process.pid}`);
     } finally {
@@ -289,7 +291,11 @@ export const tryAcquireInstallLock = (lockPath: string): boolean => {
     }
     return true;
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+    if (created) {
+      // A failed owner write or close must not leave a fresh orphan lock that
+      // makes later installs wait. Never remove a sibling's existing lock.
+      releaseInstallLock(lockPath);
+    } else if ((err as NodeJS.ErrnoException).code === "EEXIST") {
       return false;
     }
     throw err;

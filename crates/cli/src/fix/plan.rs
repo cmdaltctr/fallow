@@ -468,8 +468,8 @@ pub(super) fn read_source_with_hash_check(
     plan: &mut FixPlan,
 ) -> Option<(String, super::io::EncodingMetadata)> {
     if let Some(staged) = plan.staged_content(path) {
-        let raw = String::from_utf8(staged.to_vec()).ok()?;
-        return match super::io::classify_source(&raw) {
+        let raw = std::str::from_utf8(staged).ok()?;
+        return match super::io::classify_source(raw) {
             Ok((content, meta)) => Some((content, meta)),
             Err(super::io::EncodingError::MixedLineEndings { .. }) => {
                 plan.skip(path.to_path_buf(), SkipReason::MixedLineEndings);

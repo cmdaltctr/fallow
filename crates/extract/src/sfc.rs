@@ -439,8 +439,8 @@ pub(crate) fn parse_sfc_to_module(
     apply_template_usage(TemplateUsageInput {
         kind,
         source,
-        template_visible_imports: &template_visible_imports,
-        template_visible_bound_targets: &template_visible_bound_targets,
+        template_visible_imports,
+        template_visible_bound_targets,
         template_visible_iterable_types: &template_visible_iterable_types,
         props_return_binding: props_return_binding.as_deref(),
         credit_load_data: kind == SfcKind::Svelte && is_sveltekit_route_data_component(path),
@@ -1010,8 +1010,8 @@ fn build_generic_attr_probe_source(script: &SfcScript) -> Option<String> {
 struct TemplateUsageInput<'a> {
     kind: SfcKind,
     source: &'a str,
-    template_visible_imports: &'a FxHashSet<String>,
-    template_visible_bound_targets: &'a FxHashMap<String, String>,
+    template_visible_imports: FxHashSet<String>,
+    template_visible_bound_targets: FxHashMap<String, String>,
     template_visible_iterable_types: &'a FxHashMap<String, String>,
     props_return_binding: Option<&'a str>,
     credit_load_data: bool,
@@ -1054,13 +1054,13 @@ fn apply_template_usage(input: TemplateUsageInput<'_>) {
 /// load prop. Crediting a prop name against an import is inert. Also sets
 /// `has_load_data_whole_use` when a route spreads / passes the whole `data` prop.
 fn build_template_credited_set(
-    template_visible_imports: &FxHashSet<String>,
+    template_visible_imports: FxHashSet<String>,
     props_return_binding: Option<&str>,
     credit_load_data: bool,
     source: &str,
     combined: &mut ModuleInfo,
 ) -> FxHashSet<String> {
-    let mut credited: FxHashSet<String> = template_visible_imports.clone();
+    let mut credited = template_visible_imports;
     // unused-load-data-key Primitive B: a SvelteKit route component receives a
     // `data` prop populated by the route's `load()` return object. Credit `data`
     // as a recognized root so its template member accesses (`data.<key>`) are
@@ -1098,29 +1098,20 @@ fn compute_template_usage(
     kind: SfcKind,
     source: &str,
     credited: &FxHashSet<String>,
-    template_visible_bound_targets: &FxHashMap<String, String>,
+    mut template_visible_bound_targets: FxHashMap<String, String>,
     template_visible_iterable_types: &FxHashMap<String, String>,
     credit_load_data: bool,
 ) -> crate::template_usage::TemplateUsage {
-    if credit_load_data && template_visible_bound_targets.contains_key("data") {
-        let mut filtered = template_visible_bound_targets.clone();
-        filtered.remove("data");
-        collect_template_usage_with_bound_targets(
-            kind,
-            source,
-            credited,
-            &filtered,
-            template_visible_iterable_types,
-        )
-    } else {
-        collect_template_usage_with_bound_targets(
-            kind,
-            source,
-            credited,
-            template_visible_bound_targets,
-            template_visible_iterable_types,
-        )
+    if credit_load_data {
+        template_visible_bound_targets.remove("data");
     }
+    collect_template_usage_with_bound_targets(
+        kind,
+        source,
+        credited,
+        &template_visible_bound_targets,
+        template_visible_iterable_types,
+    )
 }
 
 /// Mark each harvested prop `used_in_template` when the template references it by

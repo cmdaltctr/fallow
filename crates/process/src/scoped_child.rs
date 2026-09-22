@@ -38,8 +38,8 @@ use super::spawn_retry::spawn_retrying_busy_executable;
 /// RAII handle wrapping a spawned `Child` with registry tracking.
 pub struct ScopedChild {
     /// `None` after the wrapper has consumed the child (`wait_with_output`,
-    /// `wait`). Drop checks this and reaps non-blockingly if the child
-    /// is still here.
+    /// `wait`). Drop checks this and terminates a still-running child,
+    /// then reaps it with bounded cleanup retries.
     inner: Option<Child>,
     /// Registry key. `None` after deregister so Drop does not redo it.
     id: Option<u64>,

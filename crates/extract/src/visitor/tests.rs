@@ -6168,12 +6168,6 @@ fn import_meta_glob_string_pattern() {
 }
 
 #[test]
-fn import_meta_glob_array_patterns() {
-    let info = parse("const mods = import.meta.glob(['./a/*.ts', './b/*.ts']);");
-    assert_eq!(info.dynamic_import_patterns.len(), 2);
-}
-
-#[test]
 fn require_context_non_recursive() {
     let info = parse("const ctx = require.context('./components', false);");
     assert_eq!(info.dynamic_import_patterns.len(), 1);
@@ -9520,7 +9514,13 @@ fn import_meta_glob_string() {
 #[test]
 fn import_meta_glob_array() {
     let info = parse("import.meta.glob(['./a/*.ts', './b/*.ts']);");
-    assert_eq!(info.dynamic_import_patterns.len(), 2);
+    assert_eq!(
+        info.dynamic_import_patterns
+            .iter()
+            .map(|pattern| pattern.prefix.as_str())
+            .collect::<Vec<_>>(),
+        ["./a/*.ts", "./b/*.ts"]
+    );
 }
 
 #[test]

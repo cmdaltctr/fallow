@@ -87,8 +87,7 @@ fn run_inner(args: &UploadSourceMapsArgs, root: &Path) -> Result<(), UploadSourc
         )));
     }
 
-    let include_patterns = vec![args.include.clone()];
-    let include = compile_glob_set(&include_patterns, "--include")?;
+    let include = compile_glob_set(std::slice::from_ref(&args.include), "--include")?;
     let exclude = compile_glob_set(&args.exclude, "--exclude")?;
     let repo = resolve_repo_name(args.repo.as_deref(), root)?;
     let git_sha = resolve_git_sha(args.git_sha.as_deref(), root)?;
