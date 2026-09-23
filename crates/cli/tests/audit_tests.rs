@@ -2830,6 +2830,152 @@ fn audit_dependency_location_change_is_introduced() {
     );
 }
 
+/// A repository whose base commit has an unused `left-pad` dependency.
+fn unused_dependency_audit_fixture() -> TempDir {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let dir = tmp.path();
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("package.json"),
+        r#"{"name":"audit-dep-scope","main":"src/index.ts","dependencies":{"left-pad":"1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(dir.join("src/index.ts"), "export {};\n").unwrap();
+    fs::write(dir.join("src/util.ts"), "export const value = 1;\n").unwrap();
+    git(dir, &["init", "-b", "main"]);
+    commit_all(dir, "initial");
+    tmp
+}
+
+fn audit_unused_dependency_names(dir: &Path) -> Vec<String> {
+    let output = run_fallow_raw(&[
+        "audit",
+        "--root",
+        dir.to_str().unwrap(),
+        "--base",
+        "HEAD~1",
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]);
+    let json = parse_json(&output);
+    json["dead_code"]["unused_dependencies"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|item| {
+            item["package_name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn audit_leaves_out_dependency_findings_of_an_unchanged_manifest() {
+    let tmp = unused_dependency_audit_fixture();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("src/util.ts"),
+        "export const value = 1;\nexport const other = 2;\n",
+    )
+    .unwrap();
+    commit_all(dir, "edit a source file");
+
+    assert_eq!(audit_unused_dependency_names(dir), Vec::<String>::new());
+}
+
+#[test]
+fn audit_reports_dependency_findings_of_a_changed_manifest() {
+    let tmp = unused_dependency_audit_fixture();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("package.json"),
+        r#"{"name":"audit-dep-scope","description":"changed","main":"src/index.ts","dependencies":{"left-pad":"1.0.0"}}"#,
+    )
+    .unwrap();
+    commit_all(dir, "edit the manifest");
+
+    assert_eq!(
+        audit_unused_dependency_names(dir),
+        vec!["left-pad".to_string()]
+    );
+}
+
+/// A source edit that makes a dependency unused, with no manifest edit, is
+/// out of audit scope: the audit does not report it and the `new-only` gate
+/// does not fail on it. With a manifest edit, the audit reports it as
+/// introduced.
+#[test]
+fn audit_scopes_a_dependency_that_a_source_edit_made_unused_by_its_manifest() {
+    let setup = |edit_manifest: bool| {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let dir = tmp.path();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        let manifest = |description: &str| {
+            format!(
+                r#"{{"name":"audit-dep-scope"{description},"main":"src/a.ts","dependencies":{{"lodash":"4.17.21"}}}}"#
+            )
+        };
+        fs::write(dir.join("package.json"), manifest("")).unwrap();
+        fs::write(
+            dir.join("src/a.ts"),
+            "import lodash from \"lodash\";\nconsole.log(lodash);\n",
+        )
+        .unwrap();
+        git(dir, &["init", "-b", "main"]);
+        commit_all(dir, "initial");
+        fs::write(dir.join("src/a.ts"), "console.log(1);\n").unwrap();
+        if edit_manifest {
+            fs::write(
+                dir.join("package.json"),
+                manifest(r#","description":"changed""#),
+            )
+            .unwrap();
+        }
+        commit_all(dir, "remove the import");
+        tmp
+    };
+    let audit = |dir: &Path| {
+        parse_json(&run_fallow_raw(&[
+            "audit",
+            "--root",
+            dir.to_str().unwrap(),
+            "--base",
+            "HEAD~1",
+            "--format",
+            "json",
+            "--quiet",
+            "--no-cache",
+        ]))
+    };
+
+    let tmp = setup(false);
+    let json = audit(tmp.path());
+    assert_eq!(
+        json["dead_code"]["unused_dependencies"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "{json:#}"
+    );
+    assert_ne!(json["verdict"].as_str(), Some("fail"), "{json:#}");
+
+    let tmp = setup(true);
+    let json = audit(tmp.path());
+    assert_eq!(
+        json["dead_code"]["unused_dependencies"][0]["package_name"], "lodash",
+        "{json:#}"
+    );
+    assert_eq!(
+        json["dead_code"]["unused_dependencies"][0]["introduced"], true,
+        "{json:#}"
+    );
+    assert_eq!(json["verdict"].as_str(), Some("fail"), "{json:#}");
+}
+
 /// An audit fixture whose dead-code baseline is saved on `main` and then
 /// rotted on `feature`, so a whole-project comparison calls the baseline stale
 /// while every audit run sees only the changed slice.
@@ -4458,6 +4604,57 @@ fn audit_new_file_is_treated_as_behavioral() {
         "new unused export in a new file must be attributed as introduced. full json: {}",
         serde_json::to_string_pretty(&json).unwrap_or_default()
     );
+}
+
+/// Removing only a `@expected-unused` tag changes no token, but it changes
+/// the findings. The head run must not stand in for the base, so the export
+/// that the tag covered is introduced and the `new-only` gate fails.
+#[test]
+fn audit_removed_expected_unused_tag_reports_introduced_finding() {
+    let dir = create_audit_fixture("reuse-expected-unused");
+    let root = dir.path();
+    fs::write(
+        root.join("src/utils.ts"),
+        "export const used = () => 42;\nexport const unused = () => 0;\n/** @expected-unused */\nexport const tagged = 1;\n",
+    )
+    .unwrap();
+    commit_all(root, "tag an unused export");
+    fs::write(
+        root.join("src/utils.ts"),
+        "export const used = () => 42;\nexport const unused = () => 0;\n/** */\nexport const tagged = 1;\n",
+    )
+    .unwrap();
+    commit_all(root, "remove the tag");
+
+    let output = run_fallow_raw(&[
+        "audit",
+        "--root",
+        root.to_str().unwrap(),
+        "--base",
+        "HEAD~1",
+        "--gate",
+        "new-only",
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+
+    let json = parse_json(&output);
+    let tagged: Vec<bool> = json["dead_code"]["unused_exports"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["export_name"] == "tagged")
+        .map(|item| item["introduced"].as_bool().unwrap_or(false))
+        .collect();
+    assert_eq!(
+        tagged,
+        vec![true],
+        "the untagged export must be introduced. full json: {}",
+        serde_json::to_string_pretty(&json).unwrap_or_default()
+    );
+    assert_eq!(json["verdict"], "fail", "stderr: {}", output.stderr);
+    assert_eq!(output.code, 1, "stderr: {}", output.stderr);
 }
 
 /// Whitespace-only edits across many `.ts` files in one commit exercise the
