@@ -244,10 +244,41 @@ test(
       );
       assert.throws(() => invoke(mismatch, "mismatch"), /invalid provenance or envelope/);
 
+      const validResult = {
+        query_id: 0,
+        operation: "symbol-use",
+        status: "complete",
+        evidence: [],
+      };
+      const validResponse = {
+        protocol_version: 7,
+        operation: "semantic-queries",
+        sidecar_version: "x",
+        backend: "typescript-go",
+        backend_version: "x",
+        results: [validResult],
+      };
+      for (const [name, response, expectedError] of [
+        ["null-envelope", null, /invalid provenance or envelope/],
+        ["null-result", { ...validResponse, results: [null] }, /invalid query identity/],
+        [
+          "null-evidence",
+          { ...validResponse, results: [{ ...validResult, evidence: [null] }] },
+          /invalid source evidence/,
+        ],
+      ]) {
+        const sidecar = writeExecutable(
+          root,
+          `${name}.mjs`,
+          `#!/usr/bin/env node\nprocess.stdin.resume(); process.stdin.on("end", () => process.stdout.write(${JSON.stringify(JSON.stringify(response))}));\n`,
+        );
+        assert.throws(() => invoke(sidecar, name), expectedError);
+      }
+
       const duplicate = writeExecutable(
         root,
         "duplicate.mjs",
-        '#!/usr/bin/env node\nprocess.stdin.resume(); process.stdin.on("end", () => { const result={query_id:0,operation:"symbol-use",evidence:[]}; process.stdout.write(JSON.stringify({protocol_version:7,operation:"semantic-queries",sidecar_version:"x",backend:"typescript-go",backend_version:"x",results:[result,result]})); });\n',
+        '#!/usr/bin/env node\nprocess.stdin.resume(); process.stdin.on("end", () => { const result={query_id:0,operation:"symbol-use",status:"complete",evidence:[]}; process.stdout.write(JSON.stringify({protocol_version:7,operation:"semantic-queries",sidecar_version:"x",backend:"typescript-go",backend_version:"x",results:[result,result]})); });\n',
       );
       assert.throws(() => invoke(duplicate, "duplicate"), /invalid query identity/);
 
@@ -357,6 +388,22 @@ test("manifest contains the complete pinned accuracy and control corpus", () => 
   assert.throws(() => validateManifest(invalid), /vite\.candidate_expectation must be zero/);
 });
 
+test("manifest reports malformed containers and feature buckets without dereferencing them", () => {
+  assert.throws(() => validateManifest(null), /manifest schema_version must be 1/);
+  assert.throws(
+    () => validateManifest({ ...manifest, projects: null }),
+    /manifest must contain exactly/,
+  );
+  for (const buckets of [null, [null], [42]]) {
+    const invalid = structuredClone(manifest);
+    invalid.projects[0].feature_buckets = buckets;
+    assert.throws(
+      () => validateManifest(invalid),
+      /feature_buckets must be an array of non-empty strings/,
+    );
+  }
+});
+
 test("tracked supplemental smoke is internally reproducible and review-bound", () => {
   const artifact = JSON.parse(
     readFileSync(resolve(REPO_ROOT, "benchmarks/type-aware-supplemental-smoke.json"), "utf8"),
@@ -397,6 +444,31 @@ test("tracked supplemental smoke is internally reproducible and review-bound", (
       dependencyEnvironment: artifact.project.dependency_environment,
     };
     assert.deepEqual(validateSupplementalArtifactData(artifact, adjudication, context), artifact);
+
+    const missingSourceRuns = structuredClone(artifact);
+    missingSourceRuns.artifacts.source_runs = null;
+    assert.throws(
+      () => validateSupplementalArtifactData(missingSourceRuns, adjudication, context),
+      /requires two baseline and two refined source runs/,
+    );
+
+    assert.throws(
+      () => validateSupplementalArtifactData(null, adjudication, context),
+      /supplemental artifact schema_version must be 6/,
+    );
+    assert.throws(
+      () => validateSupplementalArtifactData(artifact, adjudication, null),
+      /supplemental validation requires runtime hashes and a source root/,
+    );
+    assert.throws(
+      () =>
+        validateSupplementalArtifactData(
+          artifact,
+          { ...adjudication, supplemental_reviews: [] },
+          context,
+        ),
+      /counts, hashes, or review binding/,
+    );
 
     const stale = structuredClone(artifact);
     stale.result.confirmed_candidate_keys.pop();
@@ -553,6 +625,23 @@ test("semantic capability proof cannot be neutered or reassigned to tsc and Oxli
       ),
     };
     assert.deepEqual(validateCapabilitiesArtifactData(artifact, context), artifact);
+    assert.throws(
+      () => validateCapabilitiesArtifactData({ ...artifact, repositories: null }, context),
+      /requires Astro and Vitest in stable order/,
+    );
+    for (const [capability, field, message] of [
+      ["semantic-impact-targeted-tests", "targeted_tests", /no impact or targeted-test proof/],
+      ["public-type-coupling", "top_contributors", /no rich public type-coupling proof/],
+      ["public-type-coupling", "cycles", /no rich public type-coupling proof/],
+    ]) {
+      const invalidArray = structuredClone(artifact);
+      invalidArray.repositories[0].capabilities[capability][field] = null;
+      assert.throws(() => validateCapabilitiesArtifactData(invalidArray, context), message);
+    }
+    assert.throws(
+      () => validateCapabilitiesArtifactData(null, context),
+      /semantic capabilities artifact schema_version must be 3/,
+    );
 
     const missing = structuredClone(artifact);
     delete missing.repositories[0].capabilities["semantic-symbol-trace"];
@@ -612,11 +701,8 @@ test("publication gate rejects a subset missing the zero-control projects", () =
   );
 });
 
-test("publication verifier rejects a focused Fallow binary hash mismatch", () => {
-  const focusedReport = { fallow_sha256: "a".repeat(64) };
-  const discovery = { provenance: { fallow: { sha256: "b".repeat(64) } } };
-  const focusedCases = focusedReport.fallow_sha256 === discovery.provenance.fallow.sha256;
-  const summary = { gate: { go: focusedCases, checks: { focused_cases: focusedCases } } };
+test("publication gate rejects a failed focused check during verification", () => {
+  const summary = { gate: { go: false, checks: { focused_cases: false } } };
 
   assert.throws(() => requirePublicationGo(summary, "verify"), /NO-GO.*focused_cases/);
   assert.doesNotThrow(() => requirePublicationGo(summary, "write"));
@@ -831,6 +917,20 @@ test("measurement validation requires complete paired runs", () => {
     projects: [{ id: "one", runs }],
   };
   assert.doesNotThrow(() => validateMeasurements(discovery, measurements));
+  assert.throws(
+    () => validateMeasurements(discovery, { ...measurements, projects: null }),
+    /measurements must contain every discovery project exactly once/,
+  );
+  const missingRuns = structuredClone(measurements);
+  missingRuns.projects[0].runs = null;
+  assert.throws(() => validateMeasurements(discovery, missingRuns), /incomplete run matrix/);
+  assert.throws(
+    () => validateMeasurements(discovery, null),
+    /measurement artifact schema_version must be 1/,
+  );
+  const nullRun = structuredClone(measurements);
+  nullRun.projects[0].runs[0] = null;
+  assert.throws(() => validateMeasurements(discovery, nullRun), /warmup must be a boolean/);
 
   const invalidMode = structuredClone(measurements);
   invalidMode.projects[0].runs.find(({ mode }) => mode === "refined").mode = "bogus";

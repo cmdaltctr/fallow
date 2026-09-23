@@ -43,10 +43,8 @@ const validateProjectSource = (project, dependencies) => {
 const expectedCandidates = (role) => new Map([["zero-control", "zero"]]).get(role) ?? "nonzero";
 
 const validFeatureBuckets = (buckets) =>
-  [
-    Array.isArray(buckets),
-    buckets.every((bucket) => [typeof bucket === "string", bucket.trim() !== ""].every(Boolean)),
-  ].every(Boolean);
+  Array.isArray(buckets) &&
+  buckets.every((bucket) => typeof bucket === "string" && bucket.trim() !== "");
 
 const validateProjectContract = (project, fail) => {
   const expectation = expectedCandidates(project.role);
@@ -85,7 +83,7 @@ const validateProject = (project, seen, dependencies) => {
 export const validateManifest = (manifest, dependencies) => {
   const { fail, isObject, requiredGates, requiredProjects } = dependencies;
   requireValid(
-    [isObject(manifest), manifest.schema_version === 1].every(Boolean),
+    isObject(manifest) && manifest.schema_version === 1,
     "manifest schema_version must be 1",
     fail,
   );
@@ -97,9 +95,7 @@ export const validateManifest = (manifest, dependencies) => {
   requireValid(isObject(manifest.gates), "manifest gates must be an object", fail);
   requiredGates.forEach((gate) => validateGate(manifest.gates, gate, fail));
   requireValid(
-    [Array.isArray(manifest.projects), manifest.projects.length === requiredProjects.size].every(
-      Boolean,
-    ),
+    Array.isArray(manifest.projects) && manifest.projects.length === requiredProjects.size,
     `manifest must contain exactly ${requiredProjects.size} corpus projects`,
     fail,
   );
