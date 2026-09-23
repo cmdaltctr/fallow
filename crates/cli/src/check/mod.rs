@@ -776,7 +776,7 @@ fn apply_rules_and_filters(
 ) {
     rules::apply_rules(results, config);
     if opts.fail_on_issues {
-        rules::promote_policy_finding_warns(results);
+        rules::promote_finding_warns(results);
     }
     opts.filters.apply(results);
 }
@@ -1170,10 +1170,15 @@ pub fn execute_check(opts: &CheckOptions<'_>) -> Result<CheckResult, ExitCode> {
     if config.type_aware.enabled {
         // Reconciliation can add findings a syntactic pass never produced, so
         // effective severities are resolved once more over the refined set.
-        // The pass only removes findings, so a run that reconciled nothing is
-        // unchanged. Mirrors EditorAnalysisSession, which keeps the CLI and
-        // the editor reporting the same set for an overridden path.
+        // The pass removes findings and writes each gate severity again, so a
+        // run that reconciled nothing is unchanged. It also resets the
+        // --fail-on-issues promotion, which is applied again below. Mirrors
+        // EditorAnalysisSession, which keeps the CLI and the editor reporting
+        // the same set for an overridden path.
         rules::apply_rules(&mut data.results, &config);
+        if opts.fail_on_issues {
+            rules::promote_finding_warns(&mut data.results);
+        }
     }
     let elapsed = start.elapsed();
     let analysis_identity = type_aware
