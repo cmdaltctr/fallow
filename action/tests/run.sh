@@ -3132,6 +3132,21 @@ assert_contains "$(cat "$DEGRADED_SUMMARY_FILE")" "or from an input that did not
 assert_not_contains "$(cat "$DEGRADED_SUMMARY_FILE")" "Some files never reached the analysis" \
   "summary.sh: the note does not claim files were skipped"
 
+# summary.sh writes a `Gates:` line from `FALLOW_GATES_FAILED` alone. The
+# analyze.sh cases cover how a failing default rule reaches that list when
+# `fail-on-issues` is false.
+GATES_SUMMARY_FILE="$WORK_DIR/gates-summary.md"
+: > "$GATES_SUMMARY_FILE"
+OUT=$(cd "$WORK_DIR" && \
+  GITHUB_STEP_SUMMARY="$GATES_SUMMARY_FILE" \
+  FALLOW_COMMAND="dead-code" \
+  ACTION_JQ_DIR="$JQ_DIR" \
+  FALLOW_GATES_FAILED="error-severity-findings" \
+  FALLOW_RESULTS_FILE="missing-results.json" \
+  bash "$SCRIPTS_DIR/summary.sh" 2>&1)
+assert_contains "$(cat "$GATES_SUMMARY_FILE")" "> **Gates:** failed error-severity-findings." \
+  "summary.sh: the Gates line lists an unenforced default rule with status fail"
+
 printf '{"annotations":[{"path":"src/a.ts","line":0,"level":"failure","title":"fallow/high-crap-score","message":"Needs work","raw_details":null},{"path":"src/b.ts","line":12,"level":"notice","title":"fallow/info","message":"FYI","raw_details":null}]}\n' > "$CUSTOM_ARTIFACTS/fallow-pr-decision.json"
 OUT=$(cd "$WORK_DIR" && \
   FALLOW_COMMAND="dead-code" \
@@ -4258,6 +4273,37 @@ if [ "$GATE_EXIT" = "0" ]; then
 else
   fail "gate: an unowned failure leaves the job green" "got $GATE_EXIT"
 fi
+
+# Every envelope carries its default exit rule, also when no gate was armed.
+# A failing default rule belongs to the count gate: with fail-on-issues false
+# it prints nothing and leaves the job green, whether the CLI enforced it or
+# (combined mode) did not.
+# The outputs still name the failing default rule, so a step that reads
+# `gates-failed != ''` sees it on every run with findings.
+for default_case in \
+  'dead-code|{"error-severity-findings":{"status":"fail","enforced":true}}||error-severity-findings' \
+  'health|{"health-findings":{"status":"fail","enforced":true}}|"summary":{"functions_above_threshold":2}|health-findings' \
+  'dead-code|{"error-severity-findings":{"status":"fail","enforced":false},"health-findings":{"status":"fail","enforced":false}}||error-severity-findings,health-findings' \
+  ; do
+  IFS='|' read -r default_command default_gates default_extra default_failed <<< "$default_case"
+  run_gate_analyze "$(gate_envelope "$default_gates" "$default_extra")" \
+    INPUT_COMMAND="$default_command" INPUT_FAIL_ON_ISSUES="false"
+  if grep -qx "gates_failed=${default_failed}" <<< "$GATE_OUTPUTS"; then
+    pass "gate: a default rule on $default_command is named in gates_failed"
+  else
+    fail "gate: a default rule on $default_command is named in gates_failed" \
+      "expected gates_failed=${default_failed}, got: $GATE_OUTPUTS"
+  fi
+  assert_not_contains "$GATE_STDOUT" "gate reports a failure" \
+    "gate: a default rule on $default_command $default_gates prints no gate line"
+  assert_not_contains "$GATE_STDOUT" "::error::" \
+    "gate: a default rule on $default_command $default_gates prints no error"
+  if [ "$GATE_EXIT" = "0" ]; then
+    pass "gate: a default rule on $default_command leaves the job green"
+  else
+    fail "gate: a default rule on $default_command leaves the job green" "got $GATE_EXIT: $GATE_STDOUT"
+  fi
+done
 
 # A gate the CLI reports as unenforced (combined mode, --report-only) is
 # honoured rather than overridden, and says which it was.

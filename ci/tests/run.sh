@@ -1912,6 +1912,39 @@ else
   fail "gitlab gate: an unowned failure leaves the pipeline green" "got $GATE_STATUS"
 fi
 
+# Every envelope carries its default exit rule, also when no gate was armed.
+# A failing default rule belongs to the count gate: with FALLOW_FAIL_ON_ISSUES
+# false it prints nothing and leaves the pipeline green.
+# The dotenv still names the failing default rule, so a job that reads
+# `FALLOW_GATES_FAILED != ''` sees it on every run with findings.
+for DEFAULT_CASE in \
+  '{"error-severity-findings":{"status":"fail","enforced":true}}|error-severity-findings' \
+  '{"health-findings":{"status":"fail","enforced":true}}|health-findings' \
+  '{"error-severity-findings":{"status":"fail","enforced":false},"health-findings":{"status":"fail","enforced":false}}|error-severity-findings,health-findings' \
+  ; do
+  IFS='|' read -r DEFAULT_GATES DEFAULT_FAILED <<< "$DEFAULT_CASE"
+  ENVELOPE=$(gitlab_gate_envelope "$DEFAULT_GATES")
+  rm -f "$GATE_WORK/fallow-gates.env"
+  OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+    MOCK_GATE_ENVELOPE="$ENVELOPE" \
+    FALLOW_COMMAND=dead-code \
+    FALLOW_FAIL_ON_ISSUES=false)
+  GATE_STATUS=$?
+  if grep -qx "FALLOW_GATES_FAILED=${DEFAULT_FAILED}" "$GATE_WORK/fallow-gates.env" 2>/dev/null; then
+    pass "gitlab gate: the default rule $DEFAULT_GATES is named in FALLOW_GATES_FAILED"
+  else
+    fail "gitlab gate: the default rule $DEFAULT_GATES is named in FALLOW_GATES_FAILED" \
+      "expected FALLOW_GATES_FAILED=${DEFAULT_FAILED}, got: $(cat "$GATE_WORK/fallow-gates.env" 2>/dev/null)"
+  fi
+  assert_not_contains "$OUT" "gate reports a failure" \
+    "gitlab gate: the default rule $DEFAULT_GATES prints no gate line"
+  if [ "$GATE_STATUS" = "0" ]; then
+    pass "gitlab gate: the default rule $DEFAULT_GATES leaves the pipeline green"
+  else
+    fail "gitlab gate: the default rule $DEFAULT_GATES leaves the pipeline green" "got $GATE_STATUS"
+  fi
+done
+
 # A pinned binary older than the index still delivers the verdicts that had a
 # feature-local field, and warns only about the gates that never had one.
 ENVELOPE=$(gitlab_gate_envelope '' '"regression":{"exceeded":true,"delta":4}')

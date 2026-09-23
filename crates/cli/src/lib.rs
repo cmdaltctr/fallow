@@ -116,7 +116,8 @@ use cli_production::{ProductionModes, resolve_production_modes};
 #[cfg(test)]
 use cli_startup::build_tracing_filter;
 use cli_startup::{
-    bare_coverage_subcommand_error_message, cli_has_bare_coverage_input, parse_cli_args,
+    bare_combined_baseline_subcommand_error_message, bare_coverage_subcommand_error_message,
+    cli_bare_combined_baseline_flag, cli_has_bare_coverage_input, parse_cli_args,
     run_pre_dispatch_checks, setup_tracing, validate_inputs,
 };
 #[cfg(test)]
@@ -629,6 +630,16 @@ struct Cli {
     /// Also settable via `FALLOW_COVERAGE_ROOT` or `health.coverageRoot`.
     #[arg(hide_short_help = true, long = "coverage-root", value_name = "PATH")]
     coverage_root: Option<PathBuf>,
+
+    /// Compare duplication clone groups against a saved baseline in combined
+    /// mode (produced by `fallow dupes --save-baseline`).
+    #[arg(hide_short_help = true, long = "dupes-baseline", value_name = "PATH")]
+    dupes_baseline: Option<PathBuf>,
+
+    /// Compare health findings against a saved baseline in combined mode
+    /// (produced by `fallow health --save-baseline`).
+    #[arg(hide_short_help = true, long = "health-baseline", value_name = "PATH")]
+    health_baseline: Option<PathBuf>,
 
     /// Report unused exports in entry files instead of auto-marking them as used.
     #[arg(hide_short_help = true, long, global = true)]
@@ -3435,6 +3446,14 @@ fn dispatch_and_finalize(
 
     let exit_code = if command.is_some() && cli_has_bare_coverage_input(cli) {
         emit_error(bare_coverage_subcommand_error_message(), 2, output)
+    } else if command.is_some()
+        && let Some(flag) = cli_bare_combined_baseline_flag(cli)
+    {
+        emit_error(
+            &bare_combined_baseline_subcommand_error_message(flag),
+            2,
+            output,
+        )
     } else {
         match command {
             None => dispatch_bare_command(dispatch),
@@ -3573,6 +3592,8 @@ fn unsupported_doctor_option(cli: &Cli) -> Option<&'static str> {
         (cli.save_snapshot.is_some(), "--save-snapshot"),
         (cli.coverage.is_some(), "--coverage"),
         (cli.coverage_root.is_some(), "--coverage-root"),
+        (cli.dupes_baseline.is_some(), "--dupes-baseline"),
+        (cli.health_baseline.is_some(), "--health-baseline"),
         (cli.include_entry_exports, "--include-entry-exports"),
         (cli.type_aware, "--type-aware"),
         (cli.no_type_aware, "--no-type-aware"),
@@ -3688,6 +3709,10 @@ fn run_bare_combined(
         churn_file: cli.churn_file.as_deref(),
         baseline: cli.baseline.as_deref(),
         save_baseline: cli.save_baseline.as_deref(),
+        dupes_baseline: cli.dupes_baseline.as_deref(),
+        health_baseline: cli.health_baseline.as_deref(),
+        health_baseline_mode: cli.baseline_mode.unwrap_or_default().into(),
+        health_baseline_mode_explicit: cli.baseline_mode.is_some(),
         fail_on_stale_baseline: cli.fail_on_stale_baseline,
         production: cli.production,
         production_dead_code: Some(production.dead_code),
@@ -7071,6 +7096,22 @@ mod tests {
         let message = bare_coverage_subcommand_error_message();
         assert!(message.contains("bare combined-mode flags"));
         assert!(message.contains("fallow health --coverage <coverage-final.json>"));
+    }
+
+    #[test]
+    fn bare_combined_baseline_before_subcommand_is_detectable() {
+        for flag in ["--dupes-baseline", "--health-baseline"] {
+            let cli = Cli::try_parse_from(["fallow", flag, "x.json", "dead-code"])
+                .expect("clap should parse a pre-subcommand combined baseline");
+            assert!(cli.command.is_some());
+            assert_eq!(cli_bare_combined_baseline_flag(&cli), Some(flag));
+            let message = bare_combined_baseline_subcommand_error_message(flag);
+            assert!(message.contains(flag));
+            assert!(message.contains("omit the subcommand"));
+        }
+        let bare = Cli::try_parse_from(["fallow", "--dupes-baseline", "x.json"])
+            .expect("bare combined baseline should parse");
+        assert!(bare.command.is_none());
     }
 
     #[test]
