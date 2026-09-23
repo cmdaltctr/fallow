@@ -121,7 +121,7 @@ use analysis::{
     BlockingAnalysisInput, BlockingAnalysisOutput, LspAnalysisSnapshot, run_blocking_analysis,
 };
 #[cfg(test)]
-use analysis::{ProjectRootAnalysisInput, analyze_project_root, merge_duplication, merge_results};
+use analysis::{ProjectRootAnalysisInput, analyze_project_root};
 use diagnostic_filter::{attach_changed_since_data, filter_disabled_diagnostics};
 use document_state::{
     DocumentSnapshot, DocumentState, VersionSnapshot, document_matches_disk, uri_is_stale,
@@ -152,7 +152,7 @@ use protocol::analysis_complete_params_for_test;
 use protocol::config_load_error_detail;
 use protocol::{
     AnalysisComplete, AnalysisCompleteInput, IssueTypeInfo, analysis_complete_params,
-    diagnostic_issue_type_metas, diagnostic_issue_types,
+    diagnostic_issue_types,
 };
 use server_capabilities::{
     build_server_capabilities, client_supports_watched_file_registration,
@@ -199,7 +199,7 @@ fn disabled_diagnostic_codes(options: &LspInitializationOptions) -> FxHashSet<St
         .map(String::as_str)
         .collect();
 
-    diagnostic_issue_type_metas()
+    fallow_types::issue_meta::diagnostic_issue_metas()
         .filter(|issue_type| {
             muted_categories.contains(issue_type.code)
                 || issue_type.config_key.is_some_and(|config_key| {

@@ -6,6 +6,7 @@ use fallow_config::{
     DEFAULT_IGNORE_PATTERNS, ResolvedConfig, WorkspaceDiagnostic, WorkspaceDiagnosticKind,
 };
 use fallow_types::discover::{DiscoveredFile, FileId};
+use fallow_types::path_util::display_relative;
 use fallow_types::workspace::glob_first_literal_segment;
 use ignore::WalkBuilder;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -292,7 +293,7 @@ fn summarize_examples(root: &Path, examples: &[SizedFile]) -> String {
         .iter()
         .take(NOTE_EXAMPLE_CAP)
         .map(|(path, size)| {
-            let display = display_relative_path(root, path);
+            let display = display_relative(root, path);
             format!("{display} ({})", format_size_mb(*size))
         })
         .collect();
@@ -442,7 +443,7 @@ fn summarize_paths(root: &Path, examples: &[&PathBuf]) -> String {
     let shown: Vec<String> = examples
         .iter()
         .take(NOTE_EXAMPLE_CAP)
-        .map(|path| display_relative_path(root, path))
+        .map(|path| display_relative(root, path))
         .collect();
     let remaining = examples.len().saturating_sub(NOTE_EXAMPLE_CAP);
     if remaining > 0 {
@@ -458,23 +459,13 @@ fn summarize_paths_open_ended(root: &Path, examples: &[&PathBuf]) -> String {
     let shown: Vec<String> = examples
         .iter()
         .take(NOTE_EXAMPLE_CAP)
-        .map(|path| display_relative_path(root, path))
+        .map(|path| display_relative(root, path))
         .collect();
     if examples.len() > NOTE_EXAMPLE_CAP {
         format!("{}, and more", shown.join(", "))
     } else {
         shown.join(", ")
     }
-}
-
-/// Render `path` relative to `root` with forward slashes. Cross-platform
-/// output stability depends on the slash normalisation.
-fn display_relative_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
-        .replace('\\', "/")
 }
 
 /// Whether a candidate file inside a skipped dotdir is one this run had
@@ -769,7 +760,7 @@ fn report_skipped_source_dotdirs(
             config.root.display(),
             reportable
                 .first()
-                .map_or_else(String::new, |dir| display_relative_path(&config.root, dir))
+                .map_or_else(String::new, |dir| display_relative(&config.root, dir))
         ))
     {
         tracing::warn!(
@@ -807,7 +798,7 @@ fn build_skipped_dotdirs_note(root: &Path, reportable: &[&PathBuf], truncated: b
     let verb = if count == 1 { "contains" } else { "contain" };
     let at_least = if truncated { "at least " } else { "" };
     let (target, pronoun) = match reportable {
-        [only] => (display_relative_path(root, only), "it"),
+        [only] => (display_relative(root, only), "it"),
         _ => ("<dir>".to_owned(), "one"),
     };
     format!(
@@ -1961,56 +1952,15 @@ mod tests {
     }
 
     #[test]
-    fn source_extensions_include_typescript() {
-        assert!(SOURCE_EXTENSIONS.contains(&"ts"));
-        assert!(SOURCE_EXTENSIONS.contains(&"tsx"));
-        assert!(SOURCE_EXTENSIONS.contains(&"mts"));
-        assert!(SOURCE_EXTENSIONS.contains(&"cts"));
-        assert!(SOURCE_EXTENSIONS.contains(&"gts"));
-    }
-
-    #[test]
-    fn source_extensions_include_javascript() {
-        assert!(SOURCE_EXTENSIONS.contains(&"js"));
-        assert!(SOURCE_EXTENSIONS.contains(&"jsx"));
-        assert!(SOURCE_EXTENSIONS.contains(&"mjs"));
-        assert!(SOURCE_EXTENSIONS.contains(&"cjs"));
-        assert!(SOURCE_EXTENSIONS.contains(&"gjs"));
-    }
-
-    #[test]
-    fn source_extensions_include_sfc_formats() {
-        assert!(SOURCE_EXTENSIONS.contains(&"vue"));
-        assert!(SOURCE_EXTENSIONS.contains(&"svelte"));
-        assert!(SOURCE_EXTENSIONS.contains(&"astro"));
-    }
-
-    #[test]
-    fn source_extensions_include_styles() {
-        assert!(SOURCE_EXTENSIONS.contains(&"css"));
-        assert!(SOURCE_EXTENSIONS.contains(&"scss"));
-        assert!(SOURCE_EXTENSIONS.contains(&"sass"));
-        assert!(SOURCE_EXTENSIONS.contains(&"less"));
-    }
-
-    #[test]
-    fn source_extensions_exclude_non_source() {
-        assert!(!SOURCE_EXTENSIONS.contains(&"json"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"yaml"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"md"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"png"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"htm"));
-    }
-
-    #[test]
-    fn source_extensions_include_html() {
-        assert!(SOURCE_EXTENSIONS.contains(&"html"));
-    }
-
-    #[test]
-    fn source_extensions_include_graphql_documents() {
-        assert!(SOURCE_EXTENSIONS.contains(&"graphql"));
-        assert!(SOURCE_EXTENSIONS.contains(&"gql"));
+    fn source_extensions_are_exactly_the_supported_set() {
+        let mut actual = SOURCE_EXTENSIONS.to_vec();
+        actual.sort_unstable();
+        let mut expected = vec![
+            "ts", "tsx", "mts", "cts", "gts", "js", "jsx", "mjs", "cjs", "gjs", "vue", "svelte",
+            "astro", "mdx", "css", "scss", "sass", "less", "html", "graphql", "gql",
+        ];
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
     }
 
     fn build_production_glob_set() -> globset::GlobSet {
@@ -2063,21 +2013,6 @@ mod tests {
     #[test]
     fn disallowed_hidden_dirs_idea() {
         assert!(!is_allowed_hidden_dir(OsStr::new(".idea")));
-    }
-
-    #[test]
-    fn source_extensions_include_mdx() {
-        assert!(SOURCE_EXTENSIONS.contains(&"mdx"));
-    }
-
-    #[test]
-    fn source_extensions_exclude_image_and_data_formats() {
-        assert!(!SOURCE_EXTENSIONS.contains(&"png"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"jpg"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"svg"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"txt"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"csv"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"wasm"));
     }
 
     #[test]

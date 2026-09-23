@@ -28,6 +28,8 @@ pub mod baseline;
 pub mod cache_status;
 pub mod changed_files;
 pub mod churn;
+/// Continuous integration detection shared by the API runtime and the CLI.
+pub mod ci_env;
 pub mod clock;
 pub mod codeowners;
 mod core_backend;
@@ -45,21 +47,6 @@ pub(crate) mod graph {
 mod git_env;
 pub mod guard;
 pub mod health;
-#[cfg(test)]
-pub(crate) mod extract {
-    pub use fallow_types::extract::*;
-}
-#[cfg(test)]
-pub(crate) mod analyze {
-    pub mod test_support {
-        use fallow_types::discover::FileId;
-        use fallow_types::extract::ModuleInfo;
-
-        pub fn empty_module() -> ModuleInfo {
-            ModuleInfo::empty(FileId(1))
-        }
-    }
-}
 pub mod list_inventory;
 pub mod module_graph;
 pub mod plugins;
@@ -67,10 +54,6 @@ pub mod project_analysis;
 pub mod project_config;
 mod public_api;
 pub mod repo_refs;
-#[cfg(test)]
-pub(crate) mod resolve {
-    pub use fallow_graph::resolve::*;
-}
 mod results;
 mod security;
 pub mod session;
@@ -204,7 +187,6 @@ mod tests {
             .next()
             .expect("engine lib has public surface before tests");
         let forbidden_exports = [
-            "pub use error::",
             "pub use flags::",
             "pub use git_env::",
             "pub use public_api::",

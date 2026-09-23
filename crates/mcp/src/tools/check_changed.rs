@@ -15,7 +15,7 @@ use super::{
         env_diff_file, json_success, non_empty_path, programmatic_error_body, run_api_blocking,
         workspace_patterns_from_param,
     },
-    fallback_policy::{CliFallbackReason, baseline_fallback_reason, regression_fallback_reason},
+    fallback_policy::{baseline_requested, regression_requested},
     push_baseline, push_global, push_regression, push_remote_extends, push_scope, run_tool,
 };
 
@@ -102,20 +102,13 @@ pub fn build_check_changed_args(params: CheckChangedParams) -> Vec<String> {
 }
 
 fn requires_cli_fallback(params: &CheckChangedParams) -> bool {
-    cli_fallback_reason(params).is_some()
-}
-
-fn cli_fallback_reason(params: &CheckChangedParams) -> Option<CliFallbackReason> {
-    baseline_fallback_reason(params.baseline.as_deref(), params.save_baseline.as_deref()).or_else(
-        || {
-            regression_fallback_reason(
-                params.fail_on_regression,
-                params.tolerance.as_deref(),
-                params.regression_baseline.as_deref(),
-                params.save_regression_baseline.as_deref(),
-            )
-        },
-    )
+    baseline_requested(params.baseline.as_deref(), params.save_baseline.as_deref())
+        || regression_requested(
+            params.fail_on_regression,
+            params.tolerance.as_deref(),
+            params.regression_baseline.as_deref(),
+            params.save_regression_baseline.as_deref(),
+        )
 }
 
 fn check_changed_options_from_params(params: &CheckChangedParams) -> DeadCodeOptions {
@@ -142,10 +135,9 @@ fn check_changed_options_from_params(params: &CheckChangedParams) -> DeadCodeOpt
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
-
     use rmcp::model::ContentBlock;
 
+    use super::super::base_root_fixture::git;
     use super::*;
 
     #[tokio::test]
@@ -226,15 +218,6 @@ mod tests {
                 .expect("fallback check")
                 .is_none()
         );
-    }
-
-    fn git(root: &std::path::Path, args: &[&str]) {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .status()
-            .expect("git command starts");
-        assert!(status.success(), "git command failed: {args:?}");
     }
 
     fn check_changed_params(since: &str) -> CheckChangedParams {

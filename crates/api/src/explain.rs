@@ -6,8 +6,6 @@
 
 use serde_json::Value;
 
-const DOCS_BASE: &str = "https://docs.fallow.tools";
-
 /// Rule definition for SARIF `fullDescription` and JSON `_meta`.
 pub struct RuleDef {
     /// Canonical rule id, such as `fallow/unused-export` or
@@ -488,7 +486,7 @@ pub fn rule_severity_key(rule: &RuleDef) -> Option<&'static str> {
 #[must_use]
 pub fn rule_docs_url(rule: &RuleDef) -> String {
     let docs_path = rule_result_meta(rule).map_or(rule.docs_path, |meta| meta.meta_docs_path);
-    format!("{DOCS_BASE}/{docs_path}")
+    fallow_output::rule_docs_url(docs_path)
 }
 
 fn rule_result_meta(rule: &RuleDef) -> Option<&'static fallow_types::issue_meta::IssueResultMeta> {
@@ -917,11 +915,10 @@ pub fn explain_issue_type(
 /// serialization failures.
 pub fn serialize_explain_programmatic_json(
     issue_type: &str,
-    mode: fallow_output::RootEnvelopeMode,
     analysis_run_id: Option<&str>,
 ) -> Result<serde_json::Value, crate::ProgrammaticError> {
     let output = explain_issue_type(issue_type)?;
-    fallow_output::serialize_explain_json_output(output, mode, analysis_run_id).map_err(|error| {
+    fallow_output::serialize_explain_json_output(output, analysis_run_id).map_err(|error| {
         crate::ProgrammaticError::new(format!("JSON serialization error: {error}"), 2)
             .with_code("json_serialization")
     })

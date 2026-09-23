@@ -1470,16 +1470,12 @@ fn run_git(root: &Path, args: &[&str]) -> Option<String> {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
-    use std::process::Command;
 
     use super::*;
 
     fn git(root: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = git_command(root)
             .args(args)
-            .current_dir(root)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
             .output()
             .expect("git command starts");
         assert!(
@@ -2608,7 +2604,7 @@ mod tests {
     fn unix_context_open_does_not_block_on_fifo() {
         let temp = tempfile::tempdir().expect("temp dir");
         let fifo = temp.path().join("pnpm-lock.yaml");
-        let status = Command::new("mkfifo")
+        let status = std::process::Command::new("mkfifo")
             .arg(&fifo)
             .status()
             .expect("run mkfifo");

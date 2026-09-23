@@ -751,7 +751,6 @@ fn build_setup_json(root: &Path, explain: bool) -> serde_json::Value {
     let envelope = build_setup_envelope(root, explain);
     fallow_output::serialize_coverage_setup_json_output(
         envelope,
-        crate::output_runtime::current_root_envelope_mode(),
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     )
     .expect("CoverageSetupOutput serializes infallibly")
@@ -1386,18 +1385,7 @@ fn install_sidecar(
 }
 
 fn detect_setup_context(root: &Path) -> CoverageSetupContext {
-    let package_json = PackageJson::load(&root.join("package.json")).ok();
-    let framework = detect_framework(package_json.as_ref());
-    let package_manager = detect_package_manager(root);
-    let scripts = package_json.as_ref().and_then(|pkg| pkg.scripts.as_ref());
-    CoverageSetupContext {
-        framework,
-        package_manager,
-        has_build_script: scripts.is_some_and(|scripts| scripts.contains_key("build")),
-        has_start_script: scripts.is_some_and(|scripts| scripts.contains_key("start")),
-        has_preview_script: scripts.is_some_and(|scripts| scripts.contains_key("preview")),
-        node_entry_path: detect_node_entry_path(root, package_json.as_ref()),
-    }
+    detect_setup_context_with_package_manager(root, None)
 }
 
 fn detect_setup_members(root: &Path) -> Vec<CoverageSetupMember> {
