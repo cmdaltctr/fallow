@@ -32,6 +32,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   says that it needs a fallow cloud API key, and `fallow coverage --help`
   no longer names a file that is not public.
 
+- **Module Federation options that a config builds in steps are read.** The
+  reader now follows the options of a Federation plugin call through an
+  `export const`, a TypeScript non-null assertion (`mfConfig!`), a relative
+  import or `require` of a sibling config, an object spread (`{ ...base }`),
+  and `Object.assign({}, base)`. A computed callee such as
+  `container['ModuleFederationPlugin']` also matches. Before, the exposed file
+  was reported as unused. A spread that fallow cannot read now records a
+  `plugin-config-unreadable` diagnostic with the `spread` reason. Every config
+  reader now also resolves `export const config = { ... }; export default
+  config`. (#2757)
+
+- **Webpack, rspack and rsbuild entries resolve like the bundler resolves
+  them.** A webpack config in `config/`, `build/` or `webpack/`, such as
+  `config/webpack.client.js`, is now read, so the config and its entries are
+  not reported as unused. A file there counts as a config only when it exports
+  a webpack configuration, so a helper such as `config/webpack.paths.js` is
+  still reported when nothing imports it. In `build/`, which also holds build
+  output, only a `webpack.<target>` file such as `build/webpack.prod.js` is
+  read. Federation `exposes` and `remotes` in
+  such a config resolve against the package root, as webpack does. Rspack reads
+  `context` and rsbuild reads `root`, and a relative entry resolves against
+  that directory. An entry without an extension, such as `./lib` or
+  `./src/app`, now matches the file with a source extension or the directory
+  index file, also when `context` or `root` is set. (#2753)
+
 - **Traces pick the file you name in a monorepo.** A trace of `src/a.ts`
   (for example `dead-code --trace-file src/a.ts` or
   `dead-code --trace src/a.ts:foo`) now takes the file at that exact path from

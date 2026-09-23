@@ -292,6 +292,15 @@ impl ConfigCandidateIndex {
         Self { dirs }
     }
 
+    /// Whether the discovery walk collected the file at `path`.
+    #[must_use]
+    pub(crate) fn contains_file(&self, path: &Path) -> bool {
+        match (path.parent(), path.file_name()) {
+            (Some(dir), Some(name)) => self.dir_contains(dir, name),
+            _ => false,
+        }
+    }
+
     /// Whether the directory `dir` contains a file named `name`, per the files
     /// the discovery walk collected. Used by file-based plugin activation to
     /// avoid a per-directory filesystem `read` probe.
@@ -365,24 +374,29 @@ pub fn discover_config_files<'a>(
     candidate_index: Option<&ConfigCandidateIndex>,
 ) -> Vec<(PathBuf, &'a dyn Plugin)> {
     use rayon::prelude::*;
-    let mut pending: Vec<(&'a dyn Plugin, &Path, String)> = Vec::new();
+    let mut pending: Vec<(&'a dyn Plugin, &Path, String, bool)> = Vec::new();
     for (plugin, _) in config_matchers {
-        if resolved_plugins.contains(plugin.name()) {
-            continue;
-        }
+        // A resolved plugin still probes the patterns that source discovery
+        // cannot index, such as `build/webpack.prod.js`: Phase 3a never saw
+        // those files, so a root config found there does not cover them. The
+        // `seen` set below removes a duplicate hit.
+        let resolved = resolved_plugins.contains(plugin.name());
         for root in roots {
             for pat in plugin.config_patterns() {
                 if !production_mode && is_source_ext_root_pattern(pat) {
                     continue;
                 }
-                pending.push((*plugin, *root, pat.to_string()));
+                if resolved && !pattern_needs_filesystem(pat) {
+                    continue;
+                }
+                pending.push((*plugin, *root, pat.to_string(), resolved));
             }
         }
     }
 
     let hits: Vec<(PathBuf, &'a dyn Plugin)> = pending
         .par_iter()
-        .flat_map_iter(|(plugin, root, pat)| {
+        .flat_map_iter(|(plugin, root, pat, resolved)| {
             expand_brace_pattern(pat)
                 .into_iter()
                 .flat_map(|expanded| match candidate_index {
@@ -395,6 +409,11 @@ pub fn discover_config_files<'a>(
                         match_pattern_in_index(root, &expanded, index)
                     }
                     _ => discover_pattern_matches(root, &expanded),
+                })
+                // Phase 3a already read an indexed file of a resolved plugin,
+                // such as a config in a plugin's discovery hidden directory.
+                .filter(|path| {
+                    !*resolved || !candidate_index.is_some_and(|index| index.contains_file(path))
                 })
                 .map(move |path| (path, *plugin))
                 .collect::<Vec<_>>()
@@ -416,10 +435,11 @@ fn pattern_has_glob(pattern: &str) -> bool {
 }
 
 /// True when `pattern` has a directory component (any component before the
-/// basename) that is a hidden directory NOT on the walk's traversal allowlist.
-/// The discovery walk never descends such directories, so the in-memory
-/// candidate index cannot contain files under them and the filesystem probe is
-/// required to keep those configs (e.g. `.config/prisma.ts`) discoverable.
+/// basename) that the discovery walk does not index: a hidden directory NOT on
+/// the walk's traversal allowlist, or a directory that a built-in ignore
+/// pattern excludes, such as `build`. The in-memory candidate index cannot
+/// contain files under them, so the filesystem probe is required to keep those
+/// configs (e.g. `.config/prisma.ts`, `build/webpack.prod.js`) discoverable.
 fn pattern_needs_filesystem(pattern: &str) -> bool {
     let mut components = pattern.split('/').peekable();
     let mut needs_fs = false;
@@ -435,8 +455,25 @@ fn pattern_needs_filesystem(pattern: &str) -> bool {
             needs_fs = true;
             break;
         }
+        if is_default_ignored_directory(component) {
+            needs_fs = true;
+            break;
+        }
     }
     needs_fs
+}
+
+/// Whether a built-in ignore pattern of the form `**/<name>/**` excludes a
+/// directory of this name from source discovery.
+fn is_default_ignored_directory(name: &str) -> bool {
+    fallow_config::DEFAULT_IGNORE_PATTERNS
+        .iter()
+        .any(|pattern| {
+            pattern
+                .strip_prefix("**/")
+                .and_then(|rest| rest.strip_suffix("/**"))
+                .is_some_and(|directory| directory == name)
+        })
 }
 
 /// In-memory equivalent of [`discover_pattern_matches`], resolving `pattern`
@@ -759,6 +796,9 @@ mod tests {
         assert!(!pattern_needs_filesystem("**/project.json"));
         assert!(!pattern_needs_filesystem(".storybook/main.ts"));
         assert!(!pattern_needs_filesystem("a/b/c.json"));
+        // A directory that a built-in ignore pattern excludes is not indexed.
+        assert!(pattern_needs_filesystem("build/webpack.prod.js"));
+        assert!(!pattern_needs_filesystem("config/webpack.prod.js"));
     }
 
     #[test]

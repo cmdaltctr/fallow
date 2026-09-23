@@ -1073,7 +1073,7 @@ pub(crate) fn find_config_object<'a>(program: &'a Program) -> Option<&'a ObjectE
 }
 
 /// Extract an `ObjectExpression` from an expression, handling wrapper patterns.
-fn extract_object_from_expression<'a>(
+pub(crate) fn extract_object_from_expression<'a>(
     expr: &'a Expression<'a>,
 ) -> Option<&'a ObjectExpression<'a>> {
     match expr {
@@ -1267,23 +1267,36 @@ pub(crate) fn find_variable_init_object<'a>(
     program: &'a Program,
     name: &str,
 ) -> Option<&'a ObjectExpression<'a>> {
-    for stmt in &program.body {
-        if let Statement::VariableDeclaration(decl) = stmt {
-            for declarator in &decl.declarations {
-                if let BindingPattern::BindingIdentifier(id) = &declarator.id
-                    && id.name == name
-                    && let Some(init) = &declarator.init
-                {
-                    return extract_object_from_expression(init);
-                }
+    for decl in top_level_variable_declarations(program) {
+        for declarator in &decl.declarations {
+            if let BindingPattern::BindingIdentifier(id) = &declarator.id
+                && id.name == name
+                && let Some(init) = &declarator.init
+            {
+                return extract_object_from_expression(init);
             }
         }
     }
     None
 }
 
-/// Resolve an expression to an object literal, through a top-level `const` or
-/// `let` in the same file when the expression only names one.
+/// Every top-level variable declaration, including the one an
+/// `export const NAME = ...` declaration wraps.
+fn top_level_variable_declarations<'a>(
+    program: &'a Program<'a>,
+) -> impl Iterator<Item = &'a VariableDeclaration<'a>> {
+    program.body.iter().filter_map(|stmt| match stmt {
+        Statement::VariableDeclaration(decl) => Some(&**decl),
+        Statement::ExportNamedDeclaration(export) => match &export.declaration {
+            Some(Declaration::VariableDeclaration(decl)) => Some(&**decl),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// The init expression of a top-level `const` or `let` that is the only binding
+/// of `name` in the program and that no expression writes to.
 ///
 /// `new ModuleFederationPlugin(mfConfig)` is the common shape for plugin options
 /// that a config declares above the plugin list. A reader that accepts the
@@ -1291,20 +1304,16 @@ pub(crate) fn find_variable_init_object<'a>(
 ///
 /// The name resolves only when the program holds one binding of that name. A
 /// second binding, a parameter of the same name, or a write to the binding means
-/// the expression can name another object than the top-level one, so the
-/// resolver declines instead of reading the wrong object.
-pub(crate) fn resolve_object_expression<'a>(
+/// the expression can name another value than the top-level one, so the
+/// resolver declines instead of reading the wrong value.
+pub(crate) fn find_stable_binding_init<'a>(
     program: &'a Program<'a>,
-    expr: &'a Expression<'a>,
-) -> Option<&'a ObjectExpression<'a>> {
-    if let Some(obj) = object_expression(expr) {
-        return Some(obj);
-    }
-    let name = unwrap_to_identifier_name(expr)?;
+    name: &str,
+) -> Option<&'a Expression<'a>> {
     if !holds_one_stable_object(program, name) {
         return None;
     }
-    find_variable_init_object(program, name)
+    find_variable_init_expression(program, name)
 }
 
 /// Whether one top-level `const` or `let` is the only binding of `name` in the
@@ -1321,10 +1330,7 @@ fn holds_one_stable_object(program: &Program<'_>, name: &str) -> bool {
 /// Whether a top-level `const` or `let` statement declares `name`. A `var` is
 /// function scoped and hoisted, so a later statement can hold its value.
 fn declares_top_level_const_or_let(program: &Program<'_>, name: &str) -> bool {
-    program.body.iter().any(|stmt| {
-        let Statement::VariableDeclaration(decl) = stmt else {
-            return false;
-        };
+    top_level_variable_declarations(program).any(|decl| {
         matches!(
             decl.kind,
             VariableDeclarationKind::Const | VariableDeclarationKind::Let
@@ -2015,15 +2021,7 @@ fn find_variable_init_expression<'a>(
     program: &'a Program<'a>,
     name: &str,
 ) -> Option<&'a Expression<'a>> {
-    for stmt in &program.body {
-        let decl = match stmt {
-            Statement::VariableDeclaration(decl) => decl,
-            Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                Some(Declaration::VariableDeclaration(decl)) => decl,
-                _ => continue,
-            },
-            _ => continue,
-        };
+    for decl in top_level_variable_declarations(program) {
         for declarator in &decl.declarations {
             if let BindingPattern::BindingIdentifier(id) = &declarator.id
                 && id.name == name
@@ -2036,11 +2034,28 @@ fn find_variable_init_expression<'a>(
     None
 }
 
+/// The expression a module exports as a whole: the right side of
+/// `module.exports = ...`, or the expression of `export default ...`.
+pub(crate) fn find_module_export_expression<'a>(
+    program: &'a Program<'a>,
+) -> Option<&'a Expression<'a>> {
+    program.body.iter().find_map(|stmt| match stmt {
+        Statement::ExportDefaultDeclaration(decl) => decl.declaration.as_expression(),
+        Statement::ExpressionStatement(expr_stmt) => match &expr_stmt.expression {
+            Expression::AssignmentExpression(assign) if is_module_exports_target(&assign.left) => {
+                Some(&assign.right)
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
 /// Find the init expression a sibling module exports under `name`
 /// (`None` = default export). For named exports this covers both
 /// `export const NAME = ...` and a local `const NAME = ...` later re-exported
 /// via `export { NAME }` (both surface through [`find_variable_init_expression`]).
-fn find_exported_init<'a>(
+pub(crate) fn find_exported_init<'a>(
     program: &'a Program<'a>,
     name: Option<&str>,
 ) -> Option<&'a Expression<'a>> {
@@ -2060,7 +2075,10 @@ fn find_exported_init<'a>(
 /// specifier and the imported name (`None` for a default import). Bare-package
 /// imports are intentionally skipped: reading a literal alias table out of
 /// `node_modules` is not a real-world config shape.
-fn find_relative_import_binding(program: &Program, name: &str) -> Option<(String, Option<String>)> {
+pub(crate) fn find_relative_import_binding(
+    program: &Program,
+    name: &str,
+) -> Option<(String, Option<String>)> {
     for stmt in &program.body {
         let Statement::ImportDeclaration(decl) = stmt else {
             continue;
@@ -2094,7 +2112,7 @@ fn find_relative_import_binding(program: &Program, name: &str) -> Option<(String
 
 /// True for a relative/absolute module specifier (`./x`, `../x`, `/x`), the
 /// shapes that point at a sibling file rather than an npm package.
-fn is_relative_specifier(specifier: &str) -> bool {
+pub(crate) fn is_relative_specifier(specifier: &str) -> bool {
     specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/')
 }
 
@@ -2103,7 +2121,10 @@ fn is_relative_specifier(specifier: &str) -> bool {
 /// written first (covers `./vite.shared.js`), then appends each known config
 /// extension (covers extensionless `./vite.shared` and dotted basenames where
 /// `Path::extension` would misread `.shared`), then an `index.*` directory file.
-fn resolve_sibling_module(config_path: &Path, specifier: &str) -> Option<(PathBuf, String)> {
+pub(crate) fn resolve_sibling_module(
+    config_path: &Path,
+    specifier: &str,
+) -> Option<(PathBuf, String)> {
     let parent = config_path.parent().unwrap_or(config_path);
     let direct = parent.join(specifier);
     if let Ok(source) = std::fs::read_to_string(&direct) {
@@ -2488,12 +2509,12 @@ fn collect_require_sources(expr: &Expression) -> Vec<String> {
 }
 
 /// Check if a call expression is `require(...)`.
-fn is_require_call(call: &CallExpression) -> bool {
+pub(crate) fn is_require_call(call: &CallExpression) -> bool {
     matches!(&call.callee, Expression::Identifier(id) if id.name == "require")
 }
 
 /// Get the first string argument of a `require()` call.
-fn get_require_source(call: &CallExpression) -> Option<String> {
+pub(crate) fn get_require_source(call: &CallExpression) -> Option<String> {
     call.arguments.first().and_then(|arg| {
         if let Argument::StringLiteral(s) = arg {
             Some(s.value.to_string())
@@ -4022,6 +4043,23 @@ mod tests {
         "#;
         let val = extract_config_string(source, &js_path(), &["testDir"]);
         assert_eq!(val, Some("./tests".to_string()));
+    }
+
+    #[test]
+    fn variable_reference_to_an_exported_const() {
+        for source in [
+            r#"
+            export const config = { testDir: "./tests" };
+            export default config;
+            "#,
+            r#"
+            export const config = { testDir: "./tests" };
+            module.exports = config;
+            "#,
+        ] {
+            let val = extract_config_string(source, &js_path(), &["testDir"]);
+            assert_eq!(val, Some("./tests".to_string()), "source: {source}");
+        }
     }
 
     #[test]
