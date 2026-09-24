@@ -658,6 +658,146 @@ fn an_applied_diff_filter_publishes_the_scope_it_left() {
     );
 }
 
+/// `changed-since` sizes its scope in changed files that the run analyzed, not
+/// in the raw git count. A change to a file that discovery drops (here a
+/// README) narrows the run to nothing, and `0` is the only place the envelope
+/// says so: the report reads clean either way (issue #2800).
+#[test]
+fn an_applied_changed_since_publishes_the_analyzed_files_it_left() {
+    let repo = committed_project();
+    let root_path = repo.path();
+    let root = root_arg(&repo);
+    std::fs::write(root_path.join("README.md"), "# docs only\n").expect("readme");
+
+    let readme_only = |args: &[&str]| -> Value {
+        let mut full = args.to_vec();
+        full.extend([
+            "--root",
+            root,
+            "--changed-since",
+            "HEAD",
+            "--format",
+            "json",
+            "--quiet",
+        ]);
+        parse_json(&run(&full))
+    };
+    for command in [
+        vec!["dead-code"],
+        vec!["dupes"],
+        vec!["health"],
+        vec!["security"],
+        vec!["flags"],
+        vec!["suppressions"],
+        vec![],
+    ] {
+        let envelope = readme_only(&command);
+        let entry = request(&envelope, "changed-since");
+        assert_eq!(entry["status"], "applied", "`{command:?}`: {entry}");
+        assert_eq!(
+            entry["scope_size"], 0,
+            "`{command:?}`: a README-only change leaves no analyzed file in scope: {entry}"
+        );
+    }
+
+    std::fs::write(
+        root_path.join("src/orphan.ts"),
+        "export const orphan = (): number => 3;\n",
+    )
+    .expect("edit orphan");
+    let envelope = readme_only(&["dead-code"]);
+    let entry = request(&envelope, "changed-since");
+    assert_eq!(
+        entry["scope_size"], 1,
+        "the README still does not count, the edited source file does: {entry}"
+    );
+}
+
+/// The analyses of one combined run can discover different files. With
+/// `production` on for health and duplication only, a test file is inside the
+/// dead-code set and outside the other two. `scope_size` counts the changed
+/// files that ANY analysis of the run kept, so it does not depend on which
+/// section measures first: the combined run reports `1`, as `dead-code` does,
+/// while a run of health alone reports `0`. Before, the combined run took the
+/// first measurement, which came from duplication, and reported `0` for a file
+/// its dead-code section analyzed.
+#[test]
+fn changed_since_scope_size_is_the_union_over_the_analyses_of_a_run() {
+    let repo = committed_project();
+    let root_path = repo.path();
+    let root = root_arg(&repo);
+    std::fs::write(
+        root_path.join(".fallowrc.json"),
+        r#"{"production":{"deadCode":false,"health":true,"dupes":true}}"#,
+    )
+    .expect("config");
+    git(root_path, &["add", "."]);
+    git(root_path, &["commit", "-m", "config"]);
+    std::fs::write(
+        root_path.join("src/index.test.ts"),
+        "export const checked = (): number => 1;\n",
+    )
+    .expect("test file");
+    git(root_path, &["add", "."]);
+    git(root_path, &["commit", "-m", "test only"]);
+
+    let scope_size = |args: &[&str]| -> Value {
+        let mut full = args.to_vec();
+        full.extend([
+            "--root",
+            root,
+            "--changed-since",
+            "HEAD~1",
+            "--format",
+            "json",
+            "--quiet",
+        ]);
+        let envelope = parse_json(&run(&full));
+        request(&envelope, "changed-since")["scope_size"].clone()
+    };
+
+    assert_eq!(
+        scope_size(&["dead-code"]),
+        1,
+        "dead code keeps the test file"
+    );
+    assert_eq!(scope_size(&["health"]), 0, "health drops the test file");
+    assert_eq!(scope_size(&["dupes"]), 0, "duplication drops the test file");
+    assert_eq!(
+        scope_size(&[]),
+        1,
+        "the combined run counts the file its dead-code section analyzed"
+    );
+    assert_eq!(
+        scope_size(&["--only", "health,dupes"]),
+        0,
+        "a combined run without dead code analyzed no changed file"
+    );
+}
+
+/// The same zero reaches the rendered bodies that both shipped integrations
+/// post, through the reader every body shares.
+#[test]
+fn the_rendered_pr_comment_body_says_a_changed_since_measured_an_empty_scope() {
+    let repo = committed_project();
+    std::fs::write(repo.path().join("README.md"), "# docs only\n").expect("readme");
+    let out = run(&[
+        "dead-code",
+        "--root",
+        root_arg(&repo),
+        "--changed-since",
+        "HEAD",
+        "--format",
+        "pr-comment-github",
+        "--quiet",
+    ]);
+    assert!(
+        out.stdout.contains("applied over an empty scope"),
+        "the body must say the ref narrowed the run to nothing: {}",
+        out.stdout
+    );
+}
+
 /// Absent is not zero. A request nothing measured the scope of carries no
 /// member, so a consumer cannot read "not measured" as "the scope was empty".
 #[test]

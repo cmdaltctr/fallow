@@ -24,9 +24,9 @@
 //! gates that passed for the same reason.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
-use fallow_output::{RequestName, RequestOutcome, RequestOutcomes};
+use fallow_output::{RequestName, RequestOutcome, RequestOutcomes, RequestStatus};
 use rustc_hash::FxHashSet;
 
 /// What became of this run's `--changed-since` request.
@@ -35,6 +35,22 @@ use rustc_hash::FxHashSet;
 /// combined run resolve the same ref against the same root and observe the
 /// original value, which is the same value they would have computed.
 static CHANGED_SINCE_OUTCOME: OnceLock<RequestOutcome> = OnceLock::new();
+
+/// The changed files of an applied `--changed-since` request, normalized the
+/// way the result filter normalizes them, so the scope count and the filter
+/// agree on which file is "changed".
+static CHANGED_SINCE_FILES: OnceLock<FxHashSet<PathBuf>> = OnceLock::new();
+
+/// The changed files the run analyzed, over every analysis that measured: the
+/// `scope_size` of an applied `changed-since` entry is its length.
+///
+/// A union, not the first measurement. The analyses of one combined run can
+/// discover different files: a per-analysis `production` setting drops test
+/// files from dead code but keeps them for health and duplication. The unit is
+/// "changed files that the run analyzed", so a file any analysis kept counts,
+/// and the value does not depend on which section measures first. `None`
+/// means no analysis measured.
+static CHANGED_SINCE_ANALYZED: Mutex<Option<FxHashSet<PathBuf>>> = Mutex::new(None);
 
 /// Resolve `--changed-since` to a file set, warn when git cannot, and record
 /// what became of the request either way.
@@ -48,6 +64,12 @@ pub fn resolve_changed_since(root: &Path, git_ref: &str) -> Option<FxHashSet<Pat
     match fallow_engine::changed_files::changed_files(root, git_ref) {
         Ok(files) => {
             record_changed_since(RequestOutcome::applied(RequestName::ChangedSince, git_ref));
+            let _ = CHANGED_SINCE_FILES.set(
+                files
+                    .iter()
+                    .map(|path| dunce::simplified(path).to_path_buf())
+                    .collect(),
+            );
             Some(files)
         }
         Err(err) => {
@@ -66,6 +88,49 @@ pub fn resolve_changed_since(root: &Path, git_ref: &str) -> Option<FxHashSet<Pat
 
 fn record_changed_since(outcome: RequestOutcome) {
     let _ = CHANGED_SINCE_OUTCOME.set(outcome);
+}
+
+/// Add the changed files that stay in this analysis's set to the run's
+/// analyzed changed files, whose count is the `scope_size` of the applied
+/// `changed-since` entry.
+///
+/// Call it with the files discovery kept, after the ref was resolved. A changed
+/// file that discovery dropped (ignored, outside the project, not a source
+/// file) does not count: a commit that touches only a README narrows the run
+/// to nothing, and `0` is how the envelope says so (issue #2800). Does nothing
+/// when no ref was resolved, so a command can call it without a guard.
+pub fn measure_changed_since_scope(analyzed: &[fallow_types::discover::DiscoveredFile]) {
+    let Some(changed) = CHANGED_SINCE_FILES.get() else {
+        return;
+    };
+    let Ok(mut union) = CHANGED_SINCE_ANALYZED.lock() else {
+        return;
+    };
+    let union = union.get_or_insert_with(FxHashSet::default);
+    union.extend(
+        analyzed
+            .iter()
+            .map(|file| dunce::simplified(&file.path))
+            .filter(|path| changed.contains(*path))
+            .map(Path::to_path_buf),
+    );
+}
+
+/// The recorded `changed-since` entry, with the measured scope when the request
+/// applied and a command measured it.
+fn changed_since_outcome() -> Option<RequestOutcome> {
+    let outcome = CHANGED_SINCE_OUTCOME.get()?.clone();
+    let size = CHANGED_SINCE_ANALYZED
+        .lock()
+        .ok()
+        .and_then(|union| union.as_ref().map(|files| files.len() as u64));
+    Some(match size {
+        Some(size) if outcome.status == RequestStatus::Applied => RequestOutcome {
+            scope_size: Some(size),
+            ..outcome
+        },
+        _ => outcome,
+    })
 }
 
 /// What became of this run's `--sarif-file` request.
@@ -110,10 +175,7 @@ pub fn record_sarif_file_failure(path: &Path, reason: &str, message: String) {
 #[must_use]
 pub fn changed_since_request_outcomes() -> Option<RequestOutcomes> {
     let mut requests = RequestOutcomes::new();
-    requests.insert_if(
-        RequestName::ChangedSince,
-        CHANGED_SINCE_OUTCOME.get().cloned(),
-    );
+    requests.insert_if(RequestName::ChangedSince, changed_since_outcome());
     requests.into_option()
 }
 
@@ -126,10 +188,7 @@ pub fn changed_since_request_outcomes() -> Option<RequestOutcomes> {
 #[must_use]
 pub fn request_outcomes() -> Option<RequestOutcomes> {
     let mut requests = RequestOutcomes::new();
-    requests.insert_if(
-        RequestName::ChangedSince,
-        CHANGED_SINCE_OUTCOME.get().cloned(),
-    );
+    requests.insert_if(RequestName::ChangedSince, changed_since_outcome());
     requests.insert_if(
         RequestName::DiffFilter,
         crate::report::ci::diff_filter::shared_diff_request_outcome().cloned(),
