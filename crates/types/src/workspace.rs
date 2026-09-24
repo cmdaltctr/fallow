@@ -92,9 +92,13 @@ pub enum WorkspaceDiagnosticKind {
     /// `.changeset`, `.github`) and the directories an active framework plugin
     /// or a `package.json` script reference contributes, so files inside are
     /// never parsed and their imports and exports are invisible to every
-    /// analysis. No config field adds a directory to traversal: run fallow
-    /// with `--root` against the directory to analyze it on its own, or add it
-    /// to `ignorePatterns` to silence this (issue #461).
+    /// analysis. A file, export or dependency that only the directory uses can
+    /// be reported as unused. No config field adds a directory to traversal:
+    /// add the file to `entry`, the export to `ignoreExports` or the dependency
+    /// to `ignoreDependencies` to stop that false positive, or add the
+    /// directory to `ignorePatterns` to silence this (issue #461). Running
+    /// fallow with `--root` against the directory analyzes it on its own and
+    /// does not fix the main run (issue #2797).
     ///
     /// "Not excluded" is measured the way the run measures it: a directory
     /// whose contents are gitignored, or excluded by `ignorePatterns`, or (on
@@ -1198,10 +1202,12 @@ fn render_message(root: &Path, path: &Path, kind: &WorkspaceDiagnosticKind) -> S
         WorkspaceDiagnosticKind::SkippedSourceDotdir => format!(
             "Skipped hidden directory '{display}': it contains source files but hidden \
              directories are not traversed. Its imports and exports are not analyzed. \
-             There is no config field that adds a directory to traversal. If it holds \
-             first-party source, analyze it on its own with fallow --root {display}; if it \
-             is tool or agent scratch state, add '{display}/**' to ignorePatterns to \
-             silence this."
+             A file, export or dependency that only this directory uses can be reported as \
+             unused. There is no config field that adds a directory to traversal. To stop \
+             that false positive, add the file to entry, the export to ignoreExports or the \
+             dependency to ignoreDependencies. To silence this message, \
+             add '{display}/**' to ignorePatterns. fallow --root {display} analyzes only \
+             that directory on its own and does not fix this run."
         ),
         WorkspaceDiagnosticKind::SourceReadFailure { error } => format!(
             "Could not read source '{display}' ({error}). Restore the file or its read permissions, \
@@ -1522,9 +1528,22 @@ mod tests {
             "message states the consequence: {}",
             diag.message
         );
+        for remedy in [
+            "add the file to entry",
+            "the export to ignoreExports",
+            "the dependency to ignoreDependencies",
+        ] {
+            assert!(
+                diag.message.contains(remedy),
+                "message names the remedy `{remedy}`: {}",
+                diag.message
+            );
+        }
         assert!(
-            diag.message.contains("--root"),
-            "message names the real remedy: {}",
+            diag.message
+                .contains("fallow --root .claude analyzes only that directory")
+                && diag.message.contains("does not fix this run"),
+            "message must not imply that --root fixes this run: {}",
             diag.message
         );
         assert!(
