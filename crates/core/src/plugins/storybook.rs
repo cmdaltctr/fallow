@@ -130,16 +130,50 @@ fn is_react_native_config(config_path: &Path) -> bool {
     config_path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new(".rnstorybook"))
 }
 
+/// Storybook reads each `stories` glob relative to the directory of its main
+/// config file, and a leading `/` as an absolute filesystem path. A glob that
+/// leaves the root is dropped.
 fn extract_story_patterns(source: &str, config_path: &Path, root: &Path) -> Vec<String> {
-    let patterns = config_parser::extract_config_string_array(source, config_path, &["stories"]);
-    if !is_react_native_config(config_path) {
-        return patterns;
-    }
-
-    patterns
+    config_parser::extract_config_string_array(source, config_path, &["stories"])
         .into_iter()
-        .filter_map(|pattern| config_parser::normalize_config_path(&pattern, config_path, root))
+        .filter_map(|pattern| {
+            config_parser::normalize_filesystem_config_path(&pattern, config_path, root)
+        })
+        .map(|pattern| brace_story_extglob(&pattern))
         .collect()
+}
+
+/// Rewrite each Storybook `@(a|b)` group as the brace group `{a,b}`, which the
+/// glob matcher supports. The Storybook config template uses this form.
+///
+/// A group with nested syntax stays as it is. Other extglob forms (`!(..)`,
+/// `+(..)`, `*(..)`, `?(..)`) also stay, so they match nothing.
+fn brace_story_extglob(pattern: &str) -> String {
+    const OPEN: &str = "@(";
+    let mut out = String::with_capacity(pattern.len());
+    let mut rest = pattern;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + OPEN.len()..];
+        let Some(end) = after.find(')') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let body = &after[..end];
+        let plain =
+            !body.is_empty() && !body.contains(['(', '{', '}', ',', '@', '!', '+', '*', '?']);
+        let group_end = start + OPEN.len() + end + 1;
+        if plain {
+            out.push('{');
+            out.push_str(&body.replace('|', ","));
+            out.push('}');
+        } else {
+            out.push_str(&rest[start..group_end]);
+        }
+        rest = &rest[group_end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 define_plugin! {
@@ -297,6 +331,66 @@ mod tests {
                 .iter()
                 .any(|pattern| pattern.pattern == "src/mobile-case.tsx")
         );
+    }
+
+    #[test]
+    fn resolve_web_story_patterns_relative_to_config_dir() {
+        let plugin = StorybookPlugin;
+        let result = plugin.resolve_config(
+            Path::new("/project/.storybook/main.ts"),
+            r#"export default { stories: ["../src/**/*.mdx", "./local/*.tsx", "../../outside/**", "/src/**/*.docs.tsx", "/project/abs/*.tsx"] };"#,
+            Path::new("/project"),
+        );
+        let patterns: Vec<_> = result
+            .entry_patterns
+            .iter()
+            .map(|pattern| pattern.pattern.as_str())
+            .collect();
+
+        assert_eq!(
+            patterns,
+            ["src/**/*.mdx", ".storybook/local/*.tsx", "abs/*.tsx"]
+        );
+    }
+
+    #[test]
+    fn story_extglob_groups_become_brace_alternatives() {
+        let plugin = StorybookPlugin;
+        let result = plugin.resolve_config(
+            Path::new("/project/.storybook/main.ts"),
+            r#"export default { stories: [
+                "../src/**/*.stories.@(js|jsx|ts|tsx)",
+                "../src/**/*.story.@(ts|tsx)",
+                "../src/**/!(*.dev).stories.@(js|ts)",
+                "../src/**/*.+(ts|tsx)",
+            ] };"#,
+            Path::new("/project"),
+        );
+        let patterns: Vec<_> = result
+            .entry_patterns
+            .iter()
+            .map(|pattern| pattern.pattern.as_str())
+            .collect();
+
+        assert_eq!(
+            patterns,
+            [
+                "src/**/*.stories.{js,jsx,ts,tsx}",
+                "src/**/*.story.{ts,tsx}",
+                "src/**/!(*.dev).stories.{js,ts}",
+                "src/**/*.+(ts|tsx)",
+            ]
+        );
+    }
+
+    #[test]
+    fn story_extglob_group_with_nested_syntax_is_unchanged() {
+        assert_eq!(
+            brace_story_extglob("src/*.@(a|@(b|c))"),
+            "src/*.@(a|@(b|c))"
+        );
+        assert_eq!(brace_story_extglob("src/*.@(a,b)"), "src/*.@(a,b)");
+        assert_eq!(brace_story_extglob("src/*.@(ts"), "src/*.@(ts");
     }
 
     #[test]
