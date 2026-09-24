@@ -57,7 +57,7 @@ fn analyze_typed_route_reads_max_file_size_from_the_process_environment() {
     let project = tempfile::tempdir().expect("project dir");
     write_large_file_project(project.path());
 
-    let mut with_env = McpServer::start_with_options(false, Some("1"), false);
+    let mut with_env = McpServer::start_with_options(false, Some("1"), false, None, None);
     let limited = with_env.analyze(project.path());
     assert!(
         limited["workspace_diagnostics"]
@@ -68,7 +68,7 @@ fn analyze_typed_route_reads_max_file_size_from_the_process_environment() {
         "FALLOW_MAX_FILE_SIZE must reach the typed analyze route: {limited}"
     );
 
-    let mut without_env = McpServer::start_with_options(false, None, false);
+    let mut without_env = McpServer::start_with_options(false, None, false, None, None);
     let unlimited = without_env.analyze(project.path());
     assert!(
         unlimited["unused_files"]
@@ -76,6 +76,168 @@ fn analyze_typed_route_reads_max_file_size_from_the_process_environment() {
             .is_some_and(|files| files.iter().any(|file| file["path"] == "src/huge.ts")),
         "the same file stays analyzable under the default limit: {unlimited}"
     );
+}
+
+/// #2799: an unreadable `FALLOW_DIFF_FILE` stands down on the typed `analyze`
+/// route, as it does on the CLI route: the call succeeds, the report is at full
+/// scope, and `request_outcomes` says why. Before, the typed route returned
+/// `isError` with `FALLOW_INVALID_DIFF_FILE`.
+#[test]
+fn analyze_typed_route_stands_down_on_an_unreadable_ambient_diff() {
+    let project = tempfile::tempdir().expect("project dir");
+    write_large_file_project(project.path());
+    let missing = project.path().join("missing.diff");
+
+    let mut server = McpServer::start_with_diff_file(&missing);
+    let envelope = server.analyze(project.path());
+    let entry = &envelope["request_outcomes"]["diff-filter"];
+    assert_eq!(entry["status"], "not-applied", "{envelope}");
+    assert_eq!(entry["affects"], "scope", "{entry}");
+    assert_eq!(entry["reason"], "unreadable", "{entry}");
+    assert!(
+        entry["requested"]
+            .as_str()
+            .is_some_and(|label| label.starts_with("$FALLOW_DIFF_FILE ")),
+        "the label names the ambient channel as the CLI does: {entry}"
+    );
+    assert!(entry.get("scope_size").is_none(), "{entry}");
+}
+
+/// A readable `FALLOW_DIFF_FILE` applies on the typed route and states the
+/// added lines it left in scope, the same object the CLI route publishes.
+#[test]
+fn analyze_typed_route_states_the_scope_of_an_applied_ambient_diff() {
+    let project = tempfile::tempdir().expect("project dir");
+    write_large_file_project(project.path());
+    let diff = project.path().join("pr.diff");
+    std::fs::write(
+        &diff,
+        "diff --git a/src/index.ts b/src/index.ts\n\
+         --- a/src/index.ts\n\
+         +++ b/src/index.ts\n\
+         @@ -0,0 +1,1 @@\n\
+         +export const added = 1;\n",
+    )
+    .expect("write diff");
+
+    let mut server = McpServer::start_with_diff_file(&diff);
+    let envelope = server.analyze(project.path());
+    let entry = &envelope["request_outcomes"]["diff-filter"];
+    assert_eq!(entry["status"], "applied", "{envelope}");
+    assert_eq!(entry["scope_size"], 1, "{entry}");
+}
+
+/// #2799: a `FALLOW_CHANGED_SINCE` ref that does not resolve stands down on
+/// the typed `analyze` route, as a bad `--changed-since` does on the CLI, and a
+/// ref that resolves publishes `changed-since` with its scope. A README-only
+/// change measures an empty scope.
+#[test]
+fn analyze_typed_route_reports_the_ambient_changed_since_ref() {
+    let project = tempfile::tempdir().expect("project dir");
+    write_large_file_project(project.path());
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
+    ] {
+        let status = Command::new("git")
+            .args(&args)
+            .current_dir(project.path())
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    }
+    std::fs::write(project.path().join("README.md"), "# docs only\n").expect("readme");
+
+    let mut stood_down = McpServer::start_with_changed_since("refs/heads/does-not-exist");
+    let envelope = stood_down.analyze(project.path());
+    let entry = &envelope["request_outcomes"]["changed-since"];
+    assert_eq!(entry["status"], "not-applied", "{envelope}");
+    assert_eq!(entry["requested"], "refs/heads/does-not-exist", "{entry}");
+    assert!(entry["reason"].is_string(), "{entry}");
+
+    let mut applied = McpServer::start_with_changed_since("HEAD");
+    let envelope = applied.analyze(project.path());
+    let entry = &envelope["request_outcomes"]["changed-since"];
+    assert_eq!(entry["status"], "applied", "{envelope}");
+    assert_eq!(entry["scope_size"], 0, "a README-only change: {entry}");
+}
+
+/// The listing tools carry no `request_outcomes`, so a `FALLOW_CHANGED_SINCE`
+/// ref that stood down would widen their result with nothing to say so. They
+/// keep the hard error of an explicit ref.
+#[test]
+fn listing_tools_fail_on_an_ambient_ref_that_does_not_resolve() {
+    let project = tempfile::tempdir().expect("project dir");
+    write_large_file_project(project.path());
+    init_git(project.path());
+    let root = project.path().display().to_string();
+
+    for tool in ["project_info", "list_boundaries"] {
+        let mut server = McpServer::start_with_changed_since("refs/heads/does-not-exist");
+        let result = server.call_raw(tool, &serde_json::json!({ "root": root, "no_cache": true }));
+        assert_eq!(result["isError"], true, "`{tool}` must fail: {result}");
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("FALLOW_CHANGED_FILES_FAILED"),
+            "`{tool}` must name the changed-files error: {result}"
+        );
+    }
+}
+
+/// The trace tools pass the ref as an explicit one too, and, as before, do not
+/// narrow by it: a trace answers for one file or symbol, so a bad ref neither
+/// fails the call nor changes the answer.
+#[test]
+fn trace_tools_answer_the_same_with_a_bad_ambient_ref() {
+    let project = tempfile::tempdir().expect("project dir");
+    write_large_file_project(project.path());
+    init_git(project.path());
+    let arguments = serde_json::json!({
+        "root": project.path().display().to_string(),
+        "file": "src/index.ts",
+        "no_cache": true
+    });
+
+    let mut with_ref = McpServer::start_with_changed_since("refs/heads/does-not-exist");
+    let traced = with_ref.call_raw("trace_file", &arguments);
+    let mut without_ref = McpServer::start(false);
+    let plain = without_ref.call_raw("trace_file", &arguments);
+    assert_ne!(traced["isError"], true, "{traced}");
+    assert_eq!(traced["content"], plain["content"]);
+}
+
+fn init_git(root: &Path) {
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
+    ] {
+        let status = Command::new("git")
+            .args(&args)
+            .current_dir(root)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    }
 }
 
 #[test]
@@ -221,17 +383,27 @@ struct McpServer {
 
 impl McpServer {
     fn start(with_coverage_env: bool) -> Self {
-        Self::start_with_options(with_coverage_env, None, false)
+        Self::start_with_options(with_coverage_env, None, false, None, None)
     }
 
     fn start_type_aware() -> Self {
-        Self::start_with_options(false, None, true)
+        Self::start_with_options(false, None, true, None, None)
+    }
+
+    fn start_with_diff_file(diff_file: &Path) -> Self {
+        Self::start_with_options(false, None, false, Some(diff_file), None)
+    }
+
+    fn start_with_changed_since(git_ref: &str) -> Self {
+        Self::start_with_options(false, None, false, None, Some(git_ref))
     }
 
     fn start_with_options(
         with_coverage_env: bool,
         max_file_size: Option<&str>,
         with_type_aware_sidecar: bool,
+        diff_file: Option<&Path>,
+        changed_since: Option<&str>,
     ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fallow-mcp"));
         if with_type_aware_sidecar {
@@ -250,6 +422,16 @@ impl McpServer {
             command.env("FALLOW_MAX_FILE_SIZE", max_file_size);
         } else {
             command.env_remove("FALLOW_MAX_FILE_SIZE");
+        }
+        if let Some(diff_file) = diff_file {
+            command.env("FALLOW_DIFF_FILE", diff_file);
+        } else {
+            command.env_remove("FALLOW_DIFF_FILE");
+        }
+        if let Some(git_ref) = changed_since {
+            command.env("FALLOW_CHANGED_SINCE", git_ref);
+        } else {
+            command.env_remove("FALLOW_CHANGED_SINCE");
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -369,6 +551,19 @@ impl McpServer {
             .as_str()
             .unwrap_or_else(|| panic!("text content: {response}"));
         serde_json::from_str(text).expect("trace payload")
+    }
+
+    /// Call `name` with `arguments` and return the raw `result` object, error
+    /// or not.
+    fn call_raw(&mut self, name: &str, arguments: &serde_json::Value) -> serde_json::Value {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        });
+        self.send(&serde_json::to_string(&request).expect("serialize request"));
+        self.response(2)["result"].clone()
     }
 
     fn send(&mut self, message: &str) {

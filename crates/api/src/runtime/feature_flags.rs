@@ -70,10 +70,10 @@ fn run_feature_flags_inner(
         // `source-read-failure` and `source-parse-degraded` after the session
         // captured its walk snapshot, and both are reasons a flag is missing.
         workspace_diagnostics: session.current_workspace_diagnostics(),
-        // The typed route resolves its own changed-file set and records nothing
-        // in the CLI's process-wide channel, so it leaves the member absent
-        // rather than claiming a request it cannot account for.
-        request_outcomes: None,
+        // The diff this route resolved and applied above, or the reason it
+        // stood down. This route filters flags by the diff, unlike the CLI
+        // `flags` command, so an applied entry states a real narrowing.
+        request_outcomes: resolved.request_outcomes(),
         meta: resolved.explain_enabled().then(feature_flags_meta),
     });
 
@@ -134,6 +134,8 @@ fn apply_feature_flags_scope(
         });
     }
     if let Some(changed_files) = changed_files_for_run(resolved)? {
+        resolved
+            .measure_changed_since_scope(session.files().iter().map(|file| file.path.as_path()));
         flags.retain(|flag| changed_files.contains(&flag.path));
     }
     if let Some(diff) = resolved.diff.as_ref() {

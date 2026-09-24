@@ -12,8 +12,8 @@ use rmcp::model::{CallToolResult, ContentBlock};
 
 use super::{
     api_runtime::{
-        changed_since_from_param, env_diff_file, json_success, non_empty_path,
-        programmatic_error_body, run_api_blocking,
+        env_changed_since, env_diff_file, json_success, non_empty_path, programmatic_error_body,
+        run_api_blocking,
     },
     push_global, push_remote_extends,
 };
@@ -89,10 +89,13 @@ fn project_info_options_from_params(params: &ProjectInfoParams) -> ProjectInfoOp
             allow_remote_extends: params.allow_remote_extends.unwrap_or(false),
             no_cache: params.no_cache == Some(true),
             threads: params.threads,
-            diff_file: env_diff_file(),
+            ambient_diff_file: env_diff_file(),
             production: false,
             production_override: None,
-            changed_since: changed_since_from_param(None),
+            // This envelope carries no `request_outcomes`, so a ref that stood
+            // down would widen the result with nothing to say so: keep the
+            // hard error of an explicit ref.
+            changed_since: env_changed_since(),
             workspace: None,
             changed_workspaces: None,
             explain: false,

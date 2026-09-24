@@ -439,7 +439,7 @@ fn build_dead_code_programmatic_output(
     if let Some(type_aware) = type_aware_meta {
         meta.get_or_insert_with(Default::default).type_aware = Some(type_aware);
     }
-    let output = build_check_output(CheckOutputInput {
+    let mut output = build_check_output(CheckOutputInput {
         schema_version: CHECK_SCHEMA_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         elapsed: start.elapsed(),
@@ -449,6 +449,7 @@ fn build_dead_code_programmatic_output(
         workspace_diagnostics: session.current_workspace_diagnostics(),
         next_steps,
     });
+    output.request_outcomes = resolved.request_outcomes();
     DeadCodeProgrammaticOutput {
         output,
         root: session.root().to_path_buf(),
@@ -580,6 +581,10 @@ fn apply_dead_code_scope(
     } else {
         changed_files_for_run(resolved)?
     };
+    if changed_files.or(resolved_changed_files.as_ref()).is_some() {
+        resolved
+            .measure_changed_since_scope(session.files().iter().map(|file| file.path.as_path()));
+    }
     let files = file_scope(options, session.root());
     fallow_engine::dead_code::apply_scope(
         results,

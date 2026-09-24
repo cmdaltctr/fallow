@@ -294,7 +294,18 @@ pub struct AnalysisOptions {
     /// Worker thread count. `None` picks the default; `Some(0)` is rejected.
     pub threads: Option<usize>,
     /// Explicit unified diff file that scopes changed-code analysis.
+    ///
+    /// A file that cannot be read fails the call with
+    /// `FALLOW_INVALID_DIFF_FILE`: the caller named it and can fix it.
     pub diff_file: Option<PathBuf>,
+    /// Unified diff file inherited from the environment (`FALLOW_DIFF_FILE`)
+    /// rather than named by the caller. Read only when `diff_file` is unset.
+    ///
+    /// A file that cannot be read or placed does not fail the call. The
+    /// analysis runs at full scope and `request_outcomes["diff-filter"]` states
+    /// the reason, exactly as the CLI does for the same variable: a caller
+    /// cannot fix a CI environment it inherited (issue #2799).
+    pub ambient_diff_file: Option<PathBuf>,
     /// Legacy convenience override. `true` forces production mode; `false`
     /// defers to config unless `production_override` is set.
     pub production: bool,
@@ -302,7 +313,18 @@ pub struct AnalysisOptions {
     /// use the project config for the current analysis.
     pub production_override: Option<bool>,
     /// Git base reference that scopes analysis to files changed since it.
+    ///
+    /// A ref that does not resolve fails the call with
+    /// `FALLOW_CHANGED_FILES_FAILED`: the caller named it and can fix it.
     pub changed_since: Option<String>,
+    /// Git base reference inherited from the environment
+    /// (`FALLOW_CHANGED_SINCE`) rather than named by the caller. Read only when
+    /// `changed_since` is unset.
+    ///
+    /// A ref that does not resolve does not fail the call. The analysis runs at
+    /// full scope and `request_outcomes["changed-since"]` states the reason,
+    /// exactly as the CLI does for `--changed-since`.
+    pub ambient_changed_since: Option<String>,
     /// Restrict analysis to the named workspace packages.
     pub workspace: Option<Vec<String>>,
     /// Restrict analysis to workspaces changed since the given git reference.

@@ -21,8 +21,8 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use super::{
     VALID_DUPES_MODES,
     api_runtime::{
-        changed_since_from_param, env_diff_file, json_success, non_empty_path,
-        programmatic_error_body, run_api_blocking, workspace_patterns_from_param,
+        env_changed_since, env_diff_file, json_success, non_empty_path, programmatic_error_body,
+        run_api_blocking, workspace_patterns_from_param,
     },
     duplication_mode_from_param, min_occurrences_from_param, push_global, push_remote_extends,
     push_scope, require_non_empty, validation_error_body,
@@ -496,7 +496,10 @@ fn trace_clone_options_from_params(params: &TraceCloneParams) -> Result<TraceClo
                 allow_remote_extends: params.allow_remote_extends.unwrap_or(false),
                 no_cache: params.no_cache.unwrap_or(false),
                 threads: params.threads,
-                changed_since: changed_since_from_param(None),
+                // This envelope carries no `request_outcomes`, so a ref that stood
+                // down would widen the result with nothing to say so: keep the
+                // hard error of an explicit ref.
+                changed_since: env_changed_since(),
                 workspace: workspace_patterns_from_param(params.workspace.as_deref()),
                 ..AnalysisOptions::default()
             },
@@ -536,8 +539,11 @@ fn dead_code_analysis_options(input: DeadCodeAnalysisInput<'_>) -> AnalysisOptio
         threads: input.threads,
         production: input.production.unwrap_or(false),
         production_override: input.production,
-        changed_since: changed_since_from_param(None),
-        diff_file: env_diff_file(),
+        // This envelope carries no `request_outcomes`, so a ref that stood
+        // down would widen the result with nothing to say so: keep the
+        // hard error of an explicit ref.
+        changed_since: env_changed_since(),
+        ambient_diff_file: env_diff_file(),
         workspace: workspace_patterns_from_param(input.workspace),
         ..AnalysisOptions::default()
     }
