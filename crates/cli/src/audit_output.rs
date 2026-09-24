@@ -49,41 +49,31 @@ pub fn print_audit_result_with_style(
         return format_exit;
     }
 
-    match result.verdict {
-        AuditVerdict::Fail => ExitCode::from(1),
-        AuditVerdict::Pass | AuditVerdict::Warn => ExitCode::SUCCESS,
+    crate::exit_codes::run_exit_code([crate::exit_codes::gate_exit_code(
+        fallow_output::GateName::AuditVerdict,
+        audit_verdict_status(result.verdict),
+    )])
+}
+
+/// The gate status of an audit verdict.
+const fn audit_verdict_status(verdict: AuditVerdict) -> fallow_output::GateStatus {
+    match verdict {
+        AuditVerdict::Pass => fallow_output::GateStatus::Pass,
+        AuditVerdict::Warn => fallow_output::GateStatus::Warn,
+        AuditVerdict::Fail => fallow_output::GateStatus::Fail,
     }
 }
 
 /// The audit run's rule-severity verdict, for the envelope's `gate_outcomes`.
-///
-/// The only three-valued gate fallow has: the warn tier reports `warn` rather
-/// than collapsing onto `pass`, which is why the status is an enum. Always
-/// present, because `fallow audit` always reaches a verdict.
 fn audit_gate_outcomes(result: &AuditResult) -> Option<fallow_output::GateOutcomes> {
-    use fallow_output::{GateName, GateOutcome, GateStatus};
-
-    let status = match result.verdict {
-        AuditVerdict::Pass => GateStatus::Pass,
-        AuditVerdict::Warn => GateStatus::Warn,
-        AuditVerdict::Fail => GateStatus::Fail,
-    };
-    let mut gates = fallow_output::GateOutcomes::new();
-    gates.insert(GateName::AuditVerdict, GateOutcome::new(status, true));
-    if audit_loaded_any_baseline(result) {
-        // The honest projection of a gate that stood down: every audit narrows
-        // to the changed slice, so a whole-project baseline cannot be judged
-        // and the gate is inert by design. Publishing it as `skipped` and
-        // unenforced is what puts the fact in `gate_outcomes`, in the
-        // "Gate outcomes:" line the comment and MR note render, and in the
-        // MCP's gate sentences. One entry for up to three baselines, for the
-        // same reason the CLI prints its note once.
-        gates.insert(
-            GateName::StaleBaseline,
-            GateOutcome::new(GateStatus::Skipped, false),
-        );
-    }
-    gates.into_option()
+    crate::gates::audit_gate_outcomes(
+        audit_verdict_status(result.verdict),
+        audit_loaded_any_baseline(result),
+        result
+            .check
+            .as_ref()
+            .and_then(|check| check.type_aware_meta.as_ref()),
+    )
 }
 
 /// Whether this audit loaded any of its three baselines.

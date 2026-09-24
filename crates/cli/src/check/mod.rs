@@ -6,14 +6,14 @@ use fallow_types::discover::DiscoveredFile;
 use fallow_types::extract::ModuleInfo;
 use fallow_types::results::AnalysisResults;
 
-use crate::baseline::{
-    BaselineData, BaselineStaleness, BaselineStalenessWarning, filter_new_issues,
-};
+use crate::baseline::{BaselineData, BaselineStaleness, BaselineStalenessWarning};
 use crate::baseline_gate::LoadedBaselineStaleness;
 use crate::error::emit_error;
+use crate::exit_codes::gate_failed_exit_code;
 use crate::load_config_for_analysis;
 use crate::regression::{self, RegressionOpts, RegressionOutcome};
 use crate::report;
+use fallow_output::GateName;
 
 #[expect(
     clippy::redundant_pub_crate,
@@ -581,9 +581,11 @@ fn prepare_check_config(opts: &CheckOptions<'_>) -> Result<ResolvedConfig, ExitC
             output: opts.output,
             no_cache: opts.no_cache,
             threads: opts.threads,
-            production_override: opts
-                .production_override
-                .or_else(|| opts.production.then_some(true)),
+            production_override:
+                fallow_engine::project_config::ProductionFlags::single_analysis_override(
+                    opts.production,
+                    opts.production_override,
+                ),
             quiet: opts.quiet,
             allow_remote_extends: opts.allow_remote_extends,
         },
@@ -745,28 +747,22 @@ fn apply_scope_filters(
     ws_roots: Option<&Vec<std::path::PathBuf>>,
     changed_files: Option<&rustc_hash::FxHashSet<std::path::PathBuf>>,
 ) {
-    if let Some(ws_roots) = ws_roots {
-        filtering::filter_to_workspaces(results, ws_roots);
-    }
-    if let Some(changed) = changed_files {
-        filtering::filter_changed_files(results, changed);
-    }
     let diff_index = match opts.diff_index {
         Some(index) => Some(index),
         None if opts.use_shared_diff_index => crate::report::ci::diff_filter::shared_diff_index(),
         None => None,
     };
-    if let Some(diff_index) = diff_index {
-        filtering::filter_results_by_diff(results, diff_index, opts.root);
-    }
-
-    // Scope filters prune the owner list of a multi-owner finding in place
-    // (`duplicate_exports` narrows `locations`), so a group the engine kept
-    // because one owner was outside `ignoreFindings` can end up holding only
-    // ignored owners. Re-apply the ignore filter over the scoped result so the
-    // "hidden only when every owner matches" contract holds for what is actually
-    // reported. The helper returns immediately when no patterns are configured.
-    fallow_engine::dead_code::filter_configured_ignored_findings(results, config);
+    let files = file_scope(opts);
+    fallow_engine::dead_code::apply_scope(
+        results,
+        &fallow_engine::dead_code::DeadCodeScope {
+            workspace_roots: ws_roots.map(Vec::as_slice),
+            changed_files,
+            diff: diff_index.map(|index| (index, opts.root)),
+            files: files.as_ref(),
+        },
+        config,
+    );
 }
 
 fn apply_rules_and_filters(
@@ -781,9 +777,11 @@ fn apply_rules_and_filters(
     opts.filters.apply(results);
 }
 
-fn apply_file_filter(opts: &CheckOptions<'_>, results: &mut AnalysisResults) {
+/// The `--file` set of the run, resolved against the root, or `None` when the
+/// flag is absent. Warns for each path that does not exist.
+fn file_scope(opts: &CheckOptions<'_>) -> Option<rustc_hash::FxHashSet<std::path::PathBuf>> {
     if opts.file.is_empty() {
-        return;
+        return None;
     }
     let file_set: rustc_hash::FxHashSet<std::path::PathBuf> = opts
         .file
@@ -805,13 +803,7 @@ fn apply_file_filter(opts: &CheckOptions<'_>, results: &mut AnalysisResults) {
             );
         }
     }
-    filtering::filter_changed_files(results, &file_set);
-    results.unused_dependencies.clear();
-    results.unused_dev_dependencies.clear();
-    results.unused_optional_dependencies.clear();
-    results.type_only_dependencies.clear();
-    results.test_only_dependencies.clear();
-    results.dev_dependencies_in_production.clear();
+    Some(file_set)
 }
 
 fn warn_scoped_regression_save(opts: &CheckOptions<'_>) {
@@ -1088,7 +1080,6 @@ pub fn execute_check(opts: &CheckOptions<'_>) -> Result<CheckResult, ExitCode> {
         ws_roots.as_ref(),
         changed_files.as_ref(),
     );
-    apply_file_filter(opts, &mut data.results);
 
     apply_rules_and_filters(opts, &config, &mut data.results);
 
@@ -1433,7 +1424,7 @@ pub fn print_check_result(result: &CheckResult, opts: PrintCheckOptions) -> Exit
     // Evaluation order, and with it the order the lines print, is unchanged,
     // and so is exit precedence.
     let type_aware_failed = type_aware_completeness_failed(result, prepared.quiet);
-    let regression_exit = check_regression_exit_code(result.regression.as_ref(), prepared.quiet);
+    let regression_failed = check_regression_failed(result.regression.as_ref(), prepared.quiet);
 
     print_load_data_key_abstain_note(result, prepared.quiet);
     print_unused_component_props_exempted_note(result, prepared.quiet);
@@ -1445,21 +1436,12 @@ pub fn print_check_result(result: &CheckResult, opts: PrintCheckOptions) -> Exit
         fallow_engine::baseline::BaselineKind::DeadCode,
     );
 
-    if type_aware_failed {
-        return ExitCode::from(1);
-    }
-    if let Some(exit) = regression_exit {
-        return exit;
-    }
-    if stale_baseline_failed {
-        return ExitCode::from(1);
-    }
-
-    if prepared.has_error_severity {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    }
+    crate::exit_codes::run_exit_code([
+        gate_failed_exit_code(GateName::TypeAwareRequire, type_aware_failed),
+        gate_failed_exit_code(GateName::Regression, regression_failed),
+        gate_failed_exit_code(GateName::StaleBaseline, stale_baseline_failed),
+        gate_failed_exit_code(GateName::ErrorSeverityFindings, prepared.has_error_severity),
+    ])
 }
 
 /// This run's view of the loaded baseline, in the shape the JSON envelope
@@ -1569,15 +1551,14 @@ fn print_type_aware_warnings(result: &CheckResult, quiet: bool) {
     }
 }
 
-fn check_regression_exit_code(
-    outcome: Option<&RegressionOutcome>,
-    quiet: bool,
-) -> Option<ExitCode> {
-    let outcome = outcome?;
+fn check_regression_failed(outcome: Option<&RegressionOutcome>, quiet: bool) -> bool {
+    let Some(outcome) = outcome else {
+        return false;
+    };
     if !quiet {
         regression::print_regression_outcome(outcome);
     }
-    outcome.is_failure().then(|| ExitCode::from(1))
+    outcome.is_failure()
 }
 
 fn print_load_data_key_abstain_note(result: &CheckResult, quiet: bool) {
@@ -1825,130 +1806,89 @@ fn save_baseline_file(
 
 /// Load a baseline file, filter out matched issues, and return this run's view
 /// of the loaded baseline.
+///
+/// `fallow_engine::baseline::apply_dead_code_baseline` reads the file and
+/// removes the findings; this function owns the file read, the messages and
+/// the record for the `recheck-baseline` next step.
 fn load_and_compare_baseline(
     results: &mut fallow_types::results::AnalysisResults,
     baseline_path: &std::path::Path,
     io: &BaselineIo<'_>,
 ) -> Result<LoadedBaselineStaleness, ExitCode> {
+    use fallow_engine::baseline::{
+        DeadCodeBaselineError, DeadCodeBaselineOutcome, apply_dead_code_baseline,
+    };
+
     let content = std::fs::read_to_string(baseline_path)
         .map_err(|e| emit_error(&format!("failed to read baseline: {e}"), 2, io.output))?;
-    // One parse serves both the classification and the deserialization. The
-    // classification comes first, because this format has required fields. Serde
-    // rejects another command's baseline before anything can name the writer, and
-    // the parsed value avoids a second parse of the same bytes.
-    let parsed = serde_json::from_str::<serde_json::Value>(&content)
-        .map_err(|e| emit_error(&format!("failed to parse baseline: {e}"), 2, io.output))?;
-    if let Some(unreadable) = unreadable_baseline(&parsed, results, baseline_path, io) {
-        return Ok(unreadable);
-    }
-    let baseline_data = serde_json::from_value::<BaselineData>(parsed)
-        .map_err(|e| emit_error(&format!("failed to parse baseline: {e}"), 2, io.output))?;
-    let incompatible = baseline_data
-        .analysis_identity()
-        .incompatible_fields(io.analysis_identity);
-    if !incompatible.is_empty() {
-        let type_aware_flag = if matches!(
-            io.analysis_identity.mode,
-            fallow_types::semantic::SemanticAnalysisMode::TypeAware
-        ) {
-            " --type-aware"
-        } else {
-            ""
-        };
-        return Err(emit_error(
-            &format!(
-                "baseline analysis identity is incompatible in: {}. Regenerate it with: fallow dead-code{type_aware_flag} --save-baseline {}",
-                incompatible.join(", "),
-                baseline_path.display(),
-            ),
+    let outcome = apply_dead_code_baseline(
+        results,
+        &content,
+        io.root,
+        io.analysis_identity,
+        !io.scope_reasons.is_empty(),
+    )
+    .map_err(|err| match err {
+        DeadCodeBaselineError::Parse(message) => emit_error(
+            &format!("failed to parse baseline: {message}"),
             2,
             io.output,
-        ));
-    }
-    let baseline_entries = baseline_data.total_entries();
-    let before = results.total_issues();
-    *results = filter_new_issues(std::mem::take(results), &baseline_data, io.root);
-    let matched = before.saturating_sub(results.total_issues());
-    let staleness = BaselineStaleness {
-        entries: baseline_entries,
-        matched,
-        current_findings: before,
-        change_scoped: !io.scope_reasons.is_empty(),
+        ),
+        DeadCodeBaselineError::IncompatibleIdentity(fields) => {
+            let type_aware_flag = if matches!(
+                io.analysis_identity.mode,
+                fallow_types::semantic::SemanticAnalysisMode::TypeAware
+            ) {
+                " --type-aware"
+            } else {
+                ""
+            };
+            emit_error(
+                &format!(
+                    "baseline analysis identity is incompatible in: {}. Regenerate it with: fallow dead-code{type_aware_flag} --save-baseline {}",
+                    fields.join(", "),
+                    baseline_path.display(),
+                ),
+                2,
+                io.output,
+            )
+        }
+    })?;
+    let (staleness, unrecognised_format, saved_by) = match outcome {
+        DeadCodeBaselineOutcome::Applied(staleness) => (staleness, false, None),
+        DeadCodeBaselineOutcome::NotDeadCode {
+            staleness,
+            saved_by,
+        } => (staleness, true, saved_by),
     };
     if !io.quiet {
         eprintln!("Comparing against baseline: {}", baseline_path.display());
-        warn_on_baseline_staleness(staleness, baseline_path);
+        if !unrecognised_format {
+            warn_on_baseline_staleness(staleness, baseline_path);
+        }
+    }
+    if unrecognised_format {
+        // The file suppresses nothing, so every finding stays in the report and
+        // the counts say the baseline carried no entry (issue #2738).
+        crate::baseline_gate::note_unrecognised_baseline(
+            Some(baseline_path),
+            true,
+            saved_by.as_deref(),
+            fallow_engine::baseline::BaselineKind::DeadCode,
+            io.load_flag,
+        );
     }
     crate::output_runtime::set_loaded_baseline(crate::output_runtime::LoadedBaselineRecheck {
         command: "dead-code",
         path: baseline_path.display().to_string(),
-        baseline_entries,
+        baseline_entries: staleness.entries,
         scope_reasons: io.scope_reasons,
     });
     Ok(LoadedBaselineStaleness {
         staleness,
         path: baseline_path.to_path_buf(),
         scope_reasons: io.scope_reasons,
-        // Classified above, before the parse: a file that reaches here is this
-        // command's own baseline, however empty.
-        unrecognised_format: false,
-        saved_by: None,
-    })
-}
-
-/// This run's view of a file that is not a dead-code baseline, or `None` when it
-/// is one and the strict parse owns the outcome.
-///
-/// Read from the raw file, before deserialization. Five of the format's fields
-/// carry no serde default, so another command's baseline fails to parse with
-/// exit 2 while `dupes` and `health` warn and carry on over the same mistake;
-/// classifying first is what makes the three agree (issue #2738). Invalid JSON
-/// and a dead-code baseline missing part of itself still take the parse error:
-/// those are a broken baseline, not somebody else's.
-///
-/// The file suppresses nothing, so the comparison is skipped entirely rather
-/// than run against an empty baseline: every finding stays in the report and the
-/// counts say the baseline carried no entry.
-fn unreadable_baseline(
-    parsed: &serde_json::Value,
-    results: &fallow_types::results::AnalysisResults,
-    baseline_path: &std::path::Path,
-    io: &BaselineIo<'_>,
-) -> Option<LoadedBaselineStaleness> {
-    use fallow_engine::baseline::{BaselineFileKind, BaselineKind, classify_baseline_value};
-
-    let saved_by = match classify_baseline_value(parsed, BaselineKind::DeadCode) {
-        BaselineFileKind::Own | BaselineFileKind::NotAnObject => return None,
-        BaselineFileKind::Foreign(found) => Some(found),
-        BaselineFileKind::Unrecognised => None,
-    };
-    let staleness = BaselineStaleness {
-        entries: 0,
-        matched: 0,
-        current_findings: results.total_issues(),
-        change_scoped: !io.scope_reasons.is_empty(),
-    };
-    if !io.quiet {
-        eprintln!("Comparing against baseline: {}", baseline_path.display());
-    }
-    crate::baseline_gate::note_unrecognised_baseline(
-        Some(baseline_path),
-        true,
-        saved_by.as_deref(),
-        BaselineKind::DeadCode,
-        io.load_flag,
-    );
-    crate::output_runtime::set_loaded_baseline(crate::output_runtime::LoadedBaselineRecheck {
-        command: "dead-code",
-        path: baseline_path.display().to_string(),
-        baseline_entries: 0,
-        scope_reasons: io.scope_reasons,
-    });
-    Some(LoadedBaselineStaleness {
-        staleness,
-        path: baseline_path.to_path_buf(),
-        scope_reasons: io.scope_reasons,
-        unrecognised_format: true,
+        unrecognised_format,
         saved_by,
     })
 }

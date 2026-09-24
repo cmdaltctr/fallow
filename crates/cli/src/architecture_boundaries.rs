@@ -1431,7 +1431,14 @@ fn lsp_changed_since_scopes_editor_project_analysis_before_duplication() {
     );
     assert!(
         source.contains("analysis.filter_by_changed_files"),
-        "LSP must keep the existing post-analysis changedSince filter for dead-code and inline complexity semantics"
+        "LSP must keep the post-merge changedSince filter for clone groups and inline complexity"
+    );
+    let refine = single_call_site(&source, "refine_type_aware_project(");
+    let scope = single_call_site(&source, "apply_changed_files_scope(");
+    let merge = single_call_site(&source, "merge_project_output(");
+    assert!(
+        refine < scope && scope < merge,
+        "LSP must narrow dead-code findings after the type-aware pass, which reads `unused_files`, and before the merge"
     );
 }
 
@@ -2477,6 +2484,27 @@ fn workspace_sources_never_mutate_the_process_environment() {
                  as resolve_typed_coverage_inputs does in crates/mcp/src/tools/api_runtime.rs"
             );
         }
+    }
+}
+
+/// Return the byte offset of the one call of `needle` in `source`. A
+/// definition (`fn needle`) is not a call. The guard fails when there is no
+/// call or more than one, because an order check over the first match can
+/// then check the wrong site. Update the guard when a second call is added.
+fn single_call_site(source: &str, needle: &str) -> usize {
+    let calls: Vec<usize> = source
+        .match_indices(needle)
+        .map(|(index, _)| index)
+        .filter(|&index| !source[..index].ends_with("fn "))
+        .collect();
+    match calls.as_slice() {
+        [index] => *index,
+        [] => panic!("expected one call of `{needle}`, found none"),
+        _ => panic!(
+            "expected one call of `{needle}`, found {} at byte offsets {calls:?}; \
+             update this guard to name the call site whose order it checks",
+            calls.len()
+        ),
     }
 }
 

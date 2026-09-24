@@ -218,9 +218,11 @@ pub fn load_health_config(
             output: opts.output,
             no_cache: opts.no_cache,
             threads: opts.threads,
-            production_override: opts
-                .production_override
-                .or_else(|| opts.production.then_some(true)),
+            production_override:
+                fallow_engine::project_config::ProductionFlags::single_analysis_override(
+                    opts.production,
+                    opts.production_override,
+                ),
             quiet: opts.quiet,
             allow_remote_extends: opts.allow_remote_extends,
         },
@@ -381,7 +383,6 @@ pub fn run_health(
     json_style: crate::json_style::JsonStyle,
     type_aware: &TypeAwareHealthOptions<'_>,
 ) -> ExitCode {
-    let mut completeness_failed = false;
     let (config, config_ms) = match load_health_config(opts) {
         Ok(config) => config,
         Err(code) => return code,
@@ -403,7 +404,7 @@ pub fn run_health(
         }
         let projects = resolved_type_aware.projects;
         let require = resolved_type_aware.require;
-        let outcome = match fallow_api::analyze_type_coupling(opts.root, &projects, &[]) {
+        match fallow_api::analyze_type_coupling(opts.root, &projects, &[]) {
             Ok(outcome) => Some(outcome),
             Err(error) => {
                 match crate::type_aware_degrade::degrade_or_fail(
@@ -421,12 +422,7 @@ pub fn run_health(
                 }
                 None
             }
-        };
-        completeness_failed = outcome.as_ref().is_some_and(|outcome| {
-            require == fallow_config::TypeAwareRequire::Complete
-                && outcome.report.status != fallow_types::semantic::SemanticCompleteness::Complete
-        });
-        outcome
+        }
     } else {
         None
     };
@@ -441,7 +437,9 @@ pub fn run_health(
         Ok(result) => result,
         Err(code) => return code,
     };
-    let required_completeness = result.config.type_aware.require.into();
+    // The policy this run resolved from the flag, the environment or the
+    // config. The config alone misses `--type-aware-require`.
+    let required_completeness = resolved_type_aware.require.into();
     result.type_aware_meta = semantic
         .map(|outcome| {
             let mut meta = outcome.type_aware.meta;
@@ -470,11 +468,15 @@ pub fn run_health(
             json_style,
         },
     );
-    if code == ExitCode::SUCCESS && completeness_failed {
-        ExitCode::from(1)
-    } else {
-        code
+    if code != ExitCode::SUCCESS {
+        return code;
     }
+    // The envelope states this gate through `type-aware-require`, which reads
+    // the same predicate.
+    ExitCode::from(crate::exit_codes::gate_failed_exit_code(
+        fallow_output::GateName::TypeAwareRequire,
+        crate::report::ci::required_type_aware_incomplete(result.type_aware_meta.as_ref()),
+    ))
 }
 
 pub struct ResolvedTypeAwareHealthOptions {
@@ -602,15 +604,11 @@ pub fn print_health_result(result: &HealthResult, options: HealthPrintOptions<'_
         return ExitCode::SUCCESS;
     }
 
-    if health_exit_gate_failed(result, options) {
-        return ExitCode::from(1);
+    let code = health_exit_code(result, options);
+    if code == 0 {
+        maybe_print_score_gate_note(result, options);
     }
-    if result.should_fail_on_coverage_gaps && result.coverage_gaps_has_findings {
-        return ExitCode::from(1);
-    }
-    maybe_print_score_gate_note(result, options);
-
-    ExitCode::SUCCESS
+    crate::exit_codes::run_exit_code([code])
 }
 
 fn health_report_context<'a>(
@@ -642,145 +640,79 @@ fn health_report_context<'a>(
     }
 }
 
-/// The gates a health run armed, for the envelope's `gate_outcomes`.
-///
-/// Every entry reads the same predicate the exit path reads, so the published
-/// verdict and the process status cannot disagree. `--report-only` returns
-/// `ExitCode::SUCCESS` before any gate is consulted, so it clamps `enforced` to
-/// false on every entry while leaving each verdict in place; that is the case a
-/// boolean-only shape could not express, and the stale-baseline entry is
-/// clamped with the rest rather than reporting the flag it was armed with.
-///
-/// A gate armed by an explicit flag or by config always produces an entry.
-/// `health-findings` fails a plain `fallow health` run on any finding. It is
-/// the command's default exit rule, so it is always in the object, also when
-/// no flag armed a gate. A JSON reader then sees a failing run without the
-/// exit code.
+/// The gates a health run armed, for the envelope's `gate_outcomes`. The
+/// verdicts read the same values as the exit path.
 fn health_gate_outcomes(
     result: &HealthResult,
     options: HealthPrintOptions<'_>,
 ) -> Option<fallow_output::GateOutcomes> {
-    use fallow_output::{GateName, GateOutcome, GateStatus};
-
-    let enforced = !options.gates.report_only;
-    let mut gates = fallow_output::GateOutcomes::new();
-
-    if let Some(threshold) = options.gates.min_score {
-        // `--min-score` implies `--score`, so a missing score means the caller
-        // is a programmatic one that requested the gate without computing what
-        // it compares. Report the stand-down rather than nothing, or "armed"
-        // and "not armed" read identically.
-        gates.insert(
-            GateName::HealthMinScore,
-            result.report.health_score.as_ref().map_or_else(
-                || GateOutcome::new(GateStatus::Skipped, false),
-                |score| {
-                    GateOutcome::measured(
-                        crate::gates::status_of(score.score < threshold),
-                        enforced,
-                        score.score,
-                        threshold,
-                    )
-                },
-            ),
-        );
-    }
-
-    if let Some(min_sev) = options.gates.min_severity {
-        let reached = blocking_findings(result)
-            .filter(|f| f.severity >= min_sev)
-            .count();
-        gates.insert(
-            GateName::HealthMinSeverity,
-            GateOutcome::counted(
-                crate::gates::status_of(reached > 0),
-                enforced,
-                #[expect(
-                    clippy::cast_precision_loss,
-                    reason = "a finding count never approaches the f64 integer limit"
-                )]
-                {
-                    reached as f64
-                },
-                severity_floor_label(min_sev),
-            ),
-        );
-    }
-
-    if result.should_fail_on_coverage_gaps {
-        gates.insert(
-            GateName::HealthCoverageGaps,
-            GateOutcome::new(
-                crate::gates::status_of(result.coverage_gaps_has_findings),
-                enforced,
-            ),
-        );
-    }
-
-    // Armed by `--runtime-coverage`, so it belongs with the flag-armed gates
-    // rather than behind the default-rule guard below: without this a run whose
-    // only gate is runtime coverage exits 1 and publishes nothing.
-    if result.report.runtime_coverage.is_some() {
-        gates.insert(
-            GateName::HealthRuntimeCoverage,
-            GateOutcome::new(
-                crate::gates::status_of(has_failing_runtime_coverage(result)),
-                enforced,
-            ),
-        );
-    }
-
-    gates.insert_if(
-        GateName::StaleBaseline,
-        crate::gates::stale_baseline_outcome(
-            result.report.summary.baseline_staleness.as_ref(),
-            options.gates.fail_on_stale_baseline && enforced,
-        ),
-    );
-
-    // The default findings rule. With `--min-severity` the findings gate IS
-    // the severity gate, already recorded above under its own name.
-    if options.gates.min_severity.is_none() {
-        gates.insert(
-            GateName::HealthFindings,
-            if options.gates.min_score.is_some() {
-                // `--min-score` alone turns the findings branch off, which is
-                // what "complexity findings become informational" means.
-                GateOutcome::new(GateStatus::Skipped, false)
-            } else {
-                GateOutcome::new(
-                    crate::gates::status_of(blocking_findings(result).next().is_some()),
-                    enforced,
-                )
-            },
-        );
-    }
-
-    gates.into_option()
+    crate::gates::health_gate_outcomes(&crate::gates::HealthGateInputs {
+        report_only: options.gates.report_only,
+        min_score: options.gates.min_score.map(|threshold| {
+            (
+                threshold,
+                result.report.health_score.as_ref().map(|score| score.score),
+            )
+        }),
+        min_severity: options.gates.min_severity.map(|floor| {
+            (
+                floor,
+                blocking_findings(result)
+                    .filter(|finding| finding.severity >= floor)
+                    .count(),
+            )
+        }),
+        coverage_gaps: result
+            .should_fail_on_coverage_gaps
+            .then_some(result.coverage_gaps_has_findings),
+        runtime_coverage: result
+            .report
+            .runtime_coverage
+            .is_some()
+            .then(|| has_failing_runtime_coverage(result)),
+        baseline_staleness: result.report.summary.baseline_staleness.as_ref(),
+        fail_on_stale_baseline: options.gates.fail_on_stale_baseline,
+        has_findings: blocking_findings(result).next().is_some(),
+        type_aware_meta: result.type_aware_meta.as_ref(),
+    })
 }
 
-/// The wire spelling of a severity floor, for `threshold_label`.
-const fn severity_floor_label(severity: fallow_output::FindingSeverity) -> &'static str {
-    match severity {
-        fallow_output::FindingSeverity::Moderate => "moderate",
-        fallow_output::FindingSeverity::High => "high",
-        fallow_output::FindingSeverity::Critical => "critical",
-    }
-}
-
-/// The OR of every health exit gate, with each one evaluated before the verdict
-/// is combined so that none of them can swallow another's stderr line.
+/// The exit code of every health exit gate, with each gate evaluated before
+/// the codes are combined so that none of them can swallow another's stderr
+/// line.
 ///
 /// The baseline gate is why this is not a short-circuiting chain: the score and
 /// findings gates have their condition printed in the report, a stale baseline
 /// has it nowhere, so a run that already fails the findings gate would exit 1
 /// with nothing about the baseline the user explicitly gated on.
-fn health_exit_gate_failed(result: &HealthResult, options: HealthPrintOptions<'_>) -> bool {
-    let score = score_gate_failed(result, options);
-    let findings = findings_gate_failed(result, options);
-    let runtime_coverage = has_failing_runtime_coverage(result);
-    let stale_baseline = stale_baseline_gate_failed(result, options);
-    score || findings || runtime_coverage || stale_baseline
+fn health_exit_code(result: &HealthResult, options: HealthPrintOptions<'_>) -> u8 {
+    use crate::exit_codes::gate_failed_exit_code;
+    use fallow_output::GateName;
+
+    let findings_gate = if options.gates.min_severity.is_some() {
+        GateName::HealthMinSeverity
+    } else {
+        GateName::HealthFindings
+    };
+    [
+        gate_failed_exit_code(GateName::HealthMinScore, score_gate_failed(result, options)),
+        gate_failed_exit_code(findings_gate, findings_gate_failed(result, options)),
+        gate_failed_exit_code(
+            GateName::HealthRuntimeCoverage,
+            has_failing_runtime_coverage(result),
+        ),
+        gate_failed_exit_code(
+            GateName::StaleBaseline,
+            stale_baseline_gate_failed(result, options),
+        ),
+        gate_failed_exit_code(
+            GateName::HealthCoverageGaps,
+            result.should_fail_on_coverage_gaps && result.coverage_gaps_has_findings,
+        ),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0)
 }
 
 /// Say what this run made of the loaded baseline, and record it for the
@@ -1343,6 +1275,55 @@ mod tests {
                 },
             ),
             ExitCode::from(1),
+        );
+    }
+
+    /// A type-aware metadata block that asks for the `complete` policy and
+    /// holds a partial query, so the completeness gate fails.
+    fn incomplete_required_type_aware_meta() -> fallow_types::envelope::TypeAwareMeta {
+        fallow_types::envelope::TypeAwareMeta {
+            required_completeness: Some(
+                fallow_types::semantic::SemanticCompletenessRequirement::Complete,
+            ),
+            queries: vec![fallow_types::semantic::SemanticQuerySummary {
+                query_id: 0,
+                capability: fallow_types::semantic::SemanticCapability::TypeCoupling,
+                assertion: "type coupling".to_string(),
+                status: fallow_types::semantic::SemanticCompleteness::Partial,
+                reason_code: None,
+                total_evidence_count: 0,
+                truncated: false,
+                omissions: Vec::new(),
+                actions: Vec::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_envelope_states_a_failed_type_aware_completeness_gate() {
+        let mut result = fx_gate_result(vec![], Some(fx_health_score(100.0, "A")));
+        result.type_aware_meta = Some(incomplete_required_type_aware_meta());
+        let options = HealthPrintOptions {
+            quiet: true,
+            explain: false,
+            gates: HealthGateOptions::default(),
+            baseline_path: None,
+            baseline_saved_by: None,
+            summary: false,
+            summary_heading: true,
+            show_explain_tip: true,
+            type_aware_scope: None,
+            skip_score_and_trend: false,
+            css_requested: false,
+            json_style: crate::json_style::JsonStyle::Compact,
+        };
+        let gates = serde_json::to_value(health_gate_outcomes(&result, options))
+            .expect("gate outcomes serialize");
+        assert_eq!(
+            gates["type-aware-require"],
+            serde_json::json!({ "status": "fail", "enforced": true }),
+            "the run exits 1 on this gate, so the envelope must state it: {gates}"
         );
     }
 }

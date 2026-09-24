@@ -8,12 +8,12 @@ use fallow_engine::{
     session::AnalysisSession,
 };
 use fallow_output::{
-    CHECK_SCHEMA_VERSION, CheckOutputInput, DeadCodeNextStepsInput, DiffIndex, build_check_output,
+    CHECK_SCHEMA_VERSION, CheckOutputInput, DeadCodeNextStepsInput, build_check_output,
     build_dead_code_next_steps, check_meta,
 };
 use fallow_types::output_format::OutputFormat;
 use fallow_types::path_util::is_absolute_path_any_platform;
-use fallow_types::results::{AnalysisResults, TraceHopRole};
+use fallow_types::results::AnalysisResults;
 use rustc_hash::FxHashSet;
 
 use crate::{
@@ -43,8 +43,49 @@ pub(super) struct DeadCodeProgrammaticRunWithArtifacts {
 /// options, config load failures, analysis failures, or git changed-file
 /// failures.
 pub fn run_dead_code(options: &DeadCodeOptions) -> ProgrammaticResult<DeadCodeProgrammaticOutput> {
+    run_dead_code_with_baseline(options, None)
+}
+
+/// Run dead-code analysis and hide the findings of a saved dead-code baseline.
+///
+/// The baseline is the file that `fallow dead-code --save-baseline` writes. It
+/// is applied by the same engine function as `fallow dead-code --baseline`, so
+/// both hide the same findings. A file that another command saved suppresses
+/// nothing, as on the CLI.
+///
+/// # Errors
+///
+/// Returns the errors of [`run_dead_code`], and a structured error when the
+/// baseline cannot be read, is not valid, or was saved with an incompatible
+/// analysis identity.
+pub fn run_dead_code_with_baseline(
+    options: &DeadCodeOptions,
+    baseline: Option<&Path>,
+) -> ProgrammaticResult<DeadCodeProgrammaticOutput> {
     let resolved = resolve_programmatic_analysis_context_deferred_workspace(&options.analysis)?;
-    resolved.install(|| run_dead_code_inner(options, &resolved, |_| {}))
+    resolved.install(|| {
+        let start = Instant::now();
+        resolved.ensure_not_cancelled("config load and file discovery")?;
+        let session = load_dead_code_session(options, &resolved)?;
+        let (mut results, type_aware_meta) =
+            analyze_dead_code_results(options, &resolved, &session, None, |_| {})?;
+        if let Some(baseline) = baseline {
+            apply_baseline(
+                &mut results,
+                baseline,
+                session.root(),
+                type_aware_meta.as_ref(),
+            )?;
+        }
+        Ok(build_dead_code_programmatic_output(
+            options,
+            &resolved,
+            &session,
+            results,
+            type_aware_meta,
+            start,
+        ))
+    })
 }
 
 /// Turn an engine failure into a programmatic error, keeping a cancelled run
@@ -114,6 +155,30 @@ pub(super) fn run_dead_code_with_session(
     post_filter: impl FnOnce(&mut AnalysisResults),
     start: Instant,
 ) -> ProgrammaticResult<DeadCodeProgrammaticOutput> {
+    let (results, type_aware_meta) =
+        analyze_dead_code_results(options, resolved, session, changed_files, post_filter)?;
+    Ok(build_dead_code_programmatic_output(
+        options,
+        resolved,
+        session,
+        results,
+        type_aware_meta,
+        start,
+    ))
+}
+
+/// The reported dead-code findings of one session run, with the type-aware
+/// metadata of the run.
+fn analyze_dead_code_results(
+    options: &DeadCodeOptions,
+    resolved: &ProgrammaticAnalysisContext,
+    session: &AnalysisSession,
+    changed_files: Option<&FxHashSet<std::path::PathBuf>>,
+    post_filter: impl FnOnce(&mut AnalysisResults),
+) -> ProgrammaticResult<(
+    AnalysisResults,
+    Option<fallow_types::envelope::TypeAwareMeta>,
+)> {
     resolved.ensure_not_cancelled("dead-code analysis")?;
     let analysis = session.analyze_dead_code().map_err(|err| {
         map_engine_error(
@@ -137,15 +202,53 @@ pub(super) fn run_dead_code_with_session(
         &mut results,
         post_filter,
     )?;
+    Ok((results, type_aware_meta))
+}
 
-    Ok(build_dead_code_programmatic_output(
-        options,
-        resolved,
-        session,
-        results,
-        type_aware_meta,
-        start,
-    ))
+/// Hide the findings of a saved dead-code baseline, as `--baseline` does.
+fn apply_baseline(
+    results: &mut AnalysisResults,
+    baseline: &Path,
+    root: &Path,
+    type_aware_meta: Option<&fallow_types::envelope::TypeAwareMeta>,
+) -> ProgrammaticResult<()> {
+    use fallow_engine::baseline::{DeadCodeBaselineError, apply_dead_code_baseline};
+
+    let path = if is_absolute_path_any_platform(baseline) {
+        baseline.to_path_buf()
+    } else {
+        root.join(baseline)
+    };
+    let content = std::fs::read_to_string(&path).map_err(|err| {
+        ProgrammaticError::new(
+            format!("failed to read baseline {}: {err}", path.display()),
+            2,
+        )
+        .with_code("FALLOW_BASELINE_READ_FAILED")
+        .with_context("baseline")
+    })?;
+    let identity = type_aware_meta
+        .and_then(|meta| meta.identity.clone())
+        .unwrap_or_default();
+    apply_dead_code_baseline(results, &content, root, &identity, false)
+        .map(|_| ())
+        .map_err(|err| match err {
+            DeadCodeBaselineError::Parse(message) => ProgrammaticError::new(
+                format!("failed to parse baseline {}: {message}", path.display()),
+                2,
+            )
+            .with_code("FALLOW_BASELINE_INVALID")
+            .with_context("baseline"),
+            DeadCodeBaselineError::IncompatibleIdentity(fields) => ProgrammaticError::new(
+                format!(
+                    "baseline analysis identity is incompatible in: {}. Save it again with the same analysis options",
+                    fields.join(", ")
+                ),
+                2,
+            )
+            .with_code("FALLOW_BASELINE_IDENTITY_INCOMPATIBLE")
+            .with_context("baseline"),
+        })
 }
 
 pub(super) fn run_dead_code_with_session_artifacts(
@@ -467,205 +570,43 @@ fn apply_dead_code_scope(
     results: &mut AnalysisResults,
 ) -> ProgrammaticResult<()> {
     let workspace_roots = workspace_roots_for_session(resolved, session.workspaces())?;
-    if let Some(workspace_roots) = workspace_roots.as_ref() {
-        fallow_engine::dead_code::filter_to_workspaces(results, workspace_roots);
-    }
     let resolved_changed_files = if changed_files.is_some() {
         None
     } else {
         changed_files_for_run(resolved)?
     };
-    if let Some(changed_files) = changed_files.or(resolved_changed_files.as_ref()) {
-        fallow_engine::dead_code::filter_by_changed_files(results, changed_files);
-    }
-    if let Some(diff) = resolved.diff.as_ref() {
-        filter_dead_code_by_diff(results, diff, session.root());
-    }
-    apply_dead_code_file_filter(options, session.root(), results);
+    let files = file_scope(options, session.root());
+    fallow_engine::dead_code::apply_scope(
+        results,
+        &fallow_engine::dead_code::DeadCodeScope {
+            workspace_roots: workspace_roots.as_deref(),
+            changed_files: changed_files.or(resolved_changed_files.as_ref()),
+            diff: resolved.diff.as_ref().map(|diff| (diff, session.root())),
+            files: files.as_ref(),
+        },
+        session.config(),
+    );
     Ok(())
 }
 
-fn filter_dead_code_by_diff(results: &mut AnalysisResults, diff: &DiffIndex, root: &Path) {
-    let touches_file = |path: &Path| -> bool {
-        diff.key_for(path, root)
-            .is_none_or(|rel| diff.touches_file(&rel))
-    };
-    let line_in_diff = |path: &Path, line: u32| -> bool {
-        diff.key_for(path, root)
-            .is_none_or(|rel| diff.line_is_added(&rel, u64::from(line)))
-    };
-
-    filter_dead_code_source_findings(results, &touches_file, &line_in_diff);
-    filter_dead_code_security_findings(results, &touches_file, &line_in_diff);
-    filter_dead_code_dependency_findings(results, &line_in_diff);
-    filter_dead_code_graph_findings(results, &touches_file, &line_in_diff);
-    filter_dead_code_framework_findings(results, &line_in_diff);
-}
-
-fn filter_dead_code_source_findings(
-    results: &mut AnalysisResults,
-    touches_file: &dyn Fn(&Path) -> bool,
-    line_in_diff: &dyn Fn(&Path, u32) -> bool,
-) {
-    results
-        .unused_files
-        .retain(|finding| touches_file(&finding.file.path));
-    results
-        .unused_exports
-        .retain(|finding| line_in_diff(&finding.export.path, finding.export.line));
-    results
-        .unused_types
-        .retain(|finding| line_in_diff(&finding.export.path, finding.export.line));
-    results
-        .private_type_leaks
-        .retain(|finding| line_in_diff(&finding.leak.path, finding.leak.line));
-    results
-        .unused_enum_members
-        .retain(|finding| line_in_diff(&finding.member.path, finding.member.line));
-    results
-        .unused_class_members
-        .retain(|finding| line_in_diff(&finding.member.path, finding.member.line));
-    results
-        .unused_store_members
-        .retain(|finding| line_in_diff(&finding.member.path, finding.member.line));
-    results
-        .unprovided_injects
-        .retain(|finding| line_in_diff(&finding.inject.path, finding.inject.line));
-    results
-        .unrendered_components
-        .retain(|finding| line_in_diff(&finding.component.path, finding.component.line));
-    results
-        .unused_component_props
-        .retain(|finding| line_in_diff(&finding.prop.path, finding.prop.line));
-    results
-        .unused_component_emits
-        .retain(|finding| line_in_diff(&finding.emit.path, finding.emit.line));
-    results
-        .unused_component_inputs
-        .retain(|finding| line_in_diff(&finding.input.path, finding.input.line));
-    results
-        .unused_component_outputs
-        .retain(|finding| line_in_diff(&finding.output.path, finding.output.line));
-    results
-        .unused_svelte_events
-        .retain(|finding| line_in_diff(&finding.event.path, finding.event.line));
-    results
-        .unused_server_actions
-        .retain(|finding| line_in_diff(&finding.action.path, finding.action.line));
-    results
-        .unused_load_data_keys
-        .retain(|finding| line_in_diff(&finding.key.path, finding.key.line));
-    results
-        .unresolved_imports
-        .retain(|finding| line_in_diff(&finding.import.path, finding.import.line));
-}
-
-fn filter_dead_code_security_findings(
-    results: &mut AnalysisResults,
-    touches_file: &dyn Fn(&Path) -> bool,
-    line_in_diff: &dyn Fn(&Path, u32) -> bool,
-) {
-    results.security_findings.retain(|finding| {
-        line_in_diff(&finding.path, finding.line)
-            || finding.trace.iter().any(|hop| {
-                line_in_diff(&hop.path, hop.line)
-                    || (matches!(hop.role, TraceHopRole::SecretSource) && touches_file(&hop.path))
-            })
-            || finding.reachability.as_ref().is_some_and(|reachability| {
-                reachability
-                    .untrusted_source_trace
-                    .iter()
-                    .any(|hop| line_in_diff(&hop.path, hop.line))
-            })
-    });
-    results
-        .security_unresolved_callee_diagnostics
-        .retain(|finding| line_in_diff(&finding.path, finding.line));
-}
-
-fn filter_dead_code_dependency_findings(
-    results: &mut AnalysisResults,
-    line_in_diff: &dyn Fn(&Path, u32) -> bool,
-) {
-    for finding in &mut results.unlisted_dependencies {
-        finding
-            .dep
-            .imported_from
-            .retain(|source| line_in_diff(&source.path, source.line));
-    }
-    results
-        .unlisted_dependencies
-        .retain(|finding| !finding.dep.imported_from.is_empty());
-}
-
-fn filter_dead_code_graph_findings(
-    results: &mut AnalysisResults,
-    touches_file: &dyn Fn(&Path) -> bool,
-    line_in_diff: &dyn Fn(&Path, u32) -> bool,
-) {
-    results.duplicate_exports.retain(|finding| {
-        finding
-            .export
-            .locations
-            .iter()
-            .any(|location| line_in_diff(&location.path, location.line))
-    });
-    results
-        .circular_dependencies
-        .retain(|cycle| cycle.cycle.files.iter().any(|path| touches_file(path)));
-    results
-        .re_export_cycles
-        .retain(|cycle| cycle.cycle.files.iter().any(|path| touches_file(path)));
-    results
-        .boundary_violations
-        .retain(|finding| line_in_diff(&finding.violation.from_path, finding.violation.line));
-    results
-        .stale_suppressions
-        .retain(|finding| line_in_diff(&finding.path, finding.line));
-}
-
-fn filter_dead_code_framework_findings(
-    results: &mut AnalysisResults,
-    line_in_diff: &dyn Fn(&Path, u32) -> bool,
-) {
-    results
-        .invalid_client_exports
-        .retain(|finding| line_in_diff(&finding.export.path, finding.export.line));
-    results
-        .mixed_client_server_barrels
-        .retain(|finding| line_in_diff(&finding.barrel.path, finding.barrel.line));
-    results
-        .misplaced_directives
-        .retain(|finding| line_in_diff(&finding.directive_site.path, finding.directive_site.line));
-    results
-        .route_collisions
-        .retain(|finding| line_in_diff(&finding.collision.path, finding.collision.line));
-    results
-        .dynamic_segment_name_conflicts
-        .retain(|finding| line_in_diff(&finding.conflict.path, finding.conflict.line));
-}
-
-fn apply_dead_code_file_filter(
-    options: &DeadCodeOptions,
-    root: &Path,
-    results: &mut AnalysisResults,
-) {
+/// The `files` option resolved against the root, or `None` when it is empty.
+fn file_scope(options: &DeadCodeOptions, root: &Path) -> Option<FxHashSet<std::path::PathBuf>> {
     if options.files.is_empty() {
-        return;
+        return None;
     }
-    let file_set = options
-        .files
-        .iter()
-        .map(|path| {
-            if is_absolute_path_any_platform(path) {
-                path.clone()
-            } else {
-                root.join(path)
-            }
-        })
-        .collect::<FxHashSet<_>>();
-    fallow_engine::dead_code::filter_by_changed_files(results, &file_set);
-    clear_dead_code_dependency_findings(results);
+    Some(
+        options
+            .files
+            .iter()
+            .map(|path| {
+                if is_absolute_path_any_platform(path) {
+                    path.clone()
+                } else {
+                    root.join(path)
+                }
+            })
+            .collect(),
+    )
 }
 
 fn apply_dead_code_filters(filters: &DeadCodeFilters, results: &mut AnalysisResults) {

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use fallow_config::{OutputFormat, ResolvedConfig};
 use fallow_types::duplicates::{DefaultIgnoreSkips, DuplicationReport};
 
-use crate::baseline::{DuplicationBaselineData, filter_new_clone_groups, recompute_stats};
+use crate::baseline::{DuplicationBaselineData, filter_new_clone_groups};
 use crate::check::resolve_workspace_scope;
 use crate::report;
 use crate::{error::emit_error, load_config_for_analysis};
@@ -203,88 +203,6 @@ pub fn exceeds_threshold(threshold: f64, duplication_percentage: f64) -> bool {
     threshold > 0.0 && duplication_percentage > threshold
 }
 
-/// The gates a duplication run evaluated, for the envelope's `gate_outcomes`.
-///
-/// The threshold verdict is the same [`exceeds_threshold`] call the exit path
-/// makes, so the published boolean and the process status cannot disagree.
-fn dupes_gate_outcomes(
-    result: &DupesResult,
-    baseline_staleness: Option<&fallow_output::BaselineStaleness>,
-) -> Option<fallow_output::GateOutcomes> {
-    let mut gates = fallow_output::GateOutcomes::new();
-    gates.insert_if(
-        fallow_output::GateName::DuplicationThreshold,
-        crate::gates::duplication_threshold_outcome(
-            result.threshold,
-            result.report.stats.duplication_percentage,
-            // Armed, not the verdict: the standalone command exits on this
-            // gate, so a passing threshold still reports `enforced: true`.
-            true,
-        ),
-    );
-    gates.insert_if(
-        fallow_output::GateName::StaleBaseline,
-        crate::gates::stale_baseline_outcome(baseline_staleness, result.fail_on_stale_baseline),
-    );
-    gates.into_option()
-}
-
-use fallow_engine::changed_files::filter_duplication_by_changed_files as filter_by_changed_files;
-
-/// Filter a duplication report to only retain clone groups where at least one
-/// instance belongs to a file under one of the given workspace roots. Mirrors
-/// the `AnalysisResults` workspace-scoping behaviour in
-/// `crate::check::filtering::filter_to_workspaces`: the full cross-workspace
-/// graph is still built, only reported groups are narrowed.
-///
-/// Families and stats are rebuilt from the surviving groups so that the
-/// reported duplication percentage reflects the scoped slice, not the whole
-/// repo.
-fn filter_by_workspaces(
-    report: &mut fallow_types::duplicates::DuplicationReport,
-    ws_roots: &[std::path::PathBuf],
-    root: &std::path::Path,
-) {
-    report.clone_groups.retain(|g| {
-        g.instances
-            .iter()
-            .any(|i| ws_roots.iter().any(|r| i.file.starts_with(r)))
-    });
-    fallow_engine::duplicates::refresh_clone_families(report, root);
-    report.stats = recompute_stats(report);
-}
-
-/// Filter a duplication report to only retain clone groups whose at least
-/// one instance has its `[start_line..=end_line]` range overlap an added
-/// line for that instance's file in the supplied diff. Group-level
-/// retention (panel guidance for issue #424): a group is kept if ANY of
-/// its instances overlaps, even when the other instances do not, so the
-/// reviewer sees the full clone family in PR context. Single-instance
-/// drop is fine because a clone-of-one is no longer a clone.
-///
-/// Families and stats are rebuilt from the surviving groups so that the
-/// reported duplication percentage reflects the scoped slice.
-fn filter_by_diff(
-    report: &mut fallow_types::duplicates::DuplicationReport,
-    diff_index: &crate::report::ci::diff_filter::DiffIndex,
-    root: &std::path::Path,
-) {
-    let instance_overlaps = |instance: &fallow_types::duplicates::CloneInstance| -> bool {
-        let Some(rel) = diff_index.key_for(&instance.file, root) else {
-            return true;
-        };
-        let start = u64::try_from(instance.start_line).unwrap_or(u64::MAX);
-        let end = u64::try_from(instance.end_line).unwrap_or(u64::MAX);
-        diff_index.range_overlaps_added(&rel, start, end)
-    };
-
-    report
-        .clone_groups
-        .retain(|g| g.instances.iter().any(instance_overlaps));
-    fallow_engine::duplicates::refresh_clone_families(report, root);
-    report.stats = recompute_stats(report);
-}
-
 /// Result of executing duplication analysis without printing.
 pub struct DupesResult {
     pub report: DuplicationReport,
@@ -346,9 +264,11 @@ fn load_dupes_config_for_analysis(opts: &DupesOptions<'_>) -> Result<ResolvedCon
             output: opts.output,
             no_cache: opts.no_cache,
             threads: opts.threads,
-            production_override: opts
-                .production_override
-                .or_else(|| opts.production.then_some(true)),
+            production_override:
+                fallow_engine::project_config::ProductionFlags::single_analysis_override(
+                    opts.production,
+                    opts.production_override,
+                ),
             quiet: opts.quiet,
             allow_remote_extends: opts.allow_remote_extends,
         },
@@ -364,31 +284,29 @@ fn filter_dupes_report(
     config: &ResolvedConfig,
     effective_changed_files: Option<&rustc_hash::FxHashSet<std::path::PathBuf>>,
 ) -> Result<(), ExitCode> {
-    if let Some(changed) = effective_changed_files {
-        filter_by_changed_files(report, changed, &config.root);
-    }
-
-    if let Some(diff_index) = match opts.diff_index {
+    let diff_index = match opts.diff_index {
         Some(index) => Some(index),
         None if opts.use_shared_diff_index => crate::report::ci::diff_filter::shared_diff_index(),
         None => None,
-    } {
-        filter_by_diff(report, diff_index, &config.root);
-    }
-
-    if let Some(mut ws_roots) = resolve_workspace_scope(
+    };
+    let mut ws_roots = resolve_workspace_scope(
         opts.root,
         opts.workspace,
         opts.changed_workspaces,
         opts.output,
-    )? {
-        if let Some(scope) = opts.scope.as_ref() {
-            ws_roots.push(scope.clone());
-        }
-        filter_by_workspaces(report, &ws_roots, &config.root);
-    } else if let Some(scope) = opts.scope.as_ref() {
-        filter_by_workspaces(report, std::slice::from_ref(scope), &config.root);
+    )?;
+    if let Some(scope) = opts.scope.as_ref() {
+        ws_roots.get_or_insert_with(Vec::new).push(scope.clone());
     }
+    fallow_engine::duplicates::apply_scope(
+        report,
+        &fallow_engine::duplicates::DuplicationScope {
+            changed_files: effective_changed_files,
+            diff: diff_index,
+            workspace_roots: ws_roots.as_deref(),
+        },
+        &config.root,
+    );
 
     if let Some(n) = opts.top {
         apply_top(report, n, &config.root);
@@ -747,20 +665,7 @@ fn resolve_changed_since(
     crate::requests::resolve_changed_since(opts.root, git_ref)
 }
 
-/// Keep only the `n` highest-ranked clone groups.
-///
-/// `stats` keeps describing the corpus the run measured. Truncation is a
-/// presentation choice, so rewriting `clone_groups` / `clone_instances` from
-/// the truncated vector would put two mutually contradictory scopes in one
-/// object next to the untouched `files_with_clones` and
-/// `duplication_percentage`. Consumers read the shown/omitted split from
-/// `DuplicationReport::clone_groups_shown` / `clone_groups_omitted` instead.
-fn apply_top(report: &mut DuplicationReport, n: usize, root: &std::path::Path) {
-    report.sort();
-    report.clone_groups.truncate(n);
-    fallow_engine::duplicates::refresh_clone_families(report, root);
-    report.sort();
-}
+use fallow_engine::duplicates::apply_top;
 
 fn run_duplication_analysis(
     opts: &DupesOptions<'_>,
@@ -945,7 +850,12 @@ fn print_dupes_result_with_grouping(input: DupesResultGroupingInput<'_>) -> Exit
         .baseline_staleness
         .as_ref()
         .map(|loaded| loaded.to_envelope(0));
-    let gate_outcomes = dupes_gate_outcomes(result, baseline_staleness.as_ref());
+    let gate_outcomes = crate::gates::dupes_gate_outcomes(
+        result.threshold,
+        result.report.stats.duplication_percentage,
+        baseline_staleness.as_ref(),
+        result.fail_on_stale_baseline,
+    );
     let ctx = report::ReportContext {
         root: &result.config.root,
         rules: &result.config.rules,
@@ -1002,11 +912,16 @@ fn print_dupes_result_with_grouping(input: DupesResultGroupingInput<'_>) -> Exit
         fallow_engine::baseline::BaselineKind::Dupes,
     );
 
-    if threshold_exceeded || stale_baseline_failed {
-        return ExitCode::from(1);
-    }
-
-    ExitCode::SUCCESS
+    crate::exit_codes::run_exit_code([
+        crate::exit_codes::gate_failed_exit_code(
+            fallow_output::GateName::DuplicationThreshold,
+            threshold_exceeded,
+        ),
+        crate::exit_codes::gate_failed_exit_code(
+            fallow_output::GateName::StaleBaseline,
+            stale_baseline_failed,
+        ),
+    ])
 }
 
 pub fn print_default_ignore_note(result: &DupesResult, quiet: bool) {
@@ -1150,6 +1065,9 @@ mod tests {
     use super::*;
     use crate::baseline::{DuplicationBaselineData, filter_new_clone_groups, recompute_stats};
     use fallow_config::{DetectionMode, DuplicatesConfig, NormalizationConfig};
+    use fallow_engine::changed_files::filter_duplication_by_changed_files as filter_by_changed_files;
+    use fallow_engine::diff_scope::filter_duplication_by_diff as filter_by_diff;
+    use fallow_engine::duplicates::filter_to_workspaces as filter_by_workspaces;
     use fallow_types::duplicates::{
         CloneGroup, CloneInstance, DuplicationReport, DuplicationStats,
     };

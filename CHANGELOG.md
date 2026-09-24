@@ -180,6 +180,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   work only without a subcommand: `fallow --dupes-baseline <file> dead-code`
   stops with exit 2.
 
+- **The editor complexity code lens follows `health.thresholdOverrides`.**
+  The VS Code extension and the language server showed a complexity code
+  lens for each function above the global `maxCyclomatic` or `maxCognitive`.
+  They did not read `health.thresholdOverrides`, so a function that an
+  override lets through still had a lens, while `fallow health` did not
+  report it. The code lens now uses the same thresholds as `fallow health`.
+
+- **The MCP `find_dupes` and audit tools and the Node API keep a clone group
+  across workspaces.** With a workspace scope, `fallow dupes --workspace pkg-a`
+  keeps every clone group that has at least one copy in `pkg-a`, and shows all
+  of its copies, as the docs say. The MCP typed tools and the Node API removed
+  the copies outside `pkg-a`, and dropped the group when only one copy was
+  left. So a copy in `pkg-a` of code in `pkg-b` did not show. They now keep
+  the group as the CLI does. The duplication section of an audit with a
+  workspace scope also keeps the group now, as `fallow audit` does.
+
+- **The MCP tools, the Node API and the editor hide a duplicate export that
+  only ignored files hold after a scope.** `ignoreFindings` hides a
+  `duplicate-exports` finding only when every file that exports the name
+  matches. A scope such as `--changed-since`, `--workspace` or the
+  `fallow.changedSince` editor setting can remove files from the finding. The
+  CLI then checked `ignoreFindings` again. The MCP typed tools, the Node API,
+  the language server and the VS Code extension did not, so they showed a
+  finding that the CLI hid. They now narrow a dead-code report through the
+  same code as the CLI. `fallow dead-code --file` now applies the same rule: a
+  duplicate export that only ignored files hold after `--file` is hidden.
+
+- **The JSON output of `fallow health` and `fallow audit` shows a failed
+  type-aware completeness check.** With `--type-aware-require complete`, both
+  commands exit 1 when the type-aware analysis is not complete. Their
+  `gate_outcomes` did not show this, so the JSON said that every check passed.
+  Now `gate_outcomes` has a `type-aware-require` entry, as in `fallow
+  dead-code`. For `fallow health`, `required_completeness` in the type-aware
+  metadata now shows the policy of `--type-aware-require`. Before, it showed
+  the policy of the config file.
+
 - **Traces pick the file you name in a monorepo.** A trace of `src/a.ts`
   (for example `dead-code --trace-file src/a.ts` or
   `dead-code --trace src/a.ts:foo`) now takes the file at that exact path from

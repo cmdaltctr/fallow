@@ -1,10 +1,12 @@
 //! The drift contract predicates. Each function checks one invariant from
 //! `docs/development/drift-contract.md` and returns a readable diff on failure.
 
+use std::collections::BTreeSet;
+
 use similar::TextDiff;
 
 use crate::common::{CommandOutput, canonical_report};
-use crate::keys::{AuditKeys, KeySet, render};
+use crate::keys::{AuditKeys, FindingKey, KeySet, render};
 
 /// Issue kinds that report a suppression comment itself. Invariant I6 exempts
 /// them: a suppression comment that matches nothing is a finding by design.
@@ -212,28 +214,64 @@ pub struct StatedVerdict {
     pub failed: bool,
     /// Some entry reports `fail` and is `enforced`.
     pub enforced_failure: bool,
+    /// The exit code of the enforced entries that fail, 0 when none fails.
+    pub enforced_code: i32,
+    /// The exit code of every entry that fails, enforced or not, 0 when none
+    /// fails.
+    pub failed_code: i32,
+}
+
+impl StatedVerdict {
+    /// The verdict of a run that armed no gate.
+    pub const PASS: Self = Self {
+        failed: false,
+        enforced_failure: false,
+        enforced_code: 0,
+        failed_code: 0,
+    };
+}
+
+/// The exit code that a failed gate gives the process, as the CLI documents
+/// it: `security --gate` exits 8, every other gate exits 1.
+fn gate_failure_code(gate: &str) -> i32 {
+    if gate == "security" { 8 } else { 1 }
 }
 
 /// Read the verdict of `gate_outcomes`, `None` when the object is absent.
 pub fn stated_verdict(envelope: &serde_json::Value) -> Option<StatedVerdict> {
     let gates = envelope.get("gate_outcomes")?.as_object()?;
     let failing = gates
-        .values()
-        .filter(|outcome| outcome["status"] == "fail")
+        .iter()
+        .filter(|(_, outcome)| outcome["status"] == "fail")
         .collect::<Vec<_>>();
+    let code = |enforced_only: bool| {
+        failing
+            .iter()
+            .filter(|(_, outcome)| !enforced_only || outcome["enforced"] == true)
+            .map(|(gate, _)| gate_failure_code(gate))
+            .max()
+            .unwrap_or(0)
+    };
     Some(StatedVerdict {
         failed: !failing.is_empty(),
-        enforced_failure: failing.iter().any(|outcome| outcome["enforced"] == true),
+        enforced_failure: failing
+            .iter()
+            .any(|(_, outcome)| outcome["enforced"] == true),
+        enforced_code: code(true),
+        failed_code: code(false),
     })
 }
 
 /// How a command turns its verdict into an exit code in a machine format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitRule {
-    /// The machine run exits 1 when an enforced gate fails, like the human run.
+    /// The machine run and the human run both exit with the code of the
+    /// enforced gates that fail.
     Enforced,
-    /// Bare `fallow`: the machine run exits 0, and the human run exits 1 when
-    /// any gate fails.
+    /// Bare `fallow`: the machine run exits with the code of the enforced
+    /// gates that fail (`regression`, `stale-baseline` and
+    /// `type-aware-require`), and the human run fails on every gate that
+    /// fails.
     CombinedMachine,
 }
 
@@ -260,14 +298,11 @@ pub fn i7_verdicts_agree(runs: &VerdictRuns<'_>) -> Verdict {
                 problems.push(format!("{label}: the envelope has no gate_outcomes"));
                 continue;
             }
-            None => StatedVerdict {
-                failed: false,
-                enforced_failure: false,
-            },
+            None => StatedVerdict::PASS,
         };
-        let (expected_code, human_fails) = match runs.rule {
-            ExitRule::Enforced => (i32::from(stated.enforced_failure), stated.enforced_failure),
-            ExitRule::CombinedMachine => (0, stated.failed),
+        let (expected_code, expected_human_code) = match runs.rule {
+            ExitRule::Enforced => (stated.enforced_code, stated.enforced_code),
+            ExitRule::CombinedMachine => (stated.enforced_code, stated.failed_code),
         };
         if *code != expected_code {
             problems.push(format!(
@@ -275,7 +310,7 @@ pub fn i7_verdicts_agree(runs: &VerdictRuns<'_>) -> Verdict {
                 envelope["gate_outcomes"]
             ));
         }
-        if i32::from(human_fails) != runs.human_code {
+        if expected_human_code != runs.human_code {
             problems.push(format!(
                 "{label}: the stated verdict {stated:?} does not match the human run, which exits {}: {}",
                 runs.human_code, envelope["gate_outcomes"]
@@ -290,4 +325,52 @@ pub fn i7_verdicts_agree(runs: &VerdictRuns<'_>) -> Verdict {
         runs.command,
         problems.join("\n")
     ))
+}
+
+/// I8 (narrowing half): a scoped run holds no finding that the unscoped run lacks.
+pub fn i8_narrows(context: &str, scoped: &KeySet, unscoped: &KeySet) -> Verdict {
+    keys_subset("scoped run", scoped, "unscoped run", unscoped)
+        .map_err(|err| format!("{context}: {err}"))
+}
+
+/// Dead-code kinds that `--changed-since` keeps whatever changed: whether a
+/// dependency is unused is a fact about the whole graph, not about one file
+/// (`filter_results_by_changed_files` in `crates/engine/src/changed_files.rs`).
+pub const CHANGED_SINCE_UNFILTERED_KINDS: &[&str] = &[
+    "unused_dependencies",
+    "unused_dev_dependencies",
+    "unused_optional_dependencies",
+    "type_only_dependencies",
+    "test_only_dependencies",
+    "dev_dependencies_in_production",
+    "unused_catalog_entries",
+];
+
+/// I8 (location half): every finding of a scoped run touches the scope,
+/// except findings of the `exempt` kinds. A clone group touches the scope when
+/// one of its instances does.
+pub fn i8_inside_scope(
+    context: &str,
+    scoped: &KeySet,
+    exempt: &[&str],
+    in_scope: impl Fn(&str) -> bool,
+) -> Verdict {
+    let outside: KeySet = scoped
+        .iter()
+        .filter(|key| !exempt.contains(&key.kind.as_str()))
+        .filter(|key| !key_paths(key).iter().any(|path| in_scope(path)))
+        .cloned()
+        .collect();
+    if outside.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{context}: findings outside the scope:\n{}",
+        render(&outside)
+    ))
+}
+
+/// The paths of a key. Findings over several files join them with ` -> `.
+fn key_paths(key: &FindingKey) -> BTreeSet<&str> {
+    key.path.split(" -> ").collect()
 }

@@ -308,72 +308,34 @@ pub enum EditorInlineComplexityExceeded {
 }
 
 /// Collect inline complexity findings from retained editor analysis artifacts.
+///
+/// The rule is `fallow_engine::health::inline_complexity`, the one that the
+/// health findings use, so the code lens and `fallow health` flag the same
+/// functions, also under `health.thresholdOverrides`.
 #[must_use]
 pub fn collect_inline_complexity(
     config: &fallow_config::ResolvedConfig,
     output: &EditorDeadCodeAnalysisOutput,
 ) -> Vec<EditorInlineComplexityFinding> {
-    let Some(modules) = output.modules.as_ref() else {
+    let (Some(modules), Some(files)) = (output.modules.as_ref(), output.files.as_ref()) else {
         return Vec::new();
     };
-    let Some(files) = output.files.as_ref() else {
-        return Vec::new();
-    };
-
-    let file_paths: rustc_hash::FxHashMap<_, _> =
-        files.iter().map(|file| (file.id, &file.path)).collect();
-    let ignore_set = build_health_ignore_set(&config.health.ignore);
-    let mut findings = Vec::new();
-
-    for module in modules {
-        let Some(path) = file_paths.get(&module.file_id) else {
-            continue;
-        };
-        let relative = path.strip_prefix(&config.root).unwrap_or(path);
-        if ignore_set
-            .as_ref()
-            .is_some_and(|set| set.is_match(relative))
-        {
-            continue;
-        }
-
-        for function in &module.complexity {
-            // The module-scope unit is aggregate-only and never becomes a
-            // finding, so it gets no code lens either: a permanent lens at the
-            // top of every branching file is noise, not a refactoring cue.
-            if fallow_types::extract::is_synthetic_module_unit(&function.name) {
-                continue;
-            }
-            if fallow_types::suppress::is_suppressed(
-                &module.suppressions,
-                function.line,
-                fallow_types::suppress::IssueKind::Complexity,
-            ) {
-                continue;
-            }
-
-            let exceeds_cyclomatic = function.cyclomatic > config.health.max_cyclomatic;
-            let exceeds_cognitive = function.cognitive > config.health.max_cognitive;
-            let exceeded = match (exceeds_cyclomatic, exceeds_cognitive) {
+    fallow_engine::health::inline_complexity(config, modules, files)
+        .into_iter()
+        .map(|finding| EditorInlineComplexityFinding {
+            exceeded: match (finding.exceeds_cyclomatic, finding.exceeds_cognitive) {
                 (true, true) => EditorInlineComplexityExceeded::CyclomaticAndCognitive,
                 (true, false) => EditorInlineComplexityExceeded::Cyclomatic,
-                (false, true) => EditorInlineComplexityExceeded::Cognitive,
-                (false, false) => continue,
-            };
-
-            findings.push(EditorInlineComplexityFinding {
-                path: (*path).clone(),
-                name: function.name.clone(),
-                line: function.line,
-                col: function.col,
-                cyclomatic: function.cyclomatic,
-                cognitive: function.cognitive,
-                exceeded,
-            });
-        }
-    }
-
-    findings
+                (false, _) => EditorInlineComplexityExceeded::Cognitive,
+            },
+            path: finding.path,
+            name: finding.name,
+            line: finding.line,
+            col: finding.col,
+            cyclomatic: finding.cyclomatic,
+            cognitive: finding.cognitive,
+        })
+        .collect()
 }
 
 /// Filter inline complexity findings to the changed-file set.
@@ -386,21 +348,6 @@ pub fn filter_inline_complexity_by_changed_files(
     changed_files: &FxHashSet<PathBuf>,
 ) {
     findings.retain(|finding| changed_files.contains(&finding.path));
-}
-
-fn build_health_ignore_set(patterns: &[String]) -> Option<globset::GlobSet> {
-    if patterns.is_empty() {
-        return None;
-    }
-
-    let mut builder = globset::GlobSetBuilder::new();
-    for pattern in patterns {
-        let Ok(glob) = globset::Glob::new(pattern) else {
-            continue;
-        };
-        builder.add(glob);
-    }
-    builder.build().ok()
 }
 
 /// Reusable editor analysis session owned by the API boundary.
@@ -538,8 +485,11 @@ impl EditorAnalysisSession {
     /// Run dead-code and duplication analysis, optionally focusing duplication
     /// to files the editor already resolved as changed.
     ///
-    /// Dead-code still runs with full graph context so downstream editor
-    /// filters can preserve existing diagnostic semantics.
+    /// Dead-code still runs with full graph context, and the dead-code
+    /// findings keep full scope until the type-aware pass has run. That pass
+    /// reads `unused_files` as its set of unreachable files. After the pass,
+    /// call [`Self::apply_changed_files_scope`] to narrow the dead-code
+    /// findings of this project.
     ///
     /// # Errors
     ///
@@ -562,6 +512,37 @@ impl EditorAnalysisSession {
             .map(fallow_engine::project_analysis::ProjectAnalysisArtifacts::into_output)
             .map(EditorProjectAnalysisOutput::from_engine)
             .map(|output| self.with_resolved_rule_severities(output))
+    }
+
+    /// Narrow the dead-code findings of this project to the changed files,
+    /// with [`fallow_engine::dead_code::apply_scope`] and the config of this
+    /// project, as the CLI, MCP and Node API narrow them.
+    ///
+    /// Call it after the type-aware pass. That pass reads `unused_files` as
+    /// its set of unreachable files, so a scope before it drops evidence from
+    /// unused files outside the changed set. A multi-root editor session
+    /// merges several projects, and each project has its own
+    /// `ignoreFindings`. So the scope runs per project, where the config is
+    /// known, and not after the merge. It does nothing when `changed_files`
+    /// is `None`.
+    pub fn apply_changed_files_scope(
+        &self,
+        dead_code: &mut EditorDeadCodeAnalysisOutput,
+        changed_files: Option<&FxHashSet<PathBuf>>,
+    ) {
+        if changed_files.is_none() {
+            return;
+        }
+        fallow_engine::dead_code::apply_scope(
+            &mut dead_code.results,
+            &fallow_engine::dead_code::DeadCodeScope {
+                workspace_roots: None,
+                changed_files,
+                diff: None,
+                files: None,
+            },
+            self.inner.config(),
+        );
     }
 
     /// Resolve configured rule severities, including per-path
@@ -667,6 +648,13 @@ impl EditorAnalysisOutput {
     }
 
     /// Drop findings and clone groups that do not touch any changed file.
+    ///
+    /// Each project narrows its dead-code findings with its own config in
+    /// [`EditorAnalysisSession::apply_changed_files_scope`], after the
+    /// type-aware pass. The scope must come after that pass, because the pass
+    /// reads `unused_files` as its set of unreachable files. This filter then
+    /// narrows the clone groups of the merged output. For the dead-code
+    /// findings, it changes nothing.
     pub fn filter_by_changed_files(&mut self, changed_files: &FxHashSet<PathBuf>, root: &Path) {
         fallow_engine::changed_files::filter_results_by_changed_files(
             &mut self.results,
@@ -831,6 +819,56 @@ mod tests {
         );
     }
 
+    /// The type-aware pass reads `unused_files` as its set of unreachable
+    /// files. So the analysis keeps an unused file outside the changed set,
+    /// and the scope removes it only when the caller applies it.
+    #[test]
+    fn changed_files_scope_runs_after_the_analysis_keeps_all_unused_files() {
+        let temp = tempfile::tempdir().expect("temp project");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).expect("src dir");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"editor-scope-order","main":"src/a.ts"}"#,
+        )
+        .expect("package.json");
+        std::fs::write(src.join("a.ts"), "export const a = 1;\n").expect("source a");
+        std::fs::write(src.join("orphan.ts"), "export const orphan = 1;\n").expect("orphan");
+
+        let session = EditorAnalysisSession::load(&root, None).expect("session loads");
+        let mut changed_files = FxHashSet::default();
+        changed_files.insert(src.join("a.ts"));
+        let mut output = session
+            .analyze_project_with_changed_files(
+                &fallow_config::DuplicatesConfig::default(),
+                false,
+                Some(&changed_files),
+            )
+            .expect("analysis runs");
+        let unused_files = |output: &EditorProjectAnalysisOutput| {
+            output
+                .dead_code
+                .results
+                .unused_files
+                .iter()
+                .map(|finding| finding.file.path.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            unused_files(&output),
+            vec![src.join("orphan.ts")],
+            "the analysis keeps the unused file outside the changed set"
+        );
+
+        session.apply_changed_files_scope(&mut output.dead_code, Some(&changed_files));
+        assert!(
+            unused_files(&output).is_empty(),
+            "the scope removes the unused file outside the changed set: {:?}",
+            unused_files(&output)
+        );
+    }
+
     #[test]
     fn editor_session_scopes_duplication_to_changed_files() {
         let temp = tempfile::tempdir().expect("temp project");
@@ -864,36 +902,51 @@ mod tests {
         assert!(scoped.duplication.clone_groups.is_empty());
     }
 
+    /// A function under a `health.thresholdOverrides` entry that raises the
+    /// ceilings is not a health finding, so it gets no code lens either.
     #[test]
-    fn build_health_ignore_set_returns_none_for_empty_patterns() {
-        assert!(
-            build_health_ignore_set(&[]).is_none(),
-            "empty ignore pattern list should avoid building a matcher"
+    fn inline_complexity_applies_health_threshold_overrides() {
+        let temp = tempfile::tempdir().expect("temp project");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"editor-inline-overrides","main":"src/index.ts"}"#,
+        )
+        .expect("package.json");
+        std::fs::write(
+            root.join(".fallowrc.json"),
+            r#"{"health":{"maxCyclomatic":2,"maxCognitive":2,"thresholdOverrides":[{"files":["src/legacy.ts"],"maxCyclomatic":50,"maxCognitive":50}]}}"#,
+        )
+        .expect("config");
+        let branchy = |name: &str| {
+            format!(
+                "export function {name}(value: number): number {{\n  if (value > 1) {{ return 1; }}\n  \
+                 if (value > 2) {{ return 2; }}\n  if (value > 3) {{ return 3; }}\n  return 0;\n}}\n"
+            )
+        };
+        std::fs::write(root.join("src/app.ts"), branchy("appBranchy")).expect("app");
+        std::fs::write(root.join("src/legacy.ts"), branchy("legacyBranchy")).expect("legacy");
+        std::fs::write(
+            root.join("src/index.ts"),
+            "export { appBranchy } from \"./app\";\nexport { legacyBranchy } from \"./legacy\";\n",
+        )
+        .expect("index");
+
+        let session = EditorAnalysisSession::load(root, None).expect("session loads");
+        let output = session
+            .analyze_project_with(&session.config().duplicates.clone(), true)
+            .expect("analysis runs");
+        let names = collect_inline_complexity(session.config(), &output.dead_code)
+            .into_iter()
+            .map(|finding| finding.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec!["appBranchy".to_string()],
+            "the override raises the ceilings for src/legacy.ts, as in `fallow health`"
         );
-    }
-
-    #[test]
-    fn build_health_ignore_set_matches_glob_patterns() {
-        let set =
-            build_health_ignore_set(&["**/*.test.ts".to_string(), "src/generated/**".to_string()])
-                .expect("valid patterns build a glob set");
-
-        assert!(set.is_match(Path::new("src/foo.test.ts")));
-        assert!(set.is_match(Path::new("src/generated/client.ts")));
-        assert!(!set.is_match(Path::new("src/app.ts")));
-    }
-
-    #[test]
-    fn build_health_ignore_set_skips_invalid_patterns() {
-        let result = build_health_ignore_set(&["[invalid-glob".to_string()]);
-
-        match result {
-            None => {}
-            Some(set) => assert!(
-                !set.is_match(Path::new("any/path.ts")),
-                "set built from only invalid patterns must not match anything"
-            ),
-        }
     }
 
     fn make_inline_finding(path: PathBuf) -> EditorInlineComplexityFinding {

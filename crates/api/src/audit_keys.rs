@@ -88,14 +88,6 @@ impl DeadCodeAuditLedger {
             .any(|record| record.introduced && record.effective_severity == Severity::Warn)
     }
 
-    /// Whether any current finding has effective error severity.
-    #[must_use]
-    pub fn has_errors(&self) -> bool {
-        self.records
-            .iter()
-            .any(|record| record.effective_severity == Severity::Error)
-    }
-
     /// Demote introduced findings that have no syntactic counterpart in the
     /// current head run to inherited (advisory) status.
     ///
@@ -867,8 +859,10 @@ struct FrameworkFindingSlices<'a> {
 /// `dead_code_keys`, `retain_introduced_dead_code`.
 /// Non-exhaustive siblings the compiler will NOT flag (wire manually when a
 /// finding type is added): `annotate_dead_code_json` (same key formats, this
-/// file) and the per-collection severity branches in
-/// `crates/cli/src/check/rules.rs` (`apply_rules`, `has_error_severity_issues`).
+/// file) and the per-collection `off` filter branches in
+/// `crates/engine/src/dead_code.rs` (`apply_rule_severities`). The severity of
+/// each record comes from the `RuleSeverity` table in
+/// `crates/engine/src/effective_severity.rs`, whose visitors are exhaustive.
 /// TypeScript mirror: `editors/vscode/scripts/codegen-contracts.mjs` derives
 /// backwards-compatible aliases from `fallow schema` `ts_alias` rows.
 pub fn dead_code_keys(
@@ -1093,6 +1087,52 @@ enum AuditCollection {
 }
 
 impl AuditCollection {
+    #[cfg(test)]
+    const ALL: [Self; 42] = [
+        Self::UnusedFiles,
+        Self::UnusedExports,
+        Self::UnusedTypes,
+        Self::PrivateTypeLeaks,
+        Self::UnusedDependencies,
+        Self::UnusedDevDependencies,
+        Self::UnusedOptionalDependencies,
+        Self::UnusedEnumMembers,
+        Self::UnusedClassMembers,
+        Self::UnusedStoreMembers,
+        Self::UnresolvedImports,
+        Self::UnlistedDependencies,
+        Self::DuplicateExports,
+        Self::TypeOnlyDependencies,
+        Self::TestOnlyDependencies,
+        Self::DevDependenciesInProduction,
+        Self::CircularDependencies,
+        Self::ReExportCycles,
+        Self::BoundaryViolations,
+        Self::BoundaryCoverageViolations,
+        Self::BoundaryCallViolations,
+        Self::PolicyViolations,
+        Self::StaleSuppressions,
+        Self::UnusedCatalogEntries,
+        Self::EmptyCatalogGroups,
+        Self::UnresolvedCatalogReferences,
+        Self::UnusedDependencyOverrides,
+        Self::MisconfiguredDependencyOverrides,
+        Self::InvalidClientExports,
+        Self::MixedClientServerBarrels,
+        Self::MisplacedDirectives,
+        Self::UnprovidedInjects,
+        Self::UnrenderedComponents,
+        Self::RouteCollisions,
+        Self::DynamicSegmentNameConflicts,
+        Self::UnusedComponentProps,
+        Self::UnusedComponentEmits,
+        Self::UnusedComponentInputs,
+        Self::UnusedComponentOutputs,
+        Self::UnusedSvelteEvents,
+        Self::UnusedServerActions,
+        Self::UnusedLoadDataKeys,
+    ];
+
     const fn json_key(self) -> &'static str {
         match self {
             Self::UnusedFiles => "unused_files",
@@ -1232,28 +1272,19 @@ impl<'a> DeadCodeKeyCollector<'a> {
         self.keys.insert(key);
     }
 
-    fn insert_file(
+    /// Insert a finding with the severity that the shared rule table gives
+    /// it. The exit code and the CI formats read the same table.
+    fn insert_rule(
         &mut self,
         collection: AuditCollection,
         key: String,
-        path: &Path,
-        severity: fn(&fallow_config::RulesConfig) -> Severity,
+        item: &impl fallow_engine::dead_code::RuleSeverity,
     ) {
         let effective = self.config.map_or(Severity::Off, |config| {
-            severity(&config.resolve_rules_for_path(path))
+            item.rule_severity(&fallow_engine::dead_code::SeveritySource::from_config(
+                config,
+            ))
         });
-        self.insert(collection, key, effective);
-    }
-
-    fn insert_project(
-        &mut self,
-        collection: AuditCollection,
-        key: String,
-        severity: fn(&fallow_config::RulesConfig) -> Severity,
-    ) {
-        let effective = self
-            .config
-            .map_or(Severity::Off, |config| severity(&config.rules));
         self.insert(collection, key, effective);
     }
 
@@ -1393,14 +1424,13 @@ impl<'a> DeadCodeKeyCollector<'a> {
 
     fn add_unused_files(&mut self, items: &[fallow_types::output_dead_code::UnusedFileFinding]) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnusedFiles,
                 format!(
                     "unused-file:{}",
                     relative_key_path(&item.file.path, self.root)
                 ),
-                &item.file.path,
-                |rules| rules.unused_files,
+                item,
             );
         }
     }
@@ -1410,30 +1440,28 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnusedExportFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnusedExports,
                 format!(
                     "unused-export:{}:{}",
                     relative_key_path(&item.export.path, self.root),
                     item.export.export_name
                 ),
-                &item.export.path,
-                |rules| rules.unused_exports,
+                item,
             );
         }
     }
 
     fn add_unused_types(&mut self, items: &[fallow_types::output_dead_code::UnusedTypeFinding]) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnusedTypes,
                 format!(
                     "unused-type:{}:{}",
                     relative_key_path(&item.export.path, self.root),
                     item.export.export_name
                 ),
-                &item.export.path,
-                |rules| rules.unused_types,
+                item,
             );
         }
     }
@@ -1443,7 +1471,7 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::PrivateTypeLeakFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::PrivateTypeLeaks,
                 format!(
                     "private-type-leak:{}:{}:{}",
@@ -1451,8 +1479,7 @@ impl<'a> DeadCodeKeyCollector<'a> {
                     item.leak.export_name,
                     item.leak.type_name
                 ),
-                &item.leak.path,
-                |rules| rules.private_type_leaks,
+                item,
             );
         }
     }
@@ -1462,11 +1489,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::InvalidClientExportFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::InvalidClientExports,
                 invalid_client_export_key(&item.export, self.root),
-                &item.export.path,
-                |rules| rules.invalid_client_export,
+                item,
             );
         }
     }
@@ -1476,11 +1502,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::MixedClientServerBarrelFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::MixedClientServerBarrels,
                 mixed_client_server_barrel_key(&item.barrel, self.root),
-                &item.barrel.path,
-                |rules| rules.mixed_client_server_barrel,
+                item,
             );
         }
     }
@@ -1490,11 +1515,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::MisplacedDirectiveFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::MisplacedDirectives,
                 misplaced_directive_key(&item.directive_site, self.root),
-                &item.directive_site.path,
-                |rules| rules.misplaced_directive,
+                item,
             );
         }
     }
@@ -1504,11 +1528,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnprovidedInjectFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnprovidedInjects,
                 unprovided_inject_key(&item.inject, self.root),
-                &item.inject.path,
-                |rules| rules.unprovided_injects,
+                item,
             );
         }
     }
@@ -1518,11 +1541,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnrenderedComponentFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnrenderedComponents,
                 unrendered_component_key(&item.component, self.root),
-                &item.component.path,
-                |rules| rules.unrendered_components,
+                item,
             );
         }
     }
@@ -1532,11 +1554,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnusedComponentPropFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnusedComponentProps,
                 unused_component_prop_key(&item.prop, self.root),
-                &item.prop.path,
-                |rules| rules.unused_component_props,
+                item,
             );
         }
     }
@@ -1546,11 +1567,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnusedComponentEmitFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnusedComponentEmits,
                 unused_component_emit_key(&item.emit, self.root),
-                &item.emit.path,
-                |rules| rules.unused_component_emits,
+                item,
             );
         }
     }
@@ -1560,11 +1580,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnusedComponentInputFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnusedComponentInputs,
                 unused_component_input_key(&item.input, self.root),
-                &item.input.path,
-                |rules| rules.unused_component_inputs,
+                item,
             );
         }
     }
@@ -1574,11 +1593,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnusedComponentOutputFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnusedComponentOutputs,
                 unused_component_output_key(&item.output, self.root),
-                &item.output.path,
-                |rules| rules.unused_component_outputs,
+                item,
             );
         }
     }
@@ -1588,11 +1606,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnusedSvelteEventFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnusedSvelteEvents,
                 unused_svelte_event_key(&item.event, self.root),
-                &item.event.path,
-                |rules| rules.unused_svelte_events,
+                item,
             );
         }
     }
@@ -1602,11 +1619,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnusedServerActionFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnusedServerActions,
                 unused_server_action_key(&item.action, self.root),
-                &item.action.path,
-                |rules| rules.unused_server_actions,
+                item,
             );
         }
     }
@@ -1616,11 +1632,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnusedLoadDataKeyFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnusedLoadDataKeys,
                 unused_load_data_key_key(&item.key, self.root),
-                &item.key.path,
-                |rules| rules.unused_load_data_keys,
+                item,
             );
         }
     }
@@ -1630,11 +1645,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::RouteCollisionFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::RouteCollisions,
                 route_collision_key(&item.collision, self.root),
-                &item.collision.path,
-                |rules| rules.route_collision,
+                item,
             );
         }
     }
@@ -1644,11 +1658,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::DynamicSegmentNameConflictFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::DynamicSegmentNameConflicts,
                 dynamic_segment_name_conflict_key(&item.conflict, self.root),
-                &item.conflict.path,
-                |rules| rules.dynamic_segment_name_conflict,
+                item,
             );
         }
     }
@@ -1658,10 +1671,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnusedDependencyFinding],
     ) {
         for item in items {
-            self.insert_project(
+            self.insert_rule(
                 AuditCollection::UnusedDependencies,
                 unused_dependency_key(&item.dep, self.root),
-                |rules| rules.unused_dependencies,
+                item,
             );
         }
     }
@@ -1671,10 +1684,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnusedDevDependencyFinding],
     ) {
         for item in items {
-            self.insert_project(
+            self.insert_rule(
                 AuditCollection::UnusedDevDependencies,
                 unused_dependency_key(&item.dep, self.root),
-                |rules| rules.unused_dev_dependencies,
+                item,
             );
         }
     }
@@ -1684,10 +1697,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnusedOptionalDependencyFinding],
     ) {
         for item in items {
-            self.insert_project(
+            self.insert_rule(
                 AuditCollection::UnusedOptionalDependencies,
                 unused_dependency_key(&item.dep, self.root),
-                |rules| rules.unused_optional_dependencies,
+                item,
             );
         }
     }
@@ -1697,11 +1710,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnusedEnumMemberFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnusedEnumMembers,
                 unused_member_key("unused-enum-member", &item.member, self.root),
-                &item.member.path,
-                |rules| rules.unused_enum_members,
+                item,
             );
         }
     }
@@ -1711,11 +1723,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnusedClassMemberFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnusedClassMembers,
                 unused_member_key("unused-class-member", &item.member, self.root),
-                &item.member.path,
-                |rules| rules.unused_class_members,
+                item,
             );
         }
     }
@@ -1725,11 +1736,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnusedStoreMemberFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnusedStoreMembers,
                 unused_member_key("unused-store-member", &item.member, self.root),
-                &item.member.path,
-                |rules| rules.unused_store_members,
+                item,
             );
         }
     }
@@ -1739,15 +1749,14 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnresolvedImportFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnresolvedImports,
                 format!(
                     "unresolved-import:{}:{}",
                     relative_key_path(&item.import.path, self.root),
                     item.import.specifier
                 ),
-                &item.import.path,
-                |rules| rules.unresolved_imports,
+                item,
             );
         }
     }
@@ -1757,10 +1766,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnlistedDependencyFinding],
     ) {
         for item in items {
-            self.insert_project(
+            self.insert_rule(
                 AuditCollection::UnlistedDependencies,
                 unlisted_dependency_key(&item.dep, self.root),
-                |rules| rules.unlisted_dependencies,
+                item,
             );
         }
     }
@@ -1770,10 +1779,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::DuplicateExportFinding],
     ) {
         for item in items {
-            self.insert_project(
+            self.insert_rule(
                 AuditCollection::DuplicateExports,
                 duplicate_export_key(item, self.root),
-                |rules| rules.duplicate_exports,
+                item,
             );
         }
     }
@@ -1783,14 +1792,14 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::TypeOnlyDependencyFinding],
     ) {
         for item in items {
-            self.insert_project(
+            self.insert_rule(
                 AuditCollection::TypeOnlyDependencies,
                 format!(
                     "type-only-dependency:{}:{}",
                     relative_key_path(&item.dep.path, self.root),
                     item.dep.package_name
                 ),
-                |rules| rules.type_only_dependencies,
+                item,
             );
         }
     }
@@ -1800,14 +1809,14 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::TestOnlyDependencyFinding],
     ) {
         for item in items {
-            self.insert_project(
+            self.insert_rule(
                 AuditCollection::TestOnlyDependencies,
                 format!(
                     "test-only-dependency:{}:{}",
                     relative_key_path(&item.dep.path, self.root),
                     item.dep.package_name
                 ),
-                |rules| rules.test_only_dependencies,
+                item,
             );
         }
     }
@@ -1817,14 +1826,14 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::DevDependencyInProductionFinding],
     ) {
         for item in items {
-            self.insert_project(
+            self.insert_rule(
                 AuditCollection::DevDependenciesInProduction,
                 format!(
                     "dev-dependency-in-production:{}:{}",
                     relative_key_path(&item.dep.path, self.root),
                     item.dep.package_name
                 ),
-                |rules| rules.dev_dependencies_in_production,
+                item,
             );
         }
     }
@@ -1834,21 +1843,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::CircularDependencyFinding],
     ) {
         for item in items {
-            let severity = self.config.map_or(Severity::Off, |config| {
-                item.cycle
-                    .files
-                    .iter()
-                    .fold(Severity::Off, |current, path| {
-                        merge_severity(
-                            current,
-                            config.resolve_rules_for_path(path).circular_dependencies,
-                        )
-                    })
-            });
-            self.insert(
+            self.insert_rule(
                 AuditCollection::CircularDependencies,
                 circular_dependency_key(item, self.root),
-                severity,
+                item,
             );
         }
     }
@@ -1858,10 +1856,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::ReExportCycleFinding],
     ) {
         for item in items {
-            self.insert_project(
+            self.insert_rule(
                 AuditCollection::ReExportCycles,
                 re_export_cycle_key(item, self.root),
-                |rules| rules.re_export_cycle,
+                item,
             );
         }
     }
@@ -1871,11 +1869,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::BoundaryViolationFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::BoundaryViolations,
                 boundary_violation_key(item, self.root),
-                &item.violation.from_path,
-                |rules| rules.boundary_violation,
+                item,
             );
         }
     }
@@ -1885,11 +1882,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::BoundaryCoverageViolationFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::BoundaryCoverageViolations,
                 boundary_coverage_key(item, self.root),
-                &item.violation.path,
-                |rules| rules.boundary_violation,
+                item,
             );
         }
     }
@@ -1899,11 +1895,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::BoundaryCallViolationFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::BoundaryCallViolations,
                 boundary_call_key(item, self.root),
-                &item.violation.path,
-                |rules| rules.boundary_violation,
+                item,
             );
         }
     }
@@ -1913,32 +1908,20 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::PolicyViolationFinding],
     ) {
         for item in items {
-            let severity = match item.violation.severity {
-                fallow_types::results::PolicyViolationSeverity::Error => Severity::Error,
-                fallow_types::results::PolicyViolationSeverity::Warn => Severity::Warn,
-            };
-            self.insert(
+            self.insert_rule(
                 AuditCollection::PolicyViolations,
                 policy_violation_key(item, self.root),
-                severity,
+                item,
             );
         }
     }
 
     fn add_stale_suppressions(&mut self, items: &[fallow_types::results::StaleSuppression]) {
         for item in items {
-            let effective = self.config.map_or(Severity::Off, |config| {
-                let rules = config.resolve_rules_for_path(&item.path);
-                if item.missing_reason {
-                    rules.require_suppression_reason
-                } else {
-                    rules.stale_suppressions
-                }
-            });
-            self.insert(
+            self.insert_rule(
                 AuditCollection::StaleSuppressions,
                 stale_suppression_key(item, self.root),
-                effective,
+                item,
             );
         }
     }
@@ -1948,11 +1931,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnresolvedCatalogReferenceFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnresolvedCatalogReferences,
                 unresolved_catalog_reference_key(item, self.root),
-                &item.reference.path,
-                |rules| rules.unresolved_catalog_references,
+                item,
             );
         }
     }
@@ -1962,10 +1944,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnusedCatalogEntryFinding],
     ) {
         for item in items {
-            self.insert_project(
+            self.insert_rule(
                 AuditCollection::UnusedCatalogEntries,
                 unused_catalog_entry_key(&item.entry, self.root),
-                |rules| rules.unused_catalog_entries,
+                item,
             );
         }
     }
@@ -1975,11 +1957,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::EmptyCatalogGroupFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::EmptyCatalogGroups,
                 empty_catalog_group_key(&item.group, self.root),
-                &item.group.path,
-                |rules| rules.empty_catalog_groups,
+                item,
             );
         }
     }
@@ -1989,11 +1970,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::UnusedDependencyOverrideFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::UnusedDependencyOverrides,
                 unused_dependency_override_key(item, self.root),
-                &item.entry.path,
-                |rules| rules.unused_dependency_overrides,
+                item,
             );
         }
     }
@@ -2003,21 +1983,12 @@ impl<'a> DeadCodeKeyCollector<'a> {
         items: &[fallow_types::output_dead_code::MisconfiguredDependencyOverrideFinding],
     ) {
         for item in items {
-            self.insert_file(
+            self.insert_rule(
                 AuditCollection::MisconfiguredDependencyOverrides,
                 misconfigured_dependency_override_key(item, self.root),
-                &item.entry.path,
-                |rules| rules.misconfigured_dependency_overrides,
+                item,
             );
         }
-    }
-}
-
-const fn merge_severity(left: Severity, right: Severity) -> Severity {
-    match (left, right) {
-        (Severity::Error, _) | (_, Severity::Error) => Severity::Error,
-        (Severity::Warn, _) | (_, Severity::Warn) => Severity::Warn,
-        (Severity::Off, Severity::Off) => Severity::Off,
     }
 }
 
@@ -2036,8 +2007,10 @@ const fn merge_severity(left: Severity, right: Severity) -> Severity {
 /// `dead_code_keys`, `retain_introduced_dead_code`.
 /// Non-exhaustive siblings the compiler will NOT flag (wire manually when a
 /// finding type is added): `annotate_dead_code_json` (same key formats, this
-/// file) and the per-collection severity branches in
-/// `crates/cli/src/check/rules.rs` (`apply_rules`, `has_error_severity_issues`).
+/// file) and the per-collection `off` filter branches in
+/// `crates/engine/src/dead_code.rs` (`apply_rule_severities`). The severity of
+/// each record comes from the `RuleSeverity` table in
+/// `crates/engine/src/effective_severity.rs`, whose visitors are exhaustive.
 /// TypeScript mirror: `editors/vscode/scripts/codegen-contracts.mjs` derives
 /// backwards-compatible aliases from `fallow schema` `ts_alias` rows.
 #[expect(
@@ -3429,9 +3402,7 @@ mod tests {
         assert!(keys.contains("duplicate-export:Button:src/a.ts|src/b.ts"));
     }
 
-    #[test]
-    fn dead_code_keys_cover_type_member_and_dependency_variants() {
-        let root = root();
+    fn type_member_and_dependency_results(root: &Path) -> AnalysisResults {
         let source = root.join("src/types.ts");
         let package_json = root.join("package.json");
         let mut results = AnalysisResults::default();
@@ -3515,6 +3486,14 @@ mod tests {
                     line: 13,
                 },
             ));
+
+        results
+    }
+
+    #[test]
+    fn dead_code_keys_cover_type_member_and_dependency_variants() {
+        let root = root();
+        let results = type_member_and_dependency_results(&root);
 
         let keys = dead_code_keys(&results, &root);
 
@@ -3747,9 +3726,7 @@ mod tests {
 
     // --- key-building coverage for lines 68-177 (framework-specific key fns) ---
 
-    #[test]
-    fn dead_code_keys_cover_framework_inject_and_render_variants() {
-        let root = root();
+    fn framework_inject_and_render_results(root: &Path) -> AnalysisResults {
         let src = root.join("src/App.vue");
         let mut results = AnalysisResults::default();
         results
@@ -3805,6 +3782,14 @@ mod tests {
                 col: 0,
             }));
 
+        results
+    }
+
+    #[test]
+    fn dead_code_keys_cover_framework_inject_and_render_variants() {
+        let root = root();
+        let results = framework_inject_and_render_results(&root);
+
         let keys = dead_code_keys(&results, &root);
 
         assert!(keys.contains("unprovided-inject:src/App.vue:userStore"));
@@ -3814,9 +3799,7 @@ mod tests {
         assert!(keys.contains("unused-svelte-event:src/Counter.svelte:increment"));
     }
 
-    #[test]
-    fn dead_code_keys_cover_server_action_load_data_and_route_variants() {
-        let root = root();
+    fn server_action_load_data_and_route_results(root: &Path) -> AnalysisResults {
         let actions_file = root.join("src/actions/submit.ts");
         let page_file = root.join("src/routes/blog/+page.server.ts");
         let route_file = root.join("app/(auth)/login/page.tsx");
@@ -3861,6 +3844,14 @@ mod tests {
             }),
         );
 
+        results
+    }
+
+    #[test]
+    fn dead_code_keys_cover_server_action_load_data_and_route_variants() {
+        let root = root();
+        let results = server_action_load_data_and_route_results(&root);
+
         let keys = dead_code_keys(&results, &root);
 
         assert!(keys.contains("unused-server-action:src/actions/submit.ts:submitForm"));
@@ -3869,9 +3860,7 @@ mod tests {
         assert!(keys.contains("dynamic-segment-name-conflict:app/(auth)/login/page.tsx:/shop"));
     }
 
-    #[test]
-    fn dead_code_keys_cover_angular_input_output_and_policy_variants() {
-        let root = root();
+    fn angular_input_output_and_policy_results(root: &Path) -> AnalysisResults {
         let component = root.join("src/app/card.component.ts");
         let src = root.join("src/utils.ts");
         let mut results = AnalysisResults::default();
@@ -3911,6 +3900,14 @@ mod tests {
                 message: None,
             }));
 
+        results
+    }
+
+    #[test]
+    fn dead_code_keys_cover_angular_input_output_and_policy_variants() {
+        let root = root();
+        let results = angular_input_output_and_policy_results(&root);
+
         let keys = dead_code_keys(&results, &root);
 
         assert!(keys.contains("unused-component-input:src/app/card.component.ts:label"));
@@ -3937,9 +3934,7 @@ mod tests {
         assert!(keys.contains("re-export-cycle:multi-node:src/a.ts|src/b.ts"));
     }
 
-    #[test]
-    fn dead_code_keys_cover_unused_store_member() {
-        let root = root();
+    fn unused_store_member_results(root: &Path) -> AnalysisResults {
         let src = root.join("src/store.ts");
         let mut results = AnalysisResults::default();
         results
@@ -3952,6 +3947,14 @@ mod tests {
                 line: 42,
                 col: 2,
             }));
+
+        results
+    }
+
+    #[test]
+    fn dead_code_keys_cover_unused_store_member() {
+        let root = root();
+        let results = unused_store_member_results(&root);
 
         let keys = dead_code_keys(&results, &root);
 
@@ -4821,5 +4824,179 @@ mod tests {
             std::iter::once("unused-export:src/utils.ts:helper".to_string()).collect();
 
         assert_eq!(remap_keys_for_renames(&keys, &renames), keys);
+    }
+
+    /// One finding in each collection that no other fixture fills.
+    fn production_and_directive_results(root: &Path) -> AnalysisResults {
+        let page = root.join("src/app.ts");
+        let mut results = AnalysisResults::default();
+        results.dev_dependencies_in_production.push(
+            DevDependencyInProductionFinding::with_actions(DevDependencyInProduction {
+                package_name: "vite".to_string(),
+                path: root.join("package.json"),
+                line: 14,
+            }),
+        );
+        results
+            .invalid_client_exports
+            .push(InvalidClientExportFinding::with_actions(
+                InvalidClientExport {
+                    path: page.clone(),
+                    export_name: "config".to_string(),
+                    directive: "use client".to_string(),
+                    line: 3,
+                    col: 0,
+                },
+            ));
+        results
+            .mixed_client_server_barrels
+            .push(MixedClientServerBarrelFinding::with_actions(
+                MixedClientServerBarrel {
+                    path: page.clone(),
+                    client_origin: "./client".to_string(),
+                    server_origin: "./server".to_string(),
+                    line: 1,
+                    col: 0,
+                },
+            ));
+        results
+            .misplaced_directives
+            .push(MisplacedDirectiveFinding::with_actions(
+                MisplacedDirective {
+                    path: page,
+                    directive: "use server".to_string(),
+                    line: 5,
+                    col: 2,
+                },
+            ));
+        results
+    }
+
+    /// Every finding of the fixtures, each as its own result set, so a
+    /// disagreement names one collection.
+    fn isolated_findings(fixtures: &[AnalysisResults]) -> Vec<(String, AnalysisResults)> {
+        let mut isolated = Vec::new();
+        for fixture in fixtures {
+            let value = serde_json::to_value(fixture).expect("results serialize");
+            let object = value.as_object().expect("results serialize as an object");
+            for (collection, items) in object {
+                let Some(items) = items.as_array() else {
+                    continue;
+                };
+                for item in items {
+                    let mut single = serde_json::to_value(AnalysisResults::default())
+                        .expect("empty results serialize");
+                    single[collection.as_str()] = serde_json::Value::Array(vec![item.clone()]);
+                    let results = serde_json::from_value(single)
+                        .unwrap_or_else(|error| panic!("{collection} round-trips: {error}"));
+                    isolated.push((collection.clone(), results));
+                }
+            }
+        }
+        isolated
+    }
+
+    /// A config that sets every rule by `base` and, for the files of the
+    /// fixtures that an `overrides` entry matches, by `scoped`. Each pair
+    /// gives the severity of the rules at an even and at an odd position, so
+    /// a finding that reads the rule of another kind shows as a difference.
+    fn every_rule_config(
+        base: [&str; 2],
+        scoped: Option<[&str; 2]>,
+    ) -> fallow_config::ResolvedConfig {
+        let every_rule = |severities: [&str; 2]| {
+            let rules = serde_json::to_value(fallow_config::RulesConfig::default())
+                .expect("rules serialize");
+            let names = rules
+                .as_object()
+                .expect("rules serialize as an object")
+                .keys();
+            serde_json::Value::Object(
+                names
+                    .enumerate()
+                    .map(|(index, name)| (name.clone(), json!(severities[index % 2])))
+                    .collect(),
+            )
+        };
+        let mut config = json!({ "rules": every_rule(base) });
+        if let Some(scoped) = scoped {
+            config["overrides"] = json!([{
+                "files": [
+                    "package.json",
+                    "pnpm-workspace.yaml",
+                    "src/app.ts",
+                    "src/page.ts",
+                    "src/types.ts",
+                    "src/App.vue",
+                    "src/actions/**",
+                    "app/**",
+                    "src/app/**",
+                    "src/store.ts"
+                ],
+                "rules": every_rule(scoped)
+            }]);
+        }
+        let config: FallowConfig = serde_json::from_value(config).expect("config");
+        config.resolve(root(), OutputFormat::Json, 1, false, true, None)
+    }
+
+    /// The audit ledger and the exit-code rule resolve severity in two
+    /// places. With every finding introduced, the ledger must report an
+    /// error exactly when `has_error_severity_issues` does, for every
+    /// collection, with and without `overrides`.
+    #[test]
+    fn audit_ledger_errors_match_the_exit_code_rule_for_every_collection() {
+        let root = root();
+        let findings = isolated_findings(&[
+            sample_results(&root),
+            graph_boundary_catalog_override_results(&root),
+            type_member_and_dependency_results(&root),
+            framework_inject_and_render_results(&root),
+            server_action_load_data_and_route_results(&root),
+            angular_input_output_and_policy_results(&root),
+            unused_store_member_results(&root),
+            production_and_directive_results(&root),
+        ]);
+        let empty_base = FxHashSet::default();
+        let mut covered = std::collections::BTreeSet::new();
+        let mut mismatches = Vec::new();
+        for (base, scoped) in [
+            (["error", "error"], None),
+            (["warn", "warn"], None),
+            (["error", "warn"], None),
+            (["error", "error"], Some(["warn", "warn"])),
+            (["warn", "warn"], Some(["error", "error"])),
+            (["off", "off"], Some(["error", "error"])),
+            (["error", "warn"], Some(["warn", "error"])),
+            (["warn", "error"], Some(["error", "warn"])),
+        ] {
+            let config = every_rule_config(base, scoped);
+            for (collection, results) in &findings {
+                let ledger = dead_code_audit_ledger(results, &root, &config, Some(&empty_base));
+                covered.extend(ledger.records().iter().map(|record| record.collection));
+                let exit_rule = fallow_engine::error_severity::has_error_severity_issues(
+                    results,
+                    &config.rules,
+                    Some(&config),
+                    false,
+                );
+                if ledger.has_introduced_errors() != exit_rule {
+                    mismatches.push(format!(
+                        "{collection} (rules {base:?}, overrides {scoped:?}): ledger {}, exit rule {exit_rule}",
+                        ledger.has_introduced_errors()
+                    ));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+        let missing: Vec<&str> = super::AuditCollection::ALL
+            .iter()
+            .map(|collection| collection.json_key())
+            .filter(|key| !covered.contains(key))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the fixtures hold no finding in {missing:?}"
+        );
     }
 }
