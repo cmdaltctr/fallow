@@ -409,7 +409,7 @@ struct Cli {
 
     /// Save the current results as a baseline file. Used by bare `fallow`,
     /// `dead-code`, `dupes` and `health`; other subcommands reject it. The path
-    /// must resolve inside the project root, its Git work tree or a temp directory
+    /// must resolve inside the project root, its Git work tree, the CI workspace or a temp directory
     #[arg(hide_short_help = true, long, global = true)]
     save_baseline: Option<PathBuf>,
 
@@ -481,13 +481,18 @@ struct Cli {
     #[arg(hide_short_help = true, long, global = true)]
     fail_on_issues: bool,
 
-    /// Write SARIF output to a file (in addition to the primary --format output)
+    /// Write SARIF output to a file (in addition to the primary --format output).
+    /// Used by bare `fallow`, `dead-code` and `security`. The path must resolve
+    /// inside the project root, its Git work tree, the CI workspace or a temp
+    /// directory
     #[arg(hide_short_help = true, long, global = true, value_name = "PATH")]
     sarif_file: Option<PathBuf>,
 
     /// Write the report to a file instead of stdout, for any --format (no ANSI
     /// codes). Useful on large projects where the terminal scrollback truncates
-    /// the top. Progress and the confirmation stay on stderr.
+    /// the top. Progress and the confirmation stay on stderr. The path must
+    /// resolve inside the project root, its Git work tree, the CI workspace or
+    /// a temp directory.
     #[arg(short = 'o', long, global = true, value_name = "PATH")]
     output_file: Option<PathBuf>,
 
@@ -558,7 +563,7 @@ struct Cli {
     /// Save the current issue counts as a regression baseline. Omit PATH to
     /// update regression.baseline in the discovered fallow config, or create
     /// .fallowrc.json when none exists. Provide PATH to write a standalone file;
-    /// PATH must resolve inside the project root, its Git work tree or a temp directory.
+    /// PATH must resolve inside the project root, its Git work tree, the CI workspace or a temp directory.
     #[expect(
         clippy::option_option,
         reason = "clap pattern: None=not passed, Some(None)=flag only (write to config), Some(Some(path))=write to file"
@@ -631,7 +636,7 @@ struct Cli {
 
     /// Save a vital signs snapshot for trend tracking in combined mode.
     /// Provide a path or omit for the default `.fallow/snapshots/` location.
-    /// A given path must resolve inside the project root, its Git work tree or a temp directory.
+    /// A given path must resolve inside the project root, its Git work tree, the CI workspace or a temp directory.
     #[expect(
         clippy::option_option,
         reason = "clap pattern: None=not passed, Some(None)=default path, Some(Some(path))=custom path"
@@ -1442,7 +1447,7 @@ enum Command {
 
         /// Save a vital signs snapshot for trend tracking.
         /// Defaults to `.fallow/snapshots/{timestamp}.json` if no path is given.
-        /// A given path must resolve inside the project root, its Git work tree or a temp directory.
+        /// A given path must resolve inside the project root, its Git work tree, the CI workspace or a temp directory.
         /// Forces file-scores, hotspot, and score computation for complete metrics.
         #[expect(
             clippy::option_option,
@@ -3039,25 +3044,23 @@ fn redirect_report_to_file(
     path: &std::path::Path,
     output: fallow_config::OutputFormat,
 ) -> Result<(), ExitCode> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        return Err(emit_error(
-            &format!(
-                "failed to create {} for --output-file: {e}",
-                parent.display()
-            ),
-            2,
-            output,
-        ));
-    }
-    match std::fs::File::create(path) {
+    match fallow_engine::write_guard::create_file(
+        path,
+        fallow_engine::write_guard::WriteTarget::Path,
+    ) {
         Ok(file) => {
             report::sink::set_file_sink(file);
             colored::control::set_override(false);
             Ok(())
         }
+        Err(e) if e.is_directory() => Err(emit_error(
+            &format!(
+                "failed to create the directory of {} for --output-file: {e}",
+                path.display()
+            ),
+            2,
+            output,
+        )),
         Err(e) => Err(emit_error(
             &format!("failed to open {} for --output-file: {e}", path.display()),
             2,
@@ -3155,6 +3158,11 @@ pub fn run() -> ExitCode {
             Ok(tolerance) => tolerance,
             Err(code) => return code,
         };
+
+    if let Some(note) = write_scope::default_cache_dir_note(&cli, &root) {
+        eprintln!("{note}");
+        cli.no_cache = true;
+    }
 
     let (save_regression_file, save_to_config) = regression_save_targets(&cli);
 

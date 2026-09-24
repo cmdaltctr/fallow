@@ -435,6 +435,8 @@ These are documented for the rare CI script that depended on the old behavior. N
   - the project root,
   - the Git work tree that contains the root, but only when the working
     directory is inside that work tree too,
+  - `GITHUB_WORKSPACE` and GitLab `CI_PROJECT_DIR`, when they are set
+    (added later, see the CI workspace entry below),
   - `RUNNER_TEMP`, when it is set,
   - the system temp directory.
 
@@ -460,9 +462,52 @@ These are documented for the rare CI script that depended on the old behavior. N
   `--root packages/app`, and it keeps a Git repository at `$HOME` from
   allowing every home path to a run started outside it. The temp directories
   keep a CI job working that saves into `${{ runner.temp }}`. The check runs
-  before the analysis, so a file system change during the run is not seen,
-  and the analysis cache in `.fallow` is not checked. Read paths do not
-  change. No envelope field changes, and no `schema_version` moves.
+  before the analysis, and each write checks the resolved path again right
+  before it happens (see the next entry). Read paths do not change. No
+  envelope field changes, and no `schema_version` moves.
+
+- **Report files follow the save-path rule, and the cache stays in the
+  project.** `--output-file` and `--sarif-file` now exit 2 with an error
+  document, before the analysis runs, when the file resolves outside the
+  directories that the save flags allow. Before, they wrote wherever the path
+  pointed. An existing character device or named pipe is still allowed for
+  every save and report flag, because a write to it cannot create a file:
+  `-o /dev/null` and process substitution keep working, and
+  `--sarif-file /dev/stdout` (which resolves to `/dev/fd/N`) keeps working
+  when stdout is a pipe or a terminal. When stdout is redirected to a regular
+  file, `/dev/stdout` resolves to that file (on macOS and on Linux), and the
+  directory rule applies to it: a file outside the allowed directories is
+  rejected. The device or pipe is opened without following a symlink, and
+  the opened handle must still be a device or a pipe. Every save or report
+  write now resolves the path again right before the write and fails when it
+  is outside those directories. The write does not follow a symlink at the
+  final component (on Unix the open call refuses the link; elsewhere the path
+  is checked just before the open), and it fails when a parent directory
+  changed while fallow created the missing ones. This narrows the window for
+  a path component that another local user swaps for a symlink, from the
+  whole analysis to the moment of the write. It does not remove the window:
+  an intermediate directory swapped between the last parent check and the
+  open is still followed, and on Windows the final check and the open are two
+  steps. When the default cache directory `<root>/.fallow` resolves outside
+  these directories, for example through a committed symlink, the run does
+  not use the cache and prints one note on stderr. The run does not fail.
+  `FALLOW_CACHE_DIR`, `cache.dir` and `--no-cache` keep their meaning. No
+  envelope field changes, and no `schema_version` moves.
+
+- **The CI workspace is an allowed write directory.** Besides the project
+  root, its Git work tree, `RUNNER_TEMP` and the system temp directory, the
+  save and report flags may write into `GITHUB_WORKSPACE` and GitLab
+  `CI_PROJECT_DIR` when they are set. Both are resolved before the compare,
+  the same as `RUNNER_TEMP`. This keeps the GitHub Action layout working
+  where `actions/checkout` uses `path: app` and the Action uses `root: app`:
+  the job runs from the workspace, which is outside the Git work tree of the
+  root, and writes `fallow-results.sarif` and a relative `save-baseline`
+  there.
+
+- **`dupes` and `health` reject `--sarif-file`.** Both accepted the flag and
+  wrote no SARIF file. They now exit 2 with an error document that points to
+  `--format sarif --output-file`, the same as the baseline flags on a
+  subcommand without a baseline.
 
 - **Subcommands without a baseline reject the global baseline flags.**
   `--baseline` and `--save-baseline` are global flags, so every subcommand

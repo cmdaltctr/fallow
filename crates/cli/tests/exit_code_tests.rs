@@ -1298,7 +1298,7 @@ fn system_tmp(case: &std::path::Path) -> std::path::PathBuf {
 
 /// Run fallow from `cwd`, so a relative path resolves the way a user types it.
 /// The child sees `<case>/system-tmp` as its temp directory and no
-/// `RUNNER_TEMP`, unless `env` sets it.
+/// `RUNNER_TEMP`, `GITHUB_WORKSPACE` or `CI_PROJECT_DIR`, unless `env` sets it.
 fn run_fallow_from(
     case: &std::path::Path,
     cwd: &std::path::Path,
@@ -1321,7 +1321,9 @@ fn run_fallow_from_env(
         .env("TMPDIR", &tmp)
         .env("TMP", &tmp)
         .env("TEMP", &tmp)
-        .env_remove("RUNNER_TEMP");
+        .env_remove("RUNNER_TEMP")
+        .env_remove("GITHUB_WORKSPACE")
+        .env_remove("CI_PROJECT_DIR");
     common::scrub_coverage_env(&mut cmd);
     for (key, value) in env {
         cmd.env(key, value);
@@ -1766,4 +1768,311 @@ fn a_discovered_config_symlink_outside_stays_rejected_from_outside_the_work_tree
     );
     assert_eq!(output.code, 2, "{}", output.stdout);
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "{}\n");
+}
+
+/// The report file flags, each with a subcommand that writes it.
+const OUTPUT_FLAGS: [(&str, &str); 4] = [
+    ("dead-code", "--output-file"),
+    ("dead-code", "--sarif-file"),
+    ("security", "--sarif-file"),
+    ("health", "--output-file"),
+];
+
+/// A report file outside the project root fails with exit 2 before any work,
+/// the same as a save path.
+#[test]
+fn output_files_outside_the_project_root_are_rejected() {
+    let (dir, root) = write_confinement_project();
+    let absolute = dir.path().join("absolute-report.json");
+    for (command, flag) in OUTPUT_FLAGS {
+        for target in ["../outside-report.json", absolute.to_str().unwrap()] {
+            let output = run_fallow_from(
+                dir.path(),
+                &root,
+                &[command, flag, target, "--format", "json", "--quiet"],
+            );
+            assert_eq!(
+                output.code, 2,
+                "{command} {flag} {target} should exit 2. stdout: {} stderr: {}",
+                output.stdout, output.stderr
+            );
+            let doc = parse_json(&output);
+            let message = doc["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(flag) && message.contains("outside the project root"),
+                "{command} {flag} {target}: {message}"
+            );
+        }
+        assert!(
+            !dir.path().join("outside-report.json").exists(),
+            "{command} {flag}"
+        );
+        assert!(!absolute.exists(), "{command} {flag}");
+    }
+}
+
+/// A report file inside the project root or the temp directory keeps working.
+#[test]
+fn output_files_inside_the_project_or_temp_keep_working() {
+    let (dir, root) = write_confinement_project();
+    let tmp = system_tmp(dir.path());
+    for (command, flag) in OUTPUT_FLAGS {
+        let name = format!("{command}-{}.json", flag.trim_start_matches("--"));
+        let inside = format!("reports/{name}");
+        let in_temp = tmp.join(&name);
+        for target in [inside.as_str(), in_temp.to_str().unwrap()] {
+            let output = run_fallow_from(
+                dir.path(),
+                &root,
+                &[command, flag, target, "--format", "json", "--quiet"],
+            );
+            assert_ne!(
+                output.code, 2,
+                "{command} {flag} {target}: {}",
+                output.stdout
+            );
+        }
+        assert!(
+            root.join(&inside).is_file(),
+            "{command} {flag} writes {inside}"
+        );
+        assert!(
+            in_temp.is_file(),
+            "{command} {flag} writes into the temp dir"
+        );
+    }
+}
+
+/// A report file through a symlink inside the root that points outside it is
+/// rejected.
+#[cfg(unix)]
+#[test]
+fn output_files_through_a_symlink_that_leaves_the_root_are_rejected() {
+    let (dir, root) = write_confinement_project();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, root.join("link")).unwrap();
+    for (command, flag) in OUTPUT_FLAGS {
+        let output = run_fallow_from(
+            dir.path(),
+            &root,
+            &[
+                command,
+                flag,
+                "link/report.json",
+                "--format",
+                "json",
+                "--quiet",
+            ],
+        );
+        assert_eq!(output.code, 2, "{command} {flag}: {}", output.stderr);
+        assert!(!elsewhere.join("report.json").exists(), "{command} {flag}");
+    }
+}
+
+/// A committed `.fallow` symlink that points outside the project is not used
+/// for the cache. The run skips the cache, prints one note and succeeds.
+#[cfg(unix)]
+#[test]
+fn a_fallow_symlink_that_leaves_the_project_is_not_used_for_the_cache() {
+    let (dir, root) = write_confinement_project();
+    let elsewhere = dir.path().join("elsewhere-cache");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, root.join(".fallow")).unwrap();
+    for command in ["dead-code", "dupes", "health"] {
+        let output = run_fallow_from(dir.path(), &root, &[command, "--format", "json"]);
+        assert_ne!(output.code, 2, "{command}: {}", output.stderr);
+        let notes = output.stderr.matches("not used for the cache").count();
+        assert_eq!(notes, 1, "{command} prints one note: {}", output.stderr);
+        let written: Vec<_> = std::fs::read_dir(&elsewhere)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(
+            written.is_empty(),
+            "{command} must not write the cache outside the project: {written:?}"
+        );
+    }
+    let bare = run_fallow_from(dir.path(), &root, &["--format", "json"]);
+    assert_ne!(bare.code, 2, "{}", bare.stderr);
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+}
+
+/// A `.fallow` symlink that stays inside the project keeps the cache.
+#[cfg(unix)]
+#[test]
+fn a_fallow_symlink_inside_the_project_keeps_the_cache() {
+    let (dir, root) = write_confinement_project();
+    let inside = root.join("cache-dir");
+    std::fs::create_dir_all(&inside).unwrap();
+    std::os::unix::fs::symlink(&inside, root.join(".fallow")).unwrap();
+    let output = run_fallow_from(dir.path(), &root, &["dead-code", "--format", "json"]);
+    assert_ne!(output.code, 2, "{}", output.stderr);
+    assert!(
+        !output.stderr.contains("not used for the cache"),
+        "{}",
+        output.stderr
+    );
+    assert!(
+        std::fs::read_dir(&inside).unwrap().count() > 0,
+        "the cache is written through a link that stays inside the project"
+    );
+}
+
+/// A character device or a pipe cannot put a file outside the project, so a
+/// report or save flag may name one: `-o /dev/null`, `--sarif-file
+/// /dev/stdout` and process substitution are common CI forms.
+#[cfg(unix)]
+#[test]
+fn output_files_may_name_a_device() {
+    let (dir, root) = write_confinement_project();
+    for (command, flag) in OUTPUT_FLAGS {
+        let output = run_fallow_from(
+            dir.path(),
+            &root,
+            &[command, flag, "/dev/null", "--format", "json", "--quiet"],
+        );
+        assert_ne!(
+            output.code, 2,
+            "{command} {flag} /dev/null: {}",
+            output.stdout
+        );
+    }
+    let output = run_fallow_from(
+        dir.path(),
+        &root,
+        &[
+            "dead-code",
+            "--save-baseline",
+            "/dev/null",
+            "--format",
+            "json",
+            "--quiet",
+        ],
+    );
+    assert_ne!(
+        output.code, 2,
+        "--save-baseline /dev/null: {}",
+        output.stdout
+    );
+}
+
+/// A named pipe outside the project receives the report.
+#[cfg(unix)]
+#[test]
+fn output_files_may_name_a_fifo() {
+    let (dir, root) = write_confinement_project();
+    let fifo = dir.path().join("report.fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success());
+    let reader_path = fifo.clone();
+    let reader = std::thread::spawn(move || std::fs::read_to_string(reader_path));
+    let output = run_fallow_from(
+        dir.path(),
+        &root,
+        &[
+            "dead-code",
+            "--sarif-file",
+            fifo.to_str().unwrap(),
+            "--format",
+            "json",
+            "--quiet",
+        ],
+    );
+    assert_ne!(output.code, 2, "{} {}", output.stdout, output.stderr);
+    let received = reader.join().expect("reader").expect("read fifo");
+    assert!(
+        received.contains("\"runs\""),
+        "SARIF through the fifo: {received}"
+    );
+}
+
+/// The GitHub Action layout with `actions/checkout` `path: app` and the
+/// Action `root: app`: the job runs from `GITHUB_WORKSPACE`, outside the Git
+/// work tree of the root, and writes the SARIF file and a relative baseline
+/// there. `GITHUB_WORKSPACE` and GitLab `CI_PROJECT_DIR` are allowed
+/// directories, so this keeps working.
+#[test]
+fn the_ci_workspace_is_an_allowed_directory() {
+    for variable in ["GITHUB_WORKSPACE", "CI_PROJECT_DIR"] {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let workspace = dir.path().join("workspace");
+        let app = workspace.join("app");
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::write(app.join("package.json"), r#"{"name": "app"}"#).unwrap();
+        std::fs::write(app.join("src/index.ts"), "export const a = 1;\n").unwrap();
+        common::git(&app, &["init", "-q"]);
+        let args = [
+            "dead-code",
+            "--root",
+            "app",
+            "--sarif-file",
+            "fallow-results.sarif",
+            "--save-baseline",
+            "baseline.json",
+            "--format",
+            "json",
+            "--quiet",
+        ];
+
+        let without = run_fallow_from(dir.path(), &workspace, &args);
+        assert_eq!(without.code, 2, "{variable} unset: {}", without.stdout);
+
+        let with = run_fallow_from_env(dir.path(), &workspace, &args, &[(variable, &workspace)]);
+        assert_ne!(with.code, 2, "{variable}: {}", with.stdout);
+        assert!(
+            workspace.join("fallow-results.sarif").is_file(),
+            "{variable}"
+        );
+        assert!(workspace.join("baseline.json").is_file(), "{variable}");
+
+        let outside = run_fallow_from_env(
+            dir.path(),
+            &workspace,
+            &[
+                "dead-code",
+                "--root",
+                "app",
+                "--sarif-file",
+                "../outside.sarif",
+                "--format",
+                "json",
+                "--quiet",
+            ],
+            &[(variable, &workspace)],
+        );
+        assert_eq!(outside.code, 2, "{variable}: {}", outside.stdout);
+    }
+}
+
+/// `dupes` and `health` write no SARIF file, so `--sarif-file` is rejected
+/// instead of a silent run that writes nothing.
+#[test]
+fn dupes_and_health_reject_the_sarif_file_flag() {
+    let (dir, root) = write_confinement_project();
+    for command in ["dupes", "health"] {
+        let output = run_fallow_from(
+            dir.path(),
+            &root,
+            &[
+                command,
+                "--sarif-file",
+                "report.sarif",
+                "--format",
+                "json",
+                "--quiet",
+            ],
+        );
+        assert_eq!(output.code, 2, "{command}: {}", output.stdout);
+        let doc = parse_json(&output);
+        let message = doc["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("--sarif-file") && message.contains(command),
+            "{command}: {message}"
+        );
+        assert!(!root.join("report.sarif").exists(), "{command}");
+    }
 }
