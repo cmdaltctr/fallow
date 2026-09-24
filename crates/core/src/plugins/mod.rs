@@ -150,7 +150,7 @@ impl PluginConfigDiagnostic {
     }
 
     /// Build an advisory about a key whose effect the plugin does not model.
-    pub(super) fn not_modeled(
+    pub(crate) fn not_modeled(
         config_path: &Path,
         plugin: &str,
         key: &str,
@@ -1200,6 +1200,11 @@ pub trait Plugin: Send + Sync {
     /// plugins can scan the convention directories on the filesystem. The table is
     /// a function of which files exist on disk, so it is rebuilt every run and is
     /// never folded into per-file extraction caching. See issue #704.
+    ///
+    /// A rule with an empty `scope` is visible to the files under `root` only.
+    /// A plugin can set `scope` itself to make a rule visible to more roots.
+    /// After the plugin runs, a shared step links a Nuxt app and each layer
+    /// outside it in both directions. See issue #2752.
     fn auto_imports(&self, _root: &Path) -> Vec<AutoImportRule> {
         Vec::new()
     }

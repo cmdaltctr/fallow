@@ -1216,6 +1216,14 @@ fn restore_cached_resolved_project(
         input.files,
         resolved_project,
     )
+    .inspect(|project| {
+        record_unreadable_auto_import_reads(
+            project,
+            input.files,
+            input.plugin_result,
+            input.config,
+        );
+    })
     .ok_or_else(|| {
         // Same file-set drift the manifest reports, and equally routine: at
         // debug for the reason `CacheRejection::discarded_existing_work`
@@ -1592,7 +1600,51 @@ fn resolve_analysis_imports(
         workspaces,
         plugin_result,
     );
+    record_unreadable_auto_import_reads(&project, files, plugin_result, config);
     project
+}
+
+/// Record one `plugin-effect-not-modeled` diagnostic for each file that reads
+/// `#components` or `#imports` in a way the graph cannot narrow to names, such
+/// as a spread of a namespace import. The read credits every name of that
+/// module, so the run can miss unused convention files, and nothing else says
+/// so. Only a run with `autoImports` on drops the convention entry patterns, so
+/// only that run records it. See issue #2752.
+///
+/// The plugin stage replaces every plugin-stage diagnostic at the start of the
+/// run, so an append here cannot leave a stale entry. The input is the resolved
+/// project, which a warm graph cache restores, so a warm run records the same
+/// entries as a cold one.
+fn record_unreadable_auto_import_reads(
+    project: &resolve::ResolvedProject,
+    files: &[discover::DiscoveredFile],
+    plugin_result: &plugins::AggregatedPluginResult,
+    config: &ResolvedConfig,
+) {
+    if !config.auto_imports
+        || plugin_result.auto_imports.is_empty()
+        || !plugin_result
+            .active_plugins
+            .iter()
+            .any(|name| name == "nuxt")
+    {
+        return;
+    }
+    let diagnostics: Vec<fallow_config::WorkspaceDiagnostic> =
+        resolve::unreadable_auto_import_reads(&project.modules)
+            .into_iter()
+            .filter_map(|read| {
+                let file = files.get(read.file_id.0 as usize)?;
+                let diagnostic = plugins::PluginConfigDiagnostic::not_modeled(
+                    &file.path,
+                    "nuxt",
+                    read.module,
+                    AUTO_IMPORT_KEY_NOT_MODELED,
+                );
+                Some(diagnostic.into_workspace_diagnostic(&config.root))
+            })
+            .collect();
+    fallow_config::append_workspace_diagnostics(&config.root, diagnostics);
 }
 
 struct BuildAnalysisGraphInput<'a> {
@@ -1759,27 +1811,28 @@ fn plugin_config_hash(
     hash_active_plugins(plugin_result, &mut hasher);
     hash_path_aliases(plugin_result, root, &mut hasher);
 
-    let mut auto_imports: Vec<(&str, String, fallow_config::AutoImportKind)> = plugin_result
+    let mut auto_imports: Vec<AutoImportHashKey<'_>> = plugin_result
         .auto_imports
         .iter()
         .map(|rule| {
+            let mut scope: Vec<String> = rule
+                .scope
+                .iter()
+                .map(|scope_root| root_relative_key(root, scope_root))
+                .collect();
+            scope.sort_unstable();
             (
                 rule.name.as_str(),
                 root_relative_key(root, &rule.source),
-                rule.kind,
+                auto_import_kind_rank(rule.kind),
+                scope,
             )
         })
         .collect();
-    auto_imports.sort_unstable_by(|a, b| {
-        a.0.cmp(b.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| auto_import_kind_rank(a.2).cmp(&auto_import_kind_rank(b.2)))
-    });
+    auto_imports.sort_unstable();
     auto_imports.len().hash(&mut hasher);
-    for (name, source, kind) in auto_imports {
-        name.hash(&mut hasher);
-        source.hash(&mut hasher);
-        auto_import_kind_rank(kind).hash(&mut hasher);
+    for key in &auto_imports {
+        key.hash(&mut hasher);
     }
 
     let mut scss_include_paths: Vec<String> = plugin_result
@@ -1851,6 +1904,10 @@ fn hash_path_aliases(
         replacement.hash(hasher);
     }
 }
+
+/// The fields of one auto-import rule that decide its graph edges: name,
+/// root-relative source, kind rank, and sorted root-relative scope.
+type AutoImportHashKey<'a> = (&'a str, String, u8, Vec<String>);
 
 fn auto_import_kind_rank(kind: fallow_config::AutoImportKind) -> u8 {
     match kind {
@@ -2370,6 +2427,7 @@ fn run_plugins(
     )?;
 
     if workspaces.is_empty() {
+        share_auto_imports_across_layers(&mut result, config, workspaces);
         gate_auto_import_entry_patterns(&mut result, config, workspaces);
         record_plugin_config_diagnostics(&result, &config.root);
         return Ok(result);
@@ -2387,6 +2445,7 @@ fn run_plugins(
     );
     merge_workspace_plugin_results(&mut result, ws_results)?;
 
+    share_auto_imports_across_layers(&mut result, config, workspaces);
     gate_auto_import_entry_patterns(&mut result, config, workspaces);
     record_plugin_config_diagnostics(&result, &config.root);
 
@@ -2532,6 +2591,109 @@ fn workspace_prefix(root: &Path, workspace_root: &Path) -> String {
         .unwrap_or(workspace_root)
         .to_string_lossy()
         .into_owned()
+}
+
+/// Make the auto-imports of a Nuxt app and of each layer it extends visible to
+/// each other, for the rules of every plugin.
+///
+/// Each plugin run scopes its rules to its own root, and a local layer inside
+/// that root is covered by it. A layer outside the root is a root of its own:
+/// one that the app names by a relative path (`extends: ['../ui']`), or a
+/// workspace that it names by its package name (`extends: ['@acme/ui']`).
+///
+/// Nuxt merges an app and its layers into one namespace. A rule of a root is
+/// therefore visible to the layers the root reaches down through `extends`
+/// (a layer layout renders a component that the app overrides) and to the
+/// apps that reach the root (the app uses the components and stores of the
+/// layer). The scope follows one direction per path: it never goes up from a
+/// layer to a second app that extends the same layer, because the two apps
+/// do not share names. See issue #2752.
+fn share_auto_imports_across_layers(
+    result: &mut plugins::AggregatedPluginResult,
+    config: &ResolvedConfig,
+    workspaces: &[fallow_config::WorkspaceInfo],
+) {
+    if result.auto_imports.is_empty() || !result.active_plugins.iter().any(|name| name == "nuxt") {
+        return;
+    }
+    let links = layer_links(config, workspaces);
+    if links.is_empty() {
+        return;
+    }
+    let mut related: rustc_hash::FxHashMap<PathBuf, Vec<PathBuf>> =
+        rustc_hash::FxHashMap::default();
+    for rule in &mut result.auto_imports {
+        let declared = rule.scope.clone();
+        for root in &declared {
+            let roots = related.entry(root.clone()).or_insert_with(|| {
+                let mut roots = reachable_roots(root, &links, |(app, layer)| (app, layer));
+                roots.extend(reachable_roots(root, &links, |(app, layer)| (layer, app)));
+                roots
+            });
+            for extra in roots.iter() {
+                if !rule.scope.contains(extra) {
+                    rule.scope.push(extra.clone());
+                }
+            }
+        }
+    }
+}
+
+/// The roots that `start` reaches through `links`, following each link from
+/// the first root that `direction` returns to the second. `start` itself is
+/// not part of the result.
+fn reachable_roots<'a>(
+    start: &Path,
+    links: &'a [(PathBuf, PathBuf)],
+    direction: impl Fn(&'a (PathBuf, PathBuf)) -> (&'a PathBuf, &'a PathBuf),
+) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut pending: Vec<&Path> = vec![start];
+    while let Some(current) = pending.pop() {
+        for link in links {
+            let (from, to) = direction(link);
+            if from.as_path() == current && to.as_path() != start && !found.contains(to) {
+                found.push(to.clone());
+                pending.push(to.as_path());
+            }
+        }
+    }
+    found
+}
+
+/// The `(app root, layer root)` pairs of every Nuxt layer outside the app
+/// root: a relative `extends` path outside the root, and a workspace named by
+/// its package name.
+fn layer_links(
+    config: &ResolvedConfig,
+    workspaces: &[fallow_config::WorkspaceInfo],
+) -> Vec<(PathBuf, PathBuf)> {
+    let roots_by_name: rustc_hash::FxHashMap<&str, &Path> = workspaces
+        .iter()
+        .map(|ws| (ws.name.as_str(), ws.root.as_path()))
+        .collect();
+    let app_roots =
+        std::iter::once(config.root.as_path()).chain(workspaces.iter().map(|ws| ws.root.as_path()));
+    let mut links: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for app in app_roots {
+        let package_layers = plugins::nuxt::package_layer_names(app)
+            .into_iter()
+            .filter_map(|name| {
+                roots_by_name
+                    .get(name.as_str())
+                    .map(|root| root.to_path_buf())
+            });
+        for layer in plugins::nuxt::outside_layer_roots(app)
+            .into_iter()
+            .chain(package_layers)
+        {
+            let link = (app.to_path_buf(), layer);
+            if link.0 != link.1 && !links.contains(&link) {
+                links.push(link);
+            }
+        }
+    }
+    links
 }
 
 /// When `autoImports` is enabled, drop the modeled Nuxt convention entry
@@ -3223,11 +3385,11 @@ mod tests {
     fn graph_cache_plugin_hash_includes_auto_imports() {
         let mut without_auto_import = plugin_result();
         let mut with_auto_import = plugin_result();
-        with_auto_import.auto_imports.push(AutoImportRule {
-            name: "useCounter".to_string(),
-            source: PathBuf::from("/project/composables/useCounter.ts"),
-            kind: AutoImportKind::Named,
-        });
+        with_auto_import.auto_imports.push(AutoImportRule::new(
+            "useCounter".to_string(),
+            PathBuf::from("/project/composables/useCounter.ts"),
+            AutoImportKind::Named,
+        ));
 
         assert_ne!(
             plugin_config_hash(&without_auto_import, std::path::Path::new("")),
@@ -3235,15 +3397,25 @@ mod tests {
             "auto-import edge changes must invalidate the graph cache"
         );
 
-        without_auto_import.auto_imports.push(AutoImportRule {
-            name: "useCounter".to_string(),
-            source: PathBuf::from("/project/composables/useCounter.ts"),
-            kind: AutoImportKind::Default,
-        });
+        without_auto_import.auto_imports.push(AutoImportRule::new(
+            "useCounter".to_string(),
+            PathBuf::from("/project/composables/useCounter.ts"),
+            AutoImportKind::Default,
+        ));
         assert_ne!(
             plugin_config_hash(&without_auto_import, std::path::Path::new("")),
             plugin_config_hash(&with_auto_import, std::path::Path::new("")),
             "auto-import kind changes must invalidate the graph cache"
+        );
+
+        let mut scoped = with_auto_import.auto_imports.clone();
+        scoped[0].scope = vec![PathBuf::from("/project/packages/a")];
+        let mut with_scoped_auto_import = plugin_result();
+        with_scoped_auto_import.auto_imports = scoped;
+        assert_ne!(
+            plugin_config_hash(&with_scoped_auto_import, std::path::Path::new("")),
+            plugin_config_hash(&with_auto_import, std::path::Path::new("")),
+            "auto-import scope changes must invalidate the graph cache"
         );
     }
 
