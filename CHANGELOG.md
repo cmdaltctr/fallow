@@ -131,6 +131,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as relative to the project root. They also keep that reading for the root
   itself, and for every leading-`/` value when `<root>/<root>` is a directory,
   the same as Vite. Closes #2806.
+- **The git hook uses the right default branch without `origin/HEAD`.**
+  `fallow init --hooks` and `fallow hooks install --target git` write a
+  fallback base branch into the hook. A clone without `origin/HEAD` got
+  `main`, also when the remote only has `master`. Now the hook uses
+  `origin/main`, and then `origin/master`, the same way `fallow audit` finds
+  its base. Refs #2758.
+
+- **`health --hotspots` reports a branch without commits.** After a
+  fresh `git init`, or on a new orphan branch, the hotspot, churn and
+  ownership sections were empty without a signal. Now `workspace_diagnostics` has a `hotspots-skipped`
+  entry with the new `cause` token `no-commits`, and the terminal shows a
+  note unless you give `--quiet`. A directory that is not a repository keeps
+  the `not-a-repository` cause. Refs #2803.
 
 - **The hidden-directory message gives a remedy that fixes the run.** The
   `skipped-source-dotdir` message and the stderr note told you to run
