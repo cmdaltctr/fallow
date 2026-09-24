@@ -121,6 +121,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`--fail-on-issues` also raises `warn` complexity findings to
+  `error`.** It already raised every `warn` dead-code finding. Now `fallow
+  health` and the bare `fallow` command with `--fail-on-issues` (or `--ci`,
+  which sets it) also raise complexity findings whose `complexity-*` rule is
+  `warn`. The run then fails, and the JSON `effective_severity` and the CI
+  levels of these findings are `error`. `fallow audit` keeps its own
+  verdict and still ignores `--fail-on-issues`. (#2824)
 - **The rule, not the band, sets the CI level of a complexity finding.**
   `github-annotations`, SARIF and CodeClimate now take the level of a
   complexity finding from its `complexity-*` rule. `error` gives
@@ -162,6 +169,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The human summary line follows the result of the run.** When all
+  findings were at rule severity `warn`, `fallow dead-code`, `fallow health`
+  and the bare `fallow` command exited 0 but printed a red `✗` summary line.
+  The summary line now shows a yellow `⚠` when the run passes, and the red
+  `✗` only when a gate fails the run, for example an `error` finding or
+  `--fail-on-issues`. `health --report-only` also shows `⚠`. The
+  `--summary` and `--group-by` summary lines follow the same rule. A health
+  run with no finding and no failing gate shows `✓`. The duplication line of
+  `fallow dupes`, the bare `fallow` command and `fallow audit` shows `⚠` for
+  clones when no `--threshold` fails the run. The final `fallow audit` line
+  for a `warn` verdict shows `⚠`, not `✓`. (#2824)
 - **Save flags write only into the project and the temp directories.**
   `--save-baseline`, `--save-regression-baseline` and `--save-snapshot`
   wrote wherever the path pointed, for example `../outside.json`. Before the

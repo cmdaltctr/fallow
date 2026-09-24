@@ -6427,6 +6427,7 @@ fn health_gate_options(args: &HealthDispatchArgs<'_>) -> fallow_engine::health::
         report_only: args.report_only,
         fail_on_stale_baseline: args.fail_on_stale_baseline,
         fail_on_parse_error: args.fail_on_parse_error,
+        fail_on_issues: false,
     }
 }
 
@@ -6456,9 +6457,10 @@ fn run_health_dispatch(
     resolved: ResolvedHealthDispatch<'_>,
 ) -> ExitCode {
     let cli = dispatch.cli;
-    let (output, quiet, _fail_on_issues) =
+    let (output, quiet, fail_on_issues) =
         (dispatch.output, dispatch.quiet, dispatch.fail_on_issues);
-    let run = resolved.run;
+    let mut run = resolved.run;
+    run.gates.fail_on_issues = fail_on_issues;
     let sections = run.sections;
     let production = resolved.production;
     health::run_health(
