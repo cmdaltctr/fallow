@@ -532,6 +532,7 @@ impl CodeModeState {
     fn resolve(&self, tool: &str, params_json: &str) -> Result<ResolvedHostCall, String> {
         let tool = CodeModeTool::from_name(tool)?;
         let params = merge_default_root(params_json, self.default_root.as_deref())?;
+        reject_file_write_params(tool, &params)?;
         let key = memo_key(tool, &params);
         Ok(ResolvedHostCall { tool, params, key })
     }
@@ -987,11 +988,46 @@ fn dispatch_host_call(
     deadline: Instant,
     max_output_bytes: usize,
 ) -> Result<String, String> {
+    // `resolve` refuses the write first, with no slot spent. This guard keeps
+    // any other route to a backing from writing a file.
+    reject_file_write_params(tool, &params)?;
     if let Some(value) = run_api_tool_with_deadline(tool, params.clone(), deadline)? {
         return Ok(serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()));
     }
     let args = build_tool_args(tool, params)?;
     run_fallow_sync(binary, "code_execute", &args, deadline, max_output_bytes)
+}
+
+/// Parameters that make a host call write a baseline, regression baseline or
+/// snapshot file, and whether an empty string still writes one. An empty
+/// baseline path passes no flag to the CLI. An empty snapshot path writes a
+/// snapshot at the default location.
+const FILE_WRITE_PARAMS: [(&str, bool); 3] = [
+    ("save_baseline", false),
+    ("save_regression_baseline", false),
+    ("save_snapshot", true),
+];
+
+/// Refuse a host call that asks for a file write.
+///
+/// `code_execute` declares a read-only hint, so a host can run it with no
+/// approval prompt. A call inside it must therefore not write a file. The
+/// standalone tools declare the write, and the error names the tool to call.
+fn reject_file_write_params(tool: CodeModeTool, params: &serde_json::Value) -> Result<(), String> {
+    let Some((param, _)) = FILE_WRITE_PARAMS.iter().find(|(param, empty_writes)| {
+        params.get(*param).is_some_and(|value| match value {
+            serde_json::Value::Null => false,
+            serde_json::Value::String(path) => *empty_writes || !path.is_empty(),
+            _ => true,
+        })
+    }) else {
+        return Ok(());
+    };
+    Err(format!(
+        "invalid tool params: code mode does not write files, and `{param}` writes one. \
+         Call the standalone MCP {name} tool to write it.",
+        name = tool.name()
+    ))
 }
 
 fn timed_dispatch(
@@ -1983,6 +2019,54 @@ mod tests {
         );
         assert_eq!(json["calls"][0]["tool"], "find_similar_code");
         assert_eq!(json["calls"][0]["error_kind"], "unsupported_tool");
+    }
+
+    /// `code_execute` declares a read-only hint, so no call inside it may write
+    /// a file. Each write parameter is refused before any analysis runs, and
+    /// the error names the standalone tool that declares the write.
+    #[test]
+    fn code_mode_refuses_every_file_write_parameter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("written.json");
+        let target = target.to_str().expect("utf8");
+        for (tool, param) in [
+            ("analyze", "save_baseline"),
+            ("analyze", "save_regression_baseline"),
+            ("check_changed", "save_baseline"),
+            ("check_changed", "save_regression_baseline"),
+            ("find_dupes", "save_baseline"),
+            ("check_health", "save_baseline"),
+            ("check_health", "save_snapshot"),
+        ] {
+            let code = format!(
+                "return fallow.run('{tool}', {{ root: {root:?}, {param}: {target:?} }});",
+                root = dir.path().to_str().expect("utf8"),
+            );
+            let output = execute_code_mode(
+                "fallow".to_string(),
+                CodeExecuteParams {
+                    code,
+                    root: None,
+                    timeout_ms: Some(5_000),
+                    max_output_bytes: Some(10_000),
+                },
+            )
+            .expect_err("Code Mode must refuse a file write");
+            let json: serde_json::Value = serde_json::from_str(&output).expect("code mode JSON");
+            let error = json["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains(param) && error.contains(&format!("standalone MCP {tool} tool")),
+                "{tool}.{param}: the refusal names the parameter and the tool: {error}"
+            );
+            assert_eq!(
+                json["calls"][0]["error_kind"], "invalid_params",
+                "{tool}.{param}"
+            );
+            assert!(
+                !std::path::Path::new(target).exists(),
+                "{tool}.{param} must write no file"
+            );
+        }
     }
 
     #[test]
@@ -3431,6 +3515,66 @@ mod tests {
             "a loop of refusals grew the trace without bound: {}",
             calls.len()
         );
+    }
+
+    /// A write refusal happens before dispatch, so it spends no
+    /// `max_host_calls` slot. Eight refused writes leave the whole budget for
+    /// the next distinct call.
+    #[test]
+    fn refused_writes_leave_the_call_budget_for_distinct_calls() {
+        let (ok, json, _) = run_snippet(
+            r#"
+            let refused = 0;
+            for (let index = 0; index < 8; index += 1) {
+                try {
+                    fallow.run("analyze", { save_baseline: `baseline-${index}.json` });
+                } catch (error) {
+                    refused += 1;
+                }
+            }
+            return [refused, fallow.explain({ issue_type: "unused-export" }).kind];
+            "#,
+            2_000_000,
+        );
+
+        assert!(ok, "refused writes must leave the budget: {json}");
+        assert_eq!(json["result"], serde_json::json!([8, "explain"]));
+    }
+
+    /// A batch element that asks for a write is refused on its own, before
+    /// the batch counts its dispatches, so the other elements still run.
+    #[test]
+    fn a_batch_write_element_is_refused_without_a_dispatch_slot() {
+        let (ok, json, _) = run_snippet(
+            r#"
+            fallow.explain({ issue_type: "unused-export" });
+            const requests = [{ tool: "check_health", params: { save_snapshot: "snap.json" } }];
+            for (let index = 0; index < 7; index += 1) {
+                requests.push({ tool: "fallow_explain", params: { issue_type: "unused-export", nonce: index } });
+            }
+            return fallow.all(requests).map((element) => element.ok);
+            "#,
+            2_000_000,
+        );
+
+        assert!(ok, "the batch must run its seven valid elements: {json}");
+        assert_eq!(
+            json["result"],
+            serde_json::json!([false, true, true, true, true, true, true, true])
+        );
+    }
+
+    /// An empty baseline path never wrote a file, so it is not refused. An
+    /// empty snapshot path writes a default snapshot, so it is.
+    #[test]
+    fn only_a_write_that_writes_is_refused() {
+        let empty_baseline =
+            serde_json::json!({ "save_baseline": "", "save_regression_baseline": "" });
+        assert!(reject_file_write_params(CodeModeTool::Analyze, &empty_baseline).is_ok());
+        let empty_snapshot = serde_json::json!({ "save_snapshot": "" });
+        assert!(reject_file_write_params(CodeModeTool::CheckHealth, &empty_snapshot).is_err());
+        let baseline = serde_json::json!({ "save_baseline": "b.json" });
+        assert!(reject_file_write_params(CodeModeTool::FindDupes, &baseline).is_err());
     }
 
     /// A memo hit is recorded in `calls[]` but runs nothing, so it must not
