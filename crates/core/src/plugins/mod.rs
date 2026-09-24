@@ -248,6 +248,14 @@ pub struct PluginResult {
 }
 
 impl PluginResult {
+    /// Register an entry pattern whose leading `../` segments are relative to
+    /// the plugin root. The workspace prefix resolves them.
+    fn push_parent_relative_entry_pattern(&mut self, pattern: String) {
+        let mut rule = PathRule::new(pattern);
+        rule.parent_relative = true;
+        self.entry_patterns.push(rule);
+    }
+
     fn push_entry_pattern(&mut self, pattern: impl Into<String>) {
         self.entry_patterns
             .push(PathRule::new(normalize_entry_pattern(pattern.into())));
@@ -295,6 +303,45 @@ impl PluginResult {
                 continue;
             }
             self.push_entry_path(resolve_path(value));
+        }
+    }
+
+    /// Route each value of a rollup-style `input` to both surfaces when it is
+    /// ambiguous.
+    ///
+    /// Rollup, rolldown and vite resolve an `input` value with no importer: a
+    /// resolve plugin can read it as a module request, and without one it is a
+    /// path relative to the working directory. A value without `./`, `../` or
+    /// `/`, without a source extension and without glob syntax can therefore
+    /// name either one. It keeps the entry pattern, and it credits the package
+    /// unless the value names a file under `root`. A value that names a
+    /// project file is a path, so it must not hide an unused package that has
+    /// the same first segment (issue #2753).
+    fn extend_entry_patterns_and_dependencies<I, S>(&mut self, values: I, root: &Path)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for value in values {
+            let value = value.into();
+            if let Some(request) = module_request(&value)
+                && !names_project_file(root, request)
+            {
+                self.referenced_dependencies
+                    .push(crate::resolve::extract_package_name(request));
+            }
+            self.push_entry_path(value);
+        }
+    }
+
+    /// Register each value as a bundler entry path.
+    fn extend_entry_paths<I, S>(&mut self, values: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for value in values {
+            self.push_entry_path(value.into());
         }
     }
 
@@ -347,6 +394,20 @@ impl PluginResult {
             && self.framework_static_dir_mappings.is_empty()
             && self.provided_dependencies.is_empty()
     }
+}
+
+/// Whether an extensionless value names a file under `root`: the value itself,
+/// the value with a source extension, or the index file of the directory it
+/// names. This is the order in which a bundler resolves a path.
+fn names_project_file(root: &Path, value: &str) -> bool {
+    let base = root.join(value);
+    base.is_file()
+        || crate::discover::SOURCE_EXTENSIONS.iter().any(|extension| {
+            let mut candidate = base.clone().into_os_string();
+            candidate.push(".");
+            candidate.push(extension);
+            Path::new(&candidate).is_file() || base.join(format!("index.{extension}")).is_file()
+        })
 }
 
 /// Brace list of the extensions a bundler tries for a request that names no
@@ -438,6 +499,13 @@ pub struct PathRule {
     /// for workspaces because they intentionally operate on segment names rather
     /// than the full project-relative path.
     pub exclude_segment_regexes: Vec<String>,
+    /// Whether the leading `../` segments of `pattern` are relative to the
+    /// plugin root, so the workspace prefix resolves them. Only the Module
+    /// Federation reader sets it, for an `exposes` target in a sibling
+    /// workspace. Other plugins emit patterns relative to a config directory,
+    /// such as the Storybook `../src/**`, which must not climb out of the
+    /// workspace.
+    pub parent_relative: bool,
 }
 
 impl PathRule {
@@ -448,6 +516,7 @@ impl PathRule {
             exclude_globs: Vec::new(),
             exclude_regexes: Vec::new(),
             exclude_segment_regexes: Vec::new(),
+            parent_relative: false,
         }
     }
 
@@ -491,8 +560,13 @@ impl PathRule {
 
     #[must_use]
     fn prefixed(&self, ws_prefix: &str) -> Self {
+        let pattern = if self.parent_relative && self.pattern.starts_with("../") {
+            resolve_parent_relative_pattern(&self.pattern, ws_prefix)
+        } else {
+            prefix_workspace_pattern(&self.pattern, ws_prefix)
+        };
         Self {
-            pattern: prefix_workspace_pattern(&self.pattern, ws_prefix),
+            pattern,
             exclude_globs: self
                 .exclude_globs
                 .iter()
@@ -504,6 +578,7 @@ impl PathRule {
                 .map(|pattern| prefix_workspace_regex(pattern, ws_prefix))
                 .collect(),
             exclude_segment_regexes: self.exclude_segment_regexes.clone(),
+            parent_relative: false,
         }
     }
 }
@@ -725,6 +800,33 @@ fn prefix_workspace_pattern(pattern: &str, ws_prefix: &str) -> String {
         pattern.to_string()
     } else {
         format!("{ws_prefix}/{pattern}")
+    }
+}
+
+/// Resolve the leading `../` segments of a parent-relative pattern against the
+/// workspace prefix, so a pattern that names a file in a sibling workspace
+/// matches from the project root. A pattern that climbs past the project root,
+/// or a prefix that is not project-relative, keeps the pattern as written,
+/// which matches no project file.
+fn resolve_parent_relative_pattern(pattern: &str, ws_prefix: &str) -> String {
+    if ws_prefix.starts_with('/') || Path::new(ws_prefix).is_absolute() {
+        return pattern.to_string();
+    }
+    let mut base: Vec<&str> = ws_prefix
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let mut rest = pattern;
+    while let Some(stripped) = rest.strip_prefix("../") {
+        if base.pop().is_none() {
+            return pattern.to_string();
+        }
+        rest = stripped;
+    }
+    if base.is_empty() {
+        rest.to_string()
+    } else {
+        format!("{}/{rest}", base.join("/"))
     }
 }
 
@@ -2236,6 +2338,55 @@ mod tests {
             plugins.len() >= 110,
             "expected at least 110 built-in plugins, got {}",
             plugins.len()
+        );
+    }
+
+    /// A pattern that climbs out of its workspace with `../` resolves against
+    /// the workspace prefix, so it names a file in a sibling workspace. A climb
+    /// past the project root stays unresolved and matches no project file.
+    #[test]
+    fn a_parent_relative_pattern_resolves_against_the_workspace_prefix() {
+        let parent_relative = |pattern: &str| {
+            let mut rule = PathRule::new(pattern);
+            rule.parent_relative = true;
+            rule
+        };
+        assert_eq!(
+            parent_relative("../shared/src/Thing.tsx")
+                .prefixed("packages/app")
+                .pattern,
+            "packages/shared/src/Thing.tsx"
+        );
+        assert_eq!(
+            parent_relative("../../lib/index.{ts,js}")
+                .prefixed("apps/web/client")
+                .pattern,
+            "apps/lib/index.{ts,js}"
+        );
+        assert!(
+            parent_relative("../../../outside/Thing.tsx")
+                .prefixed("packages/app")
+                .pattern
+                .starts_with("../"),
+            "a climb past the project root matches no project file"
+        );
+        assert_eq!(
+            parent_relative("src/index.ts")
+                .prefixed("packages/app")
+                .pattern,
+            "packages/app/src/index.ts"
+        );
+    }
+
+    /// Any other pattern keeps the plain prefix, so a config-directory-relative
+    /// `../src/**` does not climb out of its workspace.
+    #[test]
+    fn a_plain_parent_pattern_is_not_resolved() {
+        assert_eq!(
+            PathRule::new("../src/**/*.stories.tsx")
+                .prefixed("packages/ui")
+                .pattern,
+            "packages/ui/../src/**/*.stories.tsx"
         );
     }
 }
