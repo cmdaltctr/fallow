@@ -326,7 +326,7 @@ CI runs diff-scoped on pull requests by default, so CI output can legitimately d
 
 ## Runtime intelligence (optional)
 
-Fallow Runtime is the optional paid layer. It merges production execution evidence (V8 coverage dumps via `NODE_V8_COVERAGE`, or Istanbul files) into `fallow health` and `fallow audit`: hot paths for careful review, cold-code deletion confidence, runtime-weighted health, and stale-flag evidence. A single local coverage capture is free; continuous and cloud runtime monitoring requires a license. Everything else in this README is free and needs no license.
+Fallow Runtime is the optional paid layer. It merges production execution evidence (V8 coverage dumps via `NODE_V8_COVERAGE`, or Istanbul files) into `fallow health` and `fallow audit`: hot paths for careful review, cold-code deletion confidence, and runtime-weighted health. A single local coverage capture is free; continuous and cloud runtime monitoring requires a license. Everything else in this README is free and needs no license.
 
 ```bash
 npx fallow license activate --trial --email you@company.com   # 30-day trial, offline Ed25519 verification
