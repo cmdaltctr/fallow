@@ -8,11 +8,15 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import {
+  GIT_LOCATION_VARIABLES,
+  companionSkillsRoot,
   decide,
   diffTrees,
   listFiles,
@@ -140,5 +144,86 @@ test("main throws when the explicit public consumer is missing", () => {
     } else {
       process.env.FALLOW_SKILLS_DIR = previous;
     }
+  }
+});
+
+// An inherited GIT_DIR or GIT_WORK_TREE, for example from a hook, would point
+// these commands at the real repository instead of the temporary one.
+const gitEnv = () =>
+  Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => !GIT_LOCATION_VARIABLES.includes(name)),
+  );
+
+const git = (cwd, ...args) => execFileSync("git", args, { cwd, env: gitEnv(), stdio: "pipe" });
+
+test("a linked worktree resolves the companion next to the main working tree", () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "vendor-skills-worktree-")));
+  const mainTree = join(base, "fallow");
+  const linked = join(base, "fallow", ".worktrees", "linked");
+  try {
+    mkdirSync(mainTree);
+    git(mainTree, "init", "-q");
+    git(
+      mainTree,
+      "-c",
+      "commit.gpgsign=false",
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@example.com",
+      "commit",
+      "-q",
+      "--allow-empty",
+      "-m",
+      "init",
+    );
+    git(mainTree, "worktree", "add", "-q", linked);
+
+    assert.equal(companionSkillsRoot({ env: {}, repoRoot: linked }), join(base, "fallow-skills"));
+    assert.equal(companionSkillsRoot({ env: {}, repoRoot: mainTree }), join(base, "fallow-skills"));
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("the git helper of this file ignores an inherited GIT_DIR", () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "vendor-skills-gitdir-")));
+  const inherited = join(base, "inherited.git");
+  const previous = process.env.GIT_DIR;
+  process.env.GIT_DIR = inherited;
+  try {
+    const checkout = join(base, "fallow");
+    mkdirSync(checkout);
+    git(checkout, "init", "-q");
+    assert.equal(existsSync(inherited), false, "git init must not write to the inherited GIT_DIR");
+    assert.equal(existsSync(join(checkout, ".git")), true);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.GIT_DIR;
+    } else {
+      process.env.GIT_DIR = previous;
+    }
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("FALLOW_SKILLS_DIR overrides the companion location", () => {
+  assert.equal(
+    companionSkillsRoot({ env: { FALLOW_SKILLS_DIR: "/elsewhere/skills" }, repoRoot: "/unused" }),
+    "/elsewhere/skills",
+  );
+});
+
+test("a checkout outside git falls back to the sibling directory", () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "vendor-skills-nogit-")));
+  const checkout = join(base, "fallow");
+  try {
+    mkdirSync(checkout);
+    assert.equal(
+      companionSkillsRoot({ env: { GIT_CEILING_DIRECTORIES: base }, repoRoot: checkout }),
+      join(base, "fallow-skills"),
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
   }
 });

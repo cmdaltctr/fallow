@@ -416,6 +416,16 @@ When a stable interface needs to change:
 
 These are documented for the rare CI script that depended on the old behavior. None require a config migration.
 
+- **The GitHub Action rejects a control character in the `baseline` input.**
+  A `baseline` value with an ASCII control character, for example a newline,
+  now stops the analyze step with exit 2 and an `::error::` line, as the
+  `changed-since` and `diff-file` inputs already did. The `baseline_path`
+  output of the internal analyze step now uses the `name<<delimiter` form of
+  `$GITHUB_OUTPUT`. The public action output `baseline-path` keeps the same
+  value. The branded token step now also writes `FALLOW_TOKEN_BRANDED` and
+  `FALLOW_TOKEN_FALLBACK_REASON` (empty for a branded token) to
+  `$GITHUB_ENV`. These names are internal to the action and can change.
+
 - **Every machine envelope states its default verdict in `gate_outcomes`.**
   The JSON envelopes of `dead-code`, `check`, `health`, `security`, `audit`
   and bare `fallow` (grouped and ungrouped) now always carry
