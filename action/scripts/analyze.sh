@@ -1232,7 +1232,10 @@ fi
 # A gate fails the job only when all three hold: the input that owns it asked
 # for it, its status is `fail`, and the CLI marked it `enforced`. The first
 # condition is what keeps `fail-on-issues: false` authoritative: a flag that
-# arrived through `args:` produces a warning, never a failure.
+# arrived through `args:` produces a warning, never a failure. One exception is
+# deliberate: `parse-error` has no input, and its entry exists only when
+# `failOnParseError` or `--fail-on-parse-error` armed it, so a flag in `args:`
+# does fail the job there (see `gate_input_value`).
 GATE_FAILURES=()
 GATE_FAILED_NAMES=()
 GATE_WARNED_NAMES=()
@@ -1277,6 +1280,10 @@ gate_input_value() {
     security)              printf '%s' "${INPUT_SECURITY_GATE:-}" ;;
     stale-baseline)        printf '%s' "${INPUT_FAIL_ON_STALE_BASELINE:-}" ;;
     type-aware-require)    printf '%s' "${INPUT_TYPE_AWARE_REQUIRE:-}" ;;
+    # No input owns this gate. The CLI publishes the entry only when
+    # `failOnParseError` in config or `--fail-on-parse-error` in args armed
+    # it, so an entry in the envelope is the repository's own request.
+    parse-error)           printf '%s' "true" ;;
     *)                     printf '%s' "" ;;
   esac
 }
@@ -1343,6 +1350,18 @@ gate_detail() {
     type-aware-require)
       printf 'semantic analysis was unavailable or partial'
       ;;
+    parse-error)
+      # A fork controls file names. Escape `%`, CR and LF like `san` in
+      # action/jq/annotations-*.jq, so a name cannot start a workflow command.
+      local files
+      files=$(jq_debug -r '
+        [ (.gate_outcomes["parse-error"].files // [])[]
+          | (.path | gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A")) as $path
+          | "\($path) (\(.error_count) parser error\(if .error_count == 1 then "" else "s" end), the parser \(if .panicked then "stopped" else "recovered" end))" ]
+        | join(", ")
+      ' "$RESULTS_FILE" || true)
+      [ -n "$files" ] && printf 'fallow could not parse %s' "$files"
+      ;;
   esac
   # An empty detail must not make this function return non-zero: the case
   # branches end in `&&` lists, and the caller assigns the result under
@@ -1359,6 +1378,7 @@ gate_remedy() {
     security)              printf 'Review the introduced candidates, or unset security-gate.' ;;
     stale-baseline)        printf 'Re-save the baseline, or set fail-on-stale-baseline: false.' ;;
     type-aware-require)    printf 'Install the semantic sidecar, or set type-aware-require: best-effort.' ;;
+    parse-error)           printf 'Fix the syntax, or remove failOnParseError and --fail-on-parse-error.' ;;
   esac
 }
 

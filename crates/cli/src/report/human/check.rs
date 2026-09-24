@@ -178,6 +178,34 @@ pub(in crate::report) struct PrintHumanInput<'a> {
     pub top: Option<usize>,
     pub show_explain_tip: bool,
     pub explain: bool,
+    /// Files an armed `parse-error` gate failed on; see [`clean_status_line`].
+    pub failed_parse_files: usize,
+}
+
+/// The final status line of a run with no finding.
+///
+/// When an armed `parse-error` gate failed, the run exits 1, so the line says
+/// that instead of "No issues found". The gate lines that follow name the
+/// files.
+fn clean_status_line(elapsed: Duration, failed_parse_files: usize) -> String {
+    let seconds = elapsed.as_secs_f64();
+    if failed_parse_files == 0 {
+        return format!("\u{2713} No issues found ({seconds:.2}s)")
+            .green()
+            .bold()
+            .to_string();
+    }
+    let noun = if failed_parse_files == 1 {
+        "file did"
+    } else {
+        "files did"
+    };
+    format!(
+        "\u{2717} 0 issues, parse-error gate failed: {failed_parse_files} {noun} not parse ({seconds:.2}s)"
+    )
+    .red()
+    .bold()
+    .to_string()
 }
 
 pub(in crate::report) fn print_human(input: &PrintHumanInput<'_>) {
@@ -208,12 +236,7 @@ fn print_human_footer(input: &PrintHumanInput<'_>, total: usize) {
     if total == 0 {
         eprintln!(
             "{}",
-            format!(
-                "\u{2713} No issues found ({:.2}s)",
-                input.elapsed.as_secs_f64()
-            )
-            .green()
-            .bold()
+            clean_status_line(input.elapsed, input.failed_parse_files)
         );
         return;
     }
@@ -3052,6 +3075,8 @@ pub(in crate::report) struct PrintGroupedHumanInput<'a> {
     pub(in crate::report) quiet: bool,
     pub(in crate::report) resolver: Option<&'a OwnershipResolver>,
     pub(in crate::report) explain: bool,
+    /// Files an armed `parse-error` gate failed on; see [`clean_status_line`].
+    pub(in crate::report) failed_parse_files: usize,
 }
 
 fn grouped_issue_counts(groups: &[crate::report::grouping::ResultGroup]) -> Vec<(&str, usize)> {
@@ -3144,14 +3169,10 @@ fn emit_grouped_final_status(
     groups: &[crate::report::grouping::ResultGroup],
     grand_total: usize,
     elapsed: Duration,
+    failed_parse_files: usize,
 ) {
     if grand_total == 0 {
-        eprintln!(
-            "{}",
-            format!("\u{2713} No issues found ({:.2}s)", elapsed.as_secs_f64())
-                .green()
-                .bold()
-        );
+        eprintln!("{}", clean_status_line(elapsed, failed_parse_files));
     } else {
         let non_empty_groups = groups
             .iter()
@@ -3201,7 +3222,7 @@ pub(in crate::report) fn print_grouped_human(input: &PrintGroupedHumanInput<'_>)
     }
 
     if !quiet {
-        emit_grouped_final_status(groups, grand_total, elapsed);
+        emit_grouped_final_status(groups, grand_total, elapsed, input.failed_parse_files);
     }
 }
 
@@ -3452,16 +3473,12 @@ pub(in crate::report) fn print_check_summary(
     elapsed: Duration,
     quiet: bool,
     heading: bool,
+    failed_parse_files: usize,
 ) {
     let total = results.total_issues();
     if total == 0 {
         if !quiet {
-            eprintln!(
-                "{}",
-                format!("\u{2713} No issues found ({:.2}s)", elapsed.as_secs_f64())
-                    .green()
-                    .bold()
-            );
+            eprintln!("{}", clean_status_line(elapsed, failed_parse_files));
         }
         return;
     }

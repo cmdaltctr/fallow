@@ -417,6 +417,7 @@ fn analyze_and_report(config: &fallow_config::ResolvedConfig, opts: &WatchOption
         // `watch` is the interactive loop; it arms no CI gate.
         gate_outcomes: None,
         config_fixable: crate::fix::is_config_fixable(&config.root, opts.config_path.as_ref()),
+        failed_parse_files: 0,
         skip_score_and_trend: false,
         css_requested: false,
         json_style: opts.json_style,
@@ -1170,6 +1171,7 @@ mod tests {
             sealed: false,
             include_entry_exports: false,
             auto_imports: false,
+            fail_on_parse_error: false,
             cache: fallow_config::CacheConfig::default(),
         }
         .resolve(root.to_path_buf(), output, threads, false, quiet, None)
