@@ -48,7 +48,7 @@ Every issue carries an `actions[]` array with an `auto_fixable` flag, so scripts
 - Design-system styling drift for CSS and CSS-in-JS (Sass/Less, CSS Modules, Tailwind, styled-components, Emotion, and more)
 - A changed-file PR gate with per-finding attribution (`fallow audit`)
 - Optional TypeScript checker evidence for exact symbol use, affected files, targeted tests, cross-file private type leaks, and public-signature coupling (`--type-aware`)
-- Optional runtime intelligence: hot paths, cold code, runtime-weighted health, stale flags (licensed Fallow Runtime; a single local coverage capture is free)
+- Optional runtime intelligence: hot paths, cold code, runtime-weighted health (licensed Fallow Runtime; a single local coverage capture is free)
 
 For head-to-head timings against [knip](https://knip.dev) and [jscpd](https://github.com/kucherenko/jscpd), see [BENCHMARKS.md](https://github.com/fallow-rs/fallow/blob/main/BENCHMARKS.md): fallow is faster than knip on smaller projects, knip is faster on several larger repos, and jscpd's Rust rewrite is faster at raw duplication scanning.
 
