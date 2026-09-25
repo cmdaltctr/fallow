@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.29.0] - 2026-09-25
+
 ### Added
 
 - **`health --coverage` reads raw V8 coverage.** Give it a
@@ -175,6 +177,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`GRAPH_CACHE_VERSION` 52) are invalidated, because extraction now stores
     the tag on each export. The first run after the upgrade is cold.
 
+- **Security candidates record strict origin checks.** `fallow security`
+  now records an `origin-equality-guard` control when a file on the import
+  trace compares `.origin` strictly with a known string and exits on a
+  mismatch. The control is a hint for verification, not proof: it does not
+  show that the check runs before the sink or guards the same value, and it
+  does not suppress a candidate or lower its severity. The JSON descriptions
+  of `controls` now say this.
+
 ### Changed
 
 - **`--fail-on-issues` also raises `warn` complexity findings to
@@ -229,8 +239,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stopped with a panic when a short line in a `Dockerfile` held a
   multi-byte character across the length of the `RUN`, `CMD` or
   `ENTRYPOINT` keyword, for example `\'あいうえお\'` in an embedded SQL
-  seed script. Such lines now count as ordinary lines. Thanks to
-  @ga-h-usuba for the report (#2896).
+  seed script. Such lines now count as ordinary lines. Thanks
+  [@ga-h-usuba](https://github.com/ga-h-usuba) for the report.
+  (Closes [#2896](https://github.com/fallow-rs/fallow/issues/2896))
 - **Inline suppressions work for component events.** A
   `fallow-ignore-next-line` or `fallow-ignore-file` comment for
   `unused-component-emit`, `unused-component-input`,
@@ -772,8 +783,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   showed as inherited, and the `new-only` gate passed. Audit now analyzes the
   base for these edits, so the finding is introduced.
 
-- Security findings for different sinks on the same line now have distinct
-  IDs. Security SARIF uses `fallowSecurity/v2` fingerprints with the same IDs
+- **Server-side request forgery candidates need a complete URL authority.**
+  A request URL with a fixed prefix is safe only when the prefix ends the
+  host before the first unknown value, with `/`, `?` or `#`. Before,
+  `` `https://api.example.com${input}` `` counted as a fixed origin, although
+  the input can extend the host name. A prefix that ends in a port, in user
+  info, in `//`, in a backslash or in a tab or line break now reports a
+  candidate. An origin variable that the code assigns again, or that a
+  parameter shadows, is no longer a fixed prefix.
+- **A `writeHead` call with constant headers is not a header-injection
+  candidate.** `res.writeHead(200, { "Content-Type": "text/html" })`, also with
+  a status message, no longer reports. A header object with a computed key, a
+  spread, a getter, a nested value or a variable still reports.
+- **Security findings for different sinks on the same line have distinct
+  IDs.** Security SARIF uses `fallowSecurity/v2` fingerprints with the same IDs
   as JSON and the visualization. Upgrading changes every security finding ID:
   regenerate candidate files and their verdicts together, including ID-based
   evaluation labels. Previously saved candidate/verdict pairs remain usable
@@ -10205,7 +10228,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[unreleased]: https://github.com/fallow-rs/fallow/compare/v3.28.0...HEAD
+[unreleased]: https://github.com/fallow-rs/fallow/compare/v3.29.0...HEAD
+[3.29.0]: https://github.com/fallow-rs/fallow/compare/v3.28.0...v3.29.0
 [3.28.0]: https://github.com/fallow-rs/fallow/compare/v3.27.0...v3.28.0
 [3.27.0]: https://github.com/fallow-rs/fallow/compare/v3.26.0...v3.27.0
 [3.26.0]: https://github.com/fallow-rs/fallow/compare/v3.25.0...v3.26.0
