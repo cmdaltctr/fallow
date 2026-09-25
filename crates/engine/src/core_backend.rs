@@ -117,6 +117,13 @@ impl DeadCodeBackendPrelude<'_> {
         self.inner.script_used_packages()
     }
 
+    pub fn trace_provenance(
+        &self,
+        modules: &[fallow_types::extract::ModuleInfo],
+    ) -> fallow_types::trace::TraceProvenance {
+        self.inner.trace_provenance(modules)
+    }
+
     /// The plugin stage's result, as the analysis sees it.
     pub fn plugin_result(&self) -> BackendAggregatedPluginResult {
         BackendAggregatedPluginResult::from_core(self.inner.plugin_result().clone())
