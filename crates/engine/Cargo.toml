@@ -37,11 +37,13 @@ oxc_coverage_instrument = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
 sha2 = { workspace = true }
+srcmap-sourcemap = "=0.3.7"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+url = "2"
 xxhash-rust = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

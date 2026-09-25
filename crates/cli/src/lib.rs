@@ -644,7 +644,7 @@ struct Cli {
     #[arg(hide_short_help = true, long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
     save_snapshot: Option<Option<String>>,
 
-    /// Path to Istanbul coverage data for exact CRAP scores in combined mode.
+    /// Path to Istanbul or raw V8 coverage data for exact CRAP scores in combined mode.
     /// Also settable via `FALLOW_COVERAGE` or `health.coverage`.
     #[arg(hide_short_help = true, long, value_name = "PATH")]
     coverage: Option<PathBuf>,
@@ -1462,14 +1462,18 @@ enum Command {
         #[arg(long)]
         trend: bool,
 
-        /// Path to coverage data (coverage-final.json) for exact per-function
-        /// CRAP scores. Generate with `jest --coverage`, `vitest run --coverage
-        /// --provider istanbul`, or any Istanbul-compatible tool. Requires
-        /// Istanbul format (not v8/c8 native format). Accepts a single
-        /// Istanbul coverage map JSON file or a directory containing
-        /// coverage-final.json. Use --coverage-root when the file was generated
-        /// in a different environment (CI runner, Docker). Affects CRAP scores
-        /// only, not --coverage-gaps. Also configurable via FALLOW_COVERAGE env var.
+        /// Path to coverage data for exact per-function CRAP scores. Accepts an
+        /// Istanbul coverage map JSON file (coverage-final.json, from
+        /// `jest --coverage`, `vitest run --coverage`, c8 or nyc), a directory
+        /// containing coverage-final.json, a raw V8 coverage directory
+        /// (`NODE_V8_COVERAGE=<dir> node --test`), or a single V8 coverage JSON
+        /// file. Transpiled V8 scripts (tsx, bundles) map back to their source
+        /// files through the source map that Node records in the dump. A
+        /// script that differs from the file on disk and has no source map
+        /// keeps the estimate. Use --coverage-root when
+        /// the data was generated in a different environment (CI runner,
+        /// Docker). Affects CRAP scores only, not --coverage-gaps. Also
+        /// configurable via FALLOW_COVERAGE env var.
         #[arg(long, value_name = "PATH")]
         coverage: Option<PathBuf>,
 
@@ -1611,7 +1615,8 @@ enum Command {
         #[arg(long)]
         max_crap: Option<f64>,
 
-        /// Path to Istanbul-format coverage data (coverage-final.json) for
+        /// Path to Istanbul coverage data (coverage-final.json) or raw V8
+        /// coverage (a `NODE_V8_COVERAGE` directory or one V8 JSON file) for
         /// accurate per-function CRAP scores in the health sub-analysis. Also
         /// configurable via FALLOW_COVERAGE or health.coverage.
         #[arg(long, value_name = "PATH")]

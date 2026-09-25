@@ -1220,10 +1220,12 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "srcmap-sourcemap",
  "tempfile",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "xxhash-rust",
 ]
 
