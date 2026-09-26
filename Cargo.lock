@@ -1215,6 +1215,7 @@ dependencies = [
  "fallow-security",
  "fallow-types",
  "globset",
+ "insta",
  "libc",
  "oxc_allocator",
  "oxc_ast",
