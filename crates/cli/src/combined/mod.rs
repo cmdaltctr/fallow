@@ -260,7 +260,17 @@ fn print_combined_deferred_performance(
         && let Some(ref mut timings) = check.timings
     {
         timings.duplication_ms = dupes_result.map(|dupes| dupes.elapsed.as_secs_f64() * 1000.0);
-        report::print_performance(timings, opts.output, opts.json_style);
+        // `run_combined_check_and_dupes` joins the two passes only when they
+        // cannot share one file walk.
+        let duplication_concurrent = !can_share_dupes_files_with_check(opts);
+        // Combined mode does not clock its report output, so no process spans.
+        report::print_performance(
+            timings,
+            None,
+            duplication_concurrent,
+            opts.output,
+            opts.json_style,
+        );
     }
 }
 

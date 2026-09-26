@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--performance` reports exact work counts.** The dead-code timings gain
+  a `counters` object. It has these counts:
+  - the source files and the bytes that the run read,
+  - the parse cache bytes that the run read,
+  - the specifier resolutions that import sites asked for,
+  - the distinct specifiers for each file,
+  - the resolver calls,
+  - the path canonicalize calls.
+  The counts do not change with the thread count or the machine. A test can
+  compare them with exact equality. The human table shows them under the
+  clock.
+- **Health `--performance` reports the churn bytes.** The health timings gain
+  `git_log_bytes`, the churn `git log` output that the run read. This count
+  also changes with the churn window and the date, because commits move out
+  of a relative window such as `--since 1y`.
+- **`--performance` shows the time outside the pipeline.** A standalone
+  `dead-code` run now reports a `process` object. It has these spans:
+  - the wall time,
+  - the startup and the thread pool,
+  - the config load,
+  - the `--changed-since` git calls,
+  - the analysis,
+  - the work after the analysis,
+  - the report output.
+  The human table adds a `Process` section with a `WALL` row at the end.
+  `dead-code` now prints the table after the report, so the output time is
+  part of it. `audit` and combined runs do not clock their report output, so
+  they do not report a `process` object. The parse cache load gets its own
+  `parse_cache_load_ms` field.
+- **`--performance` JSON has a span tree.** A new `spans` array gives the
+  parent of each stage. It also marks the spans that run at the same time as
+  their siblings. File discovery, parsing and the cache update run before the
+  `total_ms` clock starts, and the tree shows this. In combined mode, the
+  `duplication` span tells if it ran beside the dead-code pass. The human
+  table shows `(after dead code)`, not `(concurrent)`, for a duplication
+  stage that ran after the dead-code pass.
+
+### Performance
+
+- **A run without a diff starts one git process less.** Every command
+  resolved the diff base directories at startup with `git rev-parse`, also
+  when no `--diff-file`, `--diff-stdin` or `FALLOW_DIFF_FILE` was set. Fallow
+  now resolves them only to place a diff.
+- **The Impact project identity starts fewer git processes.** It read the
+  git common directory and the git toplevel with two `git rev-parse` calls.
+  In a work tree, one call now reads both. Outside a repository, the failed
+  call is the only one, because each single call fails in the same way. A
+  bare repository still uses the two single calls after the combined call
+  fails.
+
 ## [3.29.0] - 2026-09-25
 
 ### Added
