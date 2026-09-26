@@ -215,10 +215,11 @@ pub use health_findings::{
 pub use health_grouped::{HealthGroup, HealthGrouping};
 pub use health_report::HealthReport;
 pub use health_runtime_coverage::{
-    RUNTIME_STALE_AFTER_DAYS, RuntimeCoverageAction, RuntimeCoverageBlastRadiusEntry,
-    RuntimeCoverageCaptureQuality, RuntimeCoverageConfidence, RuntimeCoverageDataSource,
-    RuntimeCoverageDiscriminators, RuntimeCoverageEvidence, RuntimeCoverageFinding,
-    RuntimeCoverageHotPath, RuntimeCoverageImportanceEntry, RuntimeCoverageMessage,
+    OPTIMIZATION_TARGET_UNMATCHED_WARNING, RUNTIME_STALE_AFTER_DAYS, RuntimeCoverageAction,
+    RuntimeCoverageBlastRadiusEntry, RuntimeCoverageCaptureQuality, RuntimeCoverageConfidence,
+    RuntimeCoverageCostBasis, RuntimeCoverageDataSource, RuntimeCoverageDiscriminators,
+    RuntimeCoverageEvidence, RuntimeCoverageFinding, RuntimeCoverageHotPath,
+    RuntimeCoverageImportanceEntry, RuntimeCoverageMessage, RuntimeCoverageOptimizationTarget,
     RuntimeCoverageProvenance, RuntimeCoverageReport, RuntimeCoverageReportVerdict,
     RuntimeCoverageRiskBand, RuntimeCoverageSchemaVersion, RuntimeCoverageSignal,
     RuntimeCoverageSummary, RuntimeCoverageVerdict, RuntimeCoverageWatermark,
