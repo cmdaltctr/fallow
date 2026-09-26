@@ -28,6 +28,13 @@ lifecycle behavior.
 - Publish only results that still match the current document version.
 - Push and pull diagnostic clients must receive one coherent diagnostic set,
   including clears for stale findings.
+- `publish.rs` decides what a run sends, and the server and the
+  `lsp_save_publish` lab bench share it. A run skips a URI when its filtered
+  diagnostics and its document version equal the pull-cache entry. The
+  `workspace/diagnostic/refresh` request goes out only when the cache changed.
+  `didClose` marks the cache entry of the URI as not pushed, because the
+  server clears the push diagnostics of an open document for a pull client.
+  The next run then pushes the diagnostics of the closed file again.
 - Diagnostics keep stable codes, `source: "fallow"`, actionable messages, and
   project-relative evidence where appropriate.
 - `initializationOptions.mutedCategories` accepts exact diagnostic codes from
@@ -60,6 +67,19 @@ lifecycle behavior.
 - Initialization options and issue metadata stay aligned with generated VS
   Code contracts.
 - Shutdown must prevent late publication and clean up owned subprocess work.
+- `schedule.rs` decides when a run starts and when a run is cancelled. Saves,
+  watched-file changes and configuration changes start a run after 200 ms
+  without a new event, or 2 s after the first uncovered event. An event during
+  a run cancels it through the engine cancellation token, but after a
+  cancelled run the next run always finishes. A finished run publishes even
+  when newer events arrived during it, because the per-URI staleness check
+  protects edited buffers. A cancelled run never publishes and returns its
+  type-aware changes to the pending set. A project root stops before its
+  type-aware pass, never during it, so a run cancelled in its first root
+  returns the changes as they were and the next run stays incremental. A
+  failed run, or a run cancelled after an earlier root finished, returns
+  them as a full invalidation. The first `didOpen` still starts the startup
+  run at once.
 
 ## Diagnostic metadata and document staleness
 
@@ -75,6 +95,15 @@ document closed during analysis prevents publication. A document opened during
 the run is publishable only if its current text matches disk. Files absent from
 both snapshots, including project manifests, remain valid cross-file targets.
 Keep these checks shared by publishing and cached diagnostic cleanup.
+
+A run reads the file of an open document only when the buffer is not known to
+match the disk. `DocumentState::known_clean` is set by `didSave` and by a disk
+read that confirms the match for that version. An edit makes a new state
+without the flag, and a watched-file event for the URI clears it. The reads
+run on the blocking pool after the documents lock is dropped. A watched-file
+event bumps a disk generation under the documents write lock, and the run
+compares that generation under the same lock before it sets the flag. So a
+read that is older than a watched-file event never marks a buffer clean.
 
 ## Editor parity boundary
 

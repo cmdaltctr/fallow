@@ -122,6 +122,11 @@ Fast PR shards:
 - `fallow-benchmarks/component_graph`: project-state construction.
 - `fallow-benchmarks/component_output`: output envelope serialization and CI
   comment rendering.
+- `fallow-benchmarks/lsp_save_publish`: the language server work of one save
+  (analysis, diagnostic build, and publish plan) for a cold first run, a save
+  after one file changed, and a no-op save. Each case asserts its publish
+  count. A fourth case converts the diagnostic columns of one 5,000-line
+  file to UTF-16.
 
 Full main/manual shards:
 

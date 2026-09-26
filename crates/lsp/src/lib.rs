@@ -8,6 +8,8 @@
 )]
 
 mod analysis;
+#[doc(hidden)]
+pub mod bench_support;
 mod code_actions;
 mod code_lens;
 mod diagnostic_filter;
@@ -19,6 +21,8 @@ mod markdown;
 mod path_utils;
 mod position;
 mod protocol;
+mod publish;
+mod schedule;
 mod server_capabilities;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -90,6 +94,50 @@ fn restore_failed_type_aware_changes(
     invalidate_type_aware_changes(&mut pending);
 }
 
+/// Put the type-aware changes of a run that stopped before its type-aware
+/// pass back into the pending set. The sidecar never saw them, so they stay
+/// incremental, unless the merged set exceeds the queue capacity.
+fn requeue_unused_type_aware_changes(
+    pending: &StdMutex<fallow_api::TypeAwareFileChanges>,
+    attempted: &fallow_api::TypeAwareFileChanges,
+) {
+    if !type_aware_changes_pending(attempted) {
+        return;
+    }
+    merge_type_aware_changes(
+        &mut pending.lock().unwrap_or_else(|error| error.into_inner()),
+        attempted,
+    );
+}
+
+fn merge_type_aware_changes(
+    pending: &mut fallow_api::TypeAwareFileChanges,
+    attempted: &fallow_api::TypeAwareFileChanges,
+) {
+    if attempted.invalidate_all {
+        invalidate_type_aware_changes(pending);
+        return;
+    }
+    if pending.invalidate_all {
+        return;
+    }
+    for (source, target) in [
+        (&attempted.changed, &mut pending.changed),
+        (&attempted.created, &mut pending.created),
+        (&attempted.deleted, &mut pending.deleted),
+    ] {
+        for path in source {
+            if !target.contains(path) {
+                target.push(path.clone());
+            }
+        }
+    }
+    let pending_count = pending.changed.len() + pending.created.len() + pending.deleted.len();
+    if pending_count > MAX_PENDING_TYPE_AWARE_CHANGES {
+        invalidate_type_aware_changes(pending);
+    }
+}
+
 fn record_type_aware_file_change(
     changes: &mut fallow_api::TypeAwareFileChanges,
     path: PathBuf,
@@ -118,14 +166,19 @@ fn record_type_aware_file_change(
 }
 
 use analysis::{
-    BlockingAnalysisInput, BlockingAnalysisOutput, LspAnalysisSnapshot, run_blocking_analysis,
+    BlockingAnalysisInput, BlockingAnalysisOutput, LspAnalysisSnapshot, ProjectAnalysisError,
+    run_blocking_analysis,
 };
 #[cfg(test)]
 use analysis::{ProjectRootAnalysisInput, analyze_project_root};
-use diagnostic_filter::{attach_changed_since_data, filter_disabled_diagnostics};
-use document_state::{
-    DocumentSnapshot, DocumentState, VersionSnapshot, document_matches_disk, uri_is_stale,
-};
+use diagnostic_filter::attach_changed_since_data;
+#[cfg(test)]
+use diagnostic_filter::filter_disabled_diagnostics;
+#[cfg(test)]
+use document_state::uri_is_stale;
+#[cfg(test)]
+use document_state::{DocumentSnapshot, partition_document_snapshot};
+use document_state::{DocumentState, VersionSnapshot};
 #[cfg(test)]
 use fallow_api::EditorAnalysisOutput;
 #[cfg(test)]
@@ -154,6 +207,8 @@ use protocol::{
     AnalysisComplete, AnalysisCompleteInput, IssueTypeInfo, analysis_complete_params,
     diagnostic_issue_types,
 };
+use publish::{DiagnosticCache, PlannedPublish, PublishContext, plan_clears, plan_new_diagnostics};
+use schedule::{RunOutcome, RunScheduler};
 use server_capabilities::{
     build_server_capabilities, client_supports_watched_file_registration,
     client_supports_workspace_diagnostic_refresh,
@@ -214,6 +269,28 @@ fn disabled_diagnostic_codes(options: &LspInitializationOptions) -> FxHashSet<St
         .collect()
 }
 
+/// The blocking analysis of one run. The server uses
+/// [`run_blocking_analysis`]. Tests swap in a runner that they control.
+type AnalysisRunner = Arc<
+    dyn Fn(
+            &BlockingAnalysisInput,
+        ) -> std::result::Result<BlockingAnalysisOutput, ProjectAnalysisError>
+        + Send
+        + Sync,
+>;
+
+/// The result of one blocking analysis, with the state the run started from.
+struct CompletedRun<'a> {
+    result: std::result::Result<
+        std::result::Result<BlockingAnalysisOutput, ProjectAnalysisError>,
+        tokio::task::JoinError,
+    >,
+    root: &'a Path,
+    version_snapshot: &'a VersionSnapshot,
+    analysis_epoch: u64,
+    attempted_type_aware_changes: &'a fallow_api::TypeAwareFileChanges,
+}
+
 #[derive(Clone)]
 struct FallowLspServer {
     client: Client,
@@ -221,8 +298,14 @@ struct FallowLspServer {
     analysis: Arc<RwLock<Option<LspAnalysisSnapshot>>>,
     previous_diagnostic_uris: Arc<RwLock<FxHashSet<Uri>>>,
     analysis_guard: Arc<tokio::sync::Mutex<()>>,
-    /// Monotonic workspace event generation used to reject stale analysis.
+    /// Monotonic workspace event generation. A run records the epoch it
+    /// started at, so a queued run can see that a finished run already
+    /// covers the current epoch.
     analysis_epoch: Arc<AtomicU64>,
+    /// Watched-file event generation. It changes only while the documents
+    /// write lock is held, so a run that compares it under that lock sees
+    /// every event that cleared a `known_clean` flag.
+    disk_generation: Arc<AtomicU64>,
     /// Epoch of the last successfully applied analysis. `run_analysis` skips
     /// the run when the current epoch already completed, so a burst of
     /// workspace events queued on `analysis_guard` coalesces into one
@@ -285,7 +368,7 @@ struct FallowLspServer {
     /// this cache (and `self.root`) to avoid stale path joins.
     git_toplevel: Arc<RwLock<Option<PathBuf>>>,
     /// Cached diagnostics for pull-model support (textDocument/diagnostic)
-    cached_diagnostics: Arc<RwLock<FxHashMap<Uri, Vec<Diagnostic>>>>,
+    cached_diagnostics: Arc<RwLock<DiagnosticCache>>,
     /// Set to `true` the first time the client issues a `textDocument/diagnostic`
     /// request. This is the only reliable signal that a client genuinely
     /// consumes pull diagnostics. Advertising `workspace.diagnostics.refreshSupport`
@@ -306,6 +389,12 @@ struct FallowLspServer {
     /// work runs to completion on the blocking thread pool and its
     /// results are dropped. See issue #477.
     cancellation: Arc<AtomicBool>,
+    /// Debounce and cancellation state of the analysis runs. See
+    /// `schedule.rs`.
+    scheduler: Arc<StdMutex<RunScheduler>>,
+    /// A debounce task waits for the scheduler deadline. One at a time.
+    debounce_armed: Arc<AtomicBool>,
+    analysis_runner: AnalysisRunner,
 }
 
 impl LanguageServer for FallowLspServer {
@@ -410,6 +499,7 @@ impl LanguageServer for FallowLspServer {
     /// The grace is for quiescence, not for cancellation. See issue #477.
     async fn shutdown(&self) -> Result<()> {
         self.cancellation.store(true, Ordering::SeqCst);
+        self.lock_scheduler().cancel_running();
         fallow_api::terminate_active_type_aware_sidecars();
         let _ = tokio::time::timeout(Duration::from_millis(250), self.analysis_guard.lock()).await;
         fallow_api::terminate_active_type_aware_sidecars();
@@ -461,6 +551,7 @@ impl LanguageServer for FallowLspServer {
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        self.mark_document_saved(&params.text_document.uri).await;
         if let Some(path) = params.text_document.uri.to_file_path() {
             let mut changes = self
                 .pending_type_aware_changes
@@ -468,9 +559,8 @@ impl LanguageServer for FallowLspServer {
                 .unwrap_or_else(|error| error.into_inner());
             record_type_aware_file_change(&mut changes, path.into_owned(), FileChangeType::CHANGED);
         }
-        self.analysis_epoch.fetch_add(1, Ordering::SeqCst);
         self.startup_analysis_started.store(true, Ordering::SeqCst);
-        self.spawn_analysis();
+        self.note_workspace_event();
     }
 
     async fn did_change_configuration(&self, _: DidChangeConfigurationParams) {
@@ -481,11 +571,12 @@ impl LanguageServer for FallowLspServer {
                 .unwrap_or_else(|error| error.into_inner());
             invalidate_type_aware_changes(&mut changes);
         }
-        self.analysis_epoch.fetch_add(1, Ordering::SeqCst);
-        self.spawn_analysis();
+        self.note_workspace_event();
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        self.mark_documents_changed_on_disk(params.changes.iter().map(|change| &change.uri))
+            .await;
         {
             let mut changes = self
                 .pending_type_aware_changes
@@ -498,8 +589,7 @@ impl LanguageServer for FallowLspServer {
                 record_type_aware_file_change(&mut changes, path.into_owned(), change.typ);
             }
         }
-        self.analysis_epoch.fetch_add(1, Ordering::SeqCst);
-        self.spawn_analysis();
+        self.note_workspace_event();
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -509,7 +599,7 @@ impl LanguageServer for FallowLspServer {
         self.documents
             .write()
             .await
-            .insert(uri.clone(), DocumentState { version, text });
+            .insert(uri.clone(), DocumentState::new(version, text));
 
         if self.client_pulls.load(Ordering::SeqCst) {
             self.client
@@ -527,19 +617,18 @@ impl LanguageServer for FallowLspServer {
         if let Some(change) = params.content_changes.into_iter().last() {
             self.documents.write().await.insert(
                 params.text_document.uri,
-                DocumentState {
-                    version: params.text_document.version,
-                    text: change.text,
-                },
+                DocumentState::new(params.text_document.version, change.text),
             );
         }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.documents
-            .write()
-            .await
-            .remove(&params.text_document.uri);
+        let uri = params.text_document.uri;
+        self.documents.write().await.remove(&uri);
+        // For a pull client, `didOpen` and the first pull cleared the push
+        // diagnostics of an open document, and a closed document gets only
+        // pushes. The next run must push its diagnostics again.
+        self.cached_diagnostics.write().await.forget_push(&uri);
     }
 
     #[expect(
@@ -636,6 +725,7 @@ impl FallowLspServer {
             previous_diagnostic_uris: Arc::new(RwLock::new(FxHashSet::default())),
             analysis_guard: Arc::new(tokio::sync::Mutex::new(())),
             analysis_epoch: Arc::new(AtomicU64::new(0)),
+            disk_generation: Arc::new(AtomicU64::new(0)),
             last_completed_epoch: Arc::new(AtomicU64::new(u64::MAX)),
             documents: Arc::new(RwLock::new(FxHashMap::default())),
             startup_analysis_started: Arc::new(AtomicBool::new(false)),
@@ -652,10 +742,13 @@ impl FallowLspServer {
                 fallow_api::TypeAwareFileChanges::default(),
             )),
             git_toplevel: Arc::new(RwLock::new(None)),
-            cached_diagnostics: Arc::new(RwLock::new(FxHashMap::default())),
+            cached_diagnostics: Arc::new(RwLock::new(DiagnosticCache::default())),
             client_pulls: Arc::new(AtomicBool::new(false)),
             watched_file_registration: Arc::new(AtomicBool::new(false)),
             cancellation: Arc::new(AtomicBool::new(false)),
+            scheduler: Arc::new(StdMutex::new(RunScheduler::default())),
+            debounce_armed: Arc::new(AtomicBool::new(false)),
+            analysis_runner: Arc::new(run_blocking_analysis),
         }
     }
 
@@ -716,6 +809,64 @@ impl FallowLspServer {
         });
     }
 
+    fn lock_scheduler(&self) -> std::sync::MutexGuard<'_, RunScheduler> {
+        self.scheduler
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// A save, watched-file change or configuration change arrived. Bump the
+    /// epoch, let the scheduler cancel a superseded run, and make sure a
+    /// debounce task waits for the next run.
+    fn note_workspace_event(&self) {
+        {
+            // One lock for both steps, so a run that starts in between
+            // cannot cover the new epoch while missing the pending event.
+            let mut scheduler = self.lock_scheduler();
+            self.analysis_epoch.fetch_add(1, Ordering::SeqCst);
+            scheduler.record_event(tokio::time::Instant::now());
+        }
+        self.spawn_debounced_analysis();
+    }
+
+    /// Start a task that runs the analysis at the scheduler deadline, unless
+    /// such a task already waits.
+    fn spawn_debounced_analysis(&self) {
+        if self.debounce_armed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let server = self.clone();
+        tokio::spawn(async move {
+            server.debounce_then_run().await;
+        });
+    }
+
+    async fn debounce_then_run(&self) {
+        loop {
+            let deadline = self.lock_scheduler().run_deadline();
+            match deadline {
+                Some(deadline) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep_until(deadline).await;
+                }
+                Some(_) => {
+                    // Disarm first: an event during the run arms the next task.
+                    self.debounce_armed.store(false, Ordering::SeqCst);
+                    self.run_analysis().await;
+                    return;
+                }
+                None => {
+                    self.debounce_armed.store(false, Ordering::SeqCst);
+                    // An event between the check above and the disarm saw the
+                    // task as armed and did not start one.
+                    let pending = self.lock_scheduler().run_deadline().is_some();
+                    if !pending || self.debounce_armed.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// Resolve the canonical git toplevel for `root`, populating the cache
     /// on first call. Returns `None` if the workspace is not in a git
     /// repository or git is unavailable; callers should fall back to
@@ -768,10 +919,15 @@ impl FallowLspServer {
             return;
         }
 
-        let analysis_epoch = self.analysis_epoch.load(Ordering::SeqCst);
-        if self.last_completed_epoch.load(Ordering::SeqCst) == analysis_epoch {
-            return;
-        }
+        let (analysis_epoch, run_cancellation) = {
+            let mut scheduler = self.lock_scheduler();
+            let analysis_epoch = self.analysis_epoch.load(Ordering::SeqCst);
+            if self.last_completed_epoch.load(Ordering::SeqCst) == analysis_epoch {
+                scheduler.clear_pending();
+                return;
+            }
+            (analysis_epoch, scheduler.start_run())
+        };
 
         let version_snapshot = self.snapshot_document_versions().await;
 
@@ -800,12 +956,13 @@ impl FallowLspServer {
                 .unwrap_or_else(|error| error.into_inner());
             std::mem::take(&mut *pending)
         };
-        let failed_type_aware_changes = type_aware_changes.clone();
+        let attempted_type_aware_changes = type_aware_changes.clone();
 
         let resolved_toplevel = self.resolved_git_toplevel(&root).await;
         let blocking_root = root.clone();
         let blocking_toplevel = resolved_toplevel.clone();
         let cancellation = Arc::clone(&self.cancellation);
+        let runner = Arc::clone(&self.analysis_runner);
 
         let join_result = tokio::task::spawn_blocking(move || {
             let input = BlockingAnalysisInput {
@@ -822,64 +979,161 @@ impl FallowLspServer {
                 toplevel: blocking_toplevel,
                 changed_since,
                 cancellation,
+                run_cancellation,
             };
-            run_blocking_analysis(&input)
+            runner(&input)
         })
         .await;
 
-        match join_result {
-            Ok(Ok(output)) if self.analysis_epoch.load(Ordering::SeqCst) == analysis_epoch => {
-                self.apply_analysis_output(output, &root, &version_snapshot)
+        let outcome = self
+            .complete_run(CompletedRun {
+                result: join_result,
+                root: &root,
+                version_snapshot: &version_snapshot,
+                analysis_epoch,
+                attempted_type_aware_changes: &attempted_type_aware_changes,
+            })
+            .await;
+        self.lock_scheduler().finish_run(outcome);
+    }
+
+    /// Publish a finished run, or report a cancelled or failed one. A run
+    /// that did not finish returns its type-aware changes to the pending set:
+    /// as they were when no type-aware pass used them, else as a full
+    /// invalidation.
+    async fn complete_run(&self, run: CompletedRun<'_>) -> RunOutcome {
+        let (level, message, outcome) = match run.result {
+            // A finished run publishes even when newer events arrived during
+            // it. The per-URI staleness check keeps its results off buffers
+            // that changed since the run started, and the newer events have
+            // their own run. Without this, autosave faster than the analysis
+            // would discard every run.
+            Ok(Ok(output)) => {
+                self.apply_analysis_output(output, run.root, run.version_snapshot)
                     .await;
                 self.last_completed_epoch
-                    .store(analysis_epoch, Ordering::SeqCst);
+                    .store(run.analysis_epoch, Ordering::SeqCst);
+                return RunOutcome::Published;
             }
-            Ok(Ok(_)) => {
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        "Discarded stale fallow analysis after a newer workspace event",
-                    )
-                    .await;
+            Ok(Err(error)) if error.is_cancelled() => {
+                if error.type_aware_changes_unused() {
+                    requeue_unused_type_aware_changes(
+                        &self.pending_type_aware_changes,
+                        run.attempted_type_aware_changes,
+                    );
+                } else {
+                    restore_failed_type_aware_changes(
+                        &self.pending_type_aware_changes,
+                        run.attempted_type_aware_changes,
+                    );
+                }
+                (
+                    MessageType::INFO,
+                    "Cancelled a fallow analysis that a newer workspace event superseded"
+                        .to_string(),
+                    RunOutcome::Cancelled,
+                )
             }
             Ok(Err(error)) => {
                 restore_failed_type_aware_changes(
                     &self.pending_type_aware_changes,
-                    &failed_type_aware_changes,
+                    run.attempted_type_aware_changes,
                 );
-                self.client
-                    .log_message(MessageType::ERROR, format!("Analysis failed: {error}"))
-                    .await;
+                (
+                    MessageType::ERROR,
+                    format!("Analysis failed: {error}"),
+                    RunOutcome::Failed,
+                )
             }
-            Err(e) => {
+            Err(error) => {
                 restore_failed_type_aware_changes(
                     &self.pending_type_aware_changes,
-                    &failed_type_aware_changes,
+                    run.attempted_type_aware_changes,
                 );
-                self.client
-                    .log_message(MessageType::ERROR, format!("Analysis failed: {e}"))
-                    .await;
+                (
+                    MessageType::ERROR,
+                    format!("Analysis failed: {error}"),
+                    RunOutcome::Failed,
+                )
             }
-        }
+        };
+        self.client.log_message(level, message).await;
+        outcome
     }
 
     /// Snapshot every open document's version + disk-match state at analysis
     /// entry, used by `publish_collected_diagnostics` for the staleness check.
+    ///
+    /// A known-clean document needs no file read. The other documents are
+    /// read on the blocking pool after the documents lock is dropped, and a
+    /// confirmed match is remembered for that document version.
     async fn snapshot_document_versions(&self) -> VersionSnapshot {
-        self.documents
-            .read()
+        let (mut snapshot, checks, generation) = self.partition_documents().await;
+        if checks.is_empty() {
+            return snapshot;
+        }
+        let checked = tokio::task::spawn_blocking(move || document_state::check_disk(checks))
             .await
-            .iter()
-            .map(|(uri, state)| {
-                (
-                    uri.clone(),
-                    DocumentSnapshot {
-                        version: state.version,
-                        matches_disk: document_matches_disk(uri, &state.text),
-                    },
-                )
-            })
-            .collect()
+            .unwrap_or_default();
+        self.remember_disk_matches(checked, generation, &mut snapshot)
+            .await;
+        snapshot
+    }
+
+    /// Split the open documents into known-clean snapshots and pending disk
+    /// reads, with the disk generation at that moment.
+    async fn partition_documents(
+        &self,
+    ) -> (VersionSnapshot, Vec<document_state::PendingDiskCheck>, u64) {
+        let documents = self.documents.read().await;
+        let (snapshot, checks) = document_state::partition_document_snapshot(&documents);
+        let generation = self.disk_generation.load(Ordering::SeqCst);
+        drop(documents);
+        (snapshot, checks, generation)
+    }
+
+    /// Add the disk reads to `snapshot`, and mark a matched document clean
+    /// for its version when no watched-file event arrived after
+    /// `generation_before_reads`.
+    async fn remember_disk_matches(
+        &self,
+        checked: Vec<(Uri, document_state::DocumentSnapshot)>,
+        generation_before_reads: u64,
+        snapshot: &mut VersionSnapshot,
+    ) {
+        let mut documents = self.documents.write().await;
+        let reads_are_current =
+            self.disk_generation.load(Ordering::SeqCst) == generation_before_reads;
+        for (uri, state) in checked {
+            if reads_are_current
+                && state.matches_disk
+                && let Some(live) = documents.get_mut(&uri)
+                && live.version == state.version
+            {
+                live.known_clean = true;
+            }
+            snapshot.insert(uri, state);
+        }
+        drop(documents);
+    }
+
+    /// The client saved `uri`, so its buffer equals the file on disk.
+    async fn mark_document_saved(&self, uri: &Uri) {
+        if let Some(state) = self.documents.write().await.get_mut(uri) {
+            state.known_clean = true;
+        }
+    }
+
+    /// The files behind these URIs changed on disk, so an open buffer for
+    /// one of them is no longer known to match.
+    async fn mark_documents_changed_on_disk<'a>(&self, uris: impl Iterator<Item = &'a Uri>) {
+        let mut documents = self.documents.write().await;
+        self.disk_generation.fetch_add(1, Ordering::SeqCst);
+        for uri in uris {
+            if let Some(state) = documents.get_mut(uri) {
+                state.known_clean = false;
+            }
+        }
     }
 
     /// Publish diagnostics and cache the results from a completed analysis,
@@ -937,16 +1191,12 @@ impl FallowLspServer {
             .await;
     }
 
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "RwLock guard scope is intentional"
-    )]
     async fn publish_collected_diagnostics(
         &self,
         diagnostics_by_file: FxHashMap<Uri, Vec<Diagnostic>>,
         snapshot: &VersionSnapshot,
     ) {
-        let disabled = self.disabled_diagnostic_codes.read().await;
+        let disabled = self.disabled_diagnostic_codes.read().await.clone();
 
         let live_documents: FxHashMap<Uri, DocumentState> = self
             .documents
@@ -955,50 +1205,50 @@ impl FallowLspServer {
             .iter()
             .map(|(uri, state)| (uri.clone(), state.clone()))
             .collect();
+        let context = PublishContext {
+            disabled: &disabled,
+            snapshot,
+            live_documents: &live_documents,
+        };
 
-        let mut new_uris: FxHashSet<Uri> = FxHashSet::default();
+        // One cache lock for the whole run. The plan owns the messages, so no
+        // lock is held while they go out.
+        let plan = {
+            let mut cache = self.cached_diagnostics.write().await;
+            plan_new_diagnostics(&mut cache, diagnostics_by_file, &context)
+        };
+        let mut new_uris = plan.new_uris;
+        let changed_uris = plan.publishes.len();
+
         // Live-document URIs pushed while the client had not pulled yet. The
         // first-pull transition clears push diagnostics for open documents,
         // but a pull landing mid-loop cannot clear pushes emitted after its
         // clear; those URIs are re-cleared below once the flip is observed.
         let mut pushed_live_uris: Vec<Uri> = Vec::new();
-
-        for (uri, diags) in diagnostics_by_file {
-            new_uris.insert(uri.clone());
-
-            if uri_is_stale(&uri, snapshot, &live_documents) {
-                continue;
+        for planned in plan.publishes {
+            let has_findings = !planned.diagnostics.is_empty();
+            if let Some(uri) = self.push_planned(planned).await
+                && has_findings
+            {
+                pushed_live_uris.push(uri);
             }
-
-            let filtered = filter_disabled_diagnostics(diags, &disabled);
-
-            // Re-loaded per URI: the first textDocument/diagnostic request can
-            // arrive while this loop awaits, flipping the client into pull
-            // mode mid-publish.
-            let use_pull_diagnostics = self.client_pulls.load(Ordering::SeqCst);
-            let is_live = live_documents.contains_key(&uri);
-            if !use_pull_diagnostics || !is_live {
-                self.client
-                    .publish_diagnostics(
-                        uri.clone(),
-                        filtered.clone(),
-                        snapshot.get(&uri).map(|state| state.version),
-                    )
-                    .await;
-                if is_live && !filtered.is_empty() {
-                    pushed_live_uris.push(uri.clone());
-                }
-            }
-
-            self.cached_diagnostics.write().await.insert(uri, filtered);
         }
 
-        self.clear_stale_diagnostics(&mut new_uris, snapshot, &live_documents)
-            .await;
+        let clears = {
+            let previous_uris = self.previous_diagnostic_uris.read().await;
+            let mut cache = self.cached_diagnostics.write().await;
+            plan_clears(&mut cache, &previous_uris, &mut new_uris, &context)
+        };
+        let cache_changed = changed_uris > 0 || !clears.is_empty();
+        for planned in clears {
+            self.push_planned(planned).await;
+        }
 
         *self.previous_diagnostic_uris.write().await = new_uris;
 
-        if self.client_pulls.load(Ordering::SeqCst) {
+        // A pull client re-pulls on the refresh. When no cache entry changed,
+        // what it holds is still current, so the refresh is skipped.
+        if cache_changed && self.client_pulls.load(Ordering::SeqCst) {
             // The first pull landed mid-loop: its open-document clear ran
             // before some pushes above, so those would otherwise double with
             // the pull namespace forever (subsequent runs skip live-document
@@ -1011,36 +1261,21 @@ impl FallowLspServer {
         }
     }
 
-    /// Clear diagnostics for URIs that had findings on the previous run but do
-    /// not this run, skipping stale URIs (re-inserted into `new_uris` so their
-    /// last-valid diagnostics survive) and removing them from the cache.
-    async fn clear_stale_diagnostics(
-        &self,
-        new_uris: &mut FxHashSet<Uri>,
-        snapshot: &VersionSnapshot,
-        live_documents: &FxHashMap<Uri, DocumentState>,
-    ) {
-        let previous_uris = self.previous_diagnostic_uris.read().await;
-        let mut cache = self.cached_diagnostics.write().await;
-        for old_uri in previous_uris.iter() {
-            if new_uris.contains(old_uri) {
-                continue;
-            }
-            if uri_is_stale(old_uri, snapshot, live_documents) {
-                new_uris.insert(old_uri.clone());
-                continue;
-            }
-            if !self.client_pulls.load(Ordering::SeqCst) || !live_documents.contains_key(old_uri) {
-                self.client
-                    .publish_diagnostics(
-                        old_uri.clone(),
-                        vec![],
-                        snapshot.get(old_uri).map(|state| state.version),
-                    )
-                    .await;
-            }
-            cache.remove(old_uri);
+    /// Push one planned publish unless a pull client reads it from the cache.
+    /// Returns the URI when the push went to an open document.
+    ///
+    /// `client_pulls` is read again for each message: the first
+    /// `textDocument/diagnostic` request can arrive while a run publishes,
+    /// and it moves the client into pull mode mid-run.
+    async fn push_planned(&self, planned: PlannedPublish) -> Option<Uri> {
+        if self.client_pulls.load(Ordering::SeqCst) && planned.is_live {
+            return None;
         }
+        let live_uri = planned.is_live.then(|| planned.uri.clone());
+        self.client
+            .publish_diagnostics(planned.uri, planned.diagnostics, planned.version)
+            .await;
+        live_uri
     }
 
     /// Fire `workspace/diagnostic/refresh` without blocking on the client's
