@@ -107,6 +107,13 @@ macro_rules! with_baseline_fields {
     };
 }
 
+mod prune;
+
+pub use prune::{
+    BaselinePrune, BaselinePruneRefusal, PrunedEntry, prune_dead_code_baseline,
+    prune_dupes_baseline, prune_health_baseline,
+};
+
 /// The sorted canonical keys of `items`, one for each occurrence.
 fn canonical_keys<T: IdentifiedFinding>(items: &[T], paths: &IdentityPaths<'_>) -> Vec<String> {
     let mut keys: Vec<String> = items.iter().map(|item| item.canonical_key(paths)).collect();
@@ -347,6 +354,29 @@ pub enum BaselineKind {
 }
 
 impl BaselineKind {
+    /// The command that removes only the stale entries of the baseline at
+    /// `path`.
+    #[must_use]
+    pub fn prune_command(self, path: &Path) -> String {
+        // The prune flags resolve a relative path against the project root,
+        // while `--baseline` resolves it against the working directory. An
+        // absolute path names the same file in both.
+        let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let display = absolute.display().to_string();
+        let quoted = if display
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '@' | '+'))
+        {
+            display
+        } else {
+            format!("'{}'", display.replace('\'', "'\\''"))
+        };
+        format!(
+            "fallow baselines prune --{}-baseline {quoted}",
+            self.as_str()
+        )
+    }
+
     /// The token this kind is written as, which is also the command to run.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -3271,7 +3301,7 @@ mod tests {
         assert!(!staleness(4, 4, 4).trips_gate());
     }
 
-    fn make_results() -> AnalysisResults {
+    pub(super) fn make_results() -> AnalysisResults {
         AnalysisResults {
             unused_files: vec![
                 UnusedFileFinding::with_actions(UnusedFile {
@@ -3711,7 +3741,7 @@ mod tests {
         assert_eq!(filtered.unused_exports[0].export.export_name, "helperB");
     }
 
-    fn make_clone_group(instances: Vec<(&str, usize, usize)>) -> CloneGroup {
+    pub(super) fn make_clone_group(instances: Vec<(&str, usize, usize)>) -> CloneGroup {
         let mut files: Vec<&str> = instances.iter().map(|(file, _, _)| *file).collect();
         files.sort_unstable();
         let fragment = format!("const source = '{}';", files.join(","));
@@ -3741,7 +3771,7 @@ mod tests {
         }
     }
 
-    fn make_duplication_report(groups: Vec<CloneGroup>) -> DuplicationReport {
+    pub(super) fn make_duplication_report(groups: Vec<CloneGroup>) -> DuplicationReport {
         DuplicationReport {
             clone_groups: groups,
             clone_families: vec![],
@@ -4366,7 +4396,7 @@ mod tests {
         )
     }
 
-    fn make_health_finding_with(
+    pub(super) fn make_health_finding_with(
         root: &Path,
         name: &str,
         line: u32,
@@ -4795,7 +4825,11 @@ mod tests {
             std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
         );
         let baseline = identity_baseline(
-            &[moved_finding(&root, "src/baseline.rs", "parseExpression")],
+            &[moved_finding(
+                &root,
+                "src/baseline/mod.rs",
+                "parseExpression",
+            )],
             &root,
         );
         let filtered = super::filter_new_health_findings(
