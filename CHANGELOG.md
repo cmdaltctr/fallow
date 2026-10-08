@@ -66,6 +66,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a validator that used the schema rejected the valid output of
   `fallow similar-code status --format json` and
   `fallow similar-code cache clear --format json`.
+- **A JavaScript array in a CI `run:` block no longer becomes an entry
+  pattern.** A heredoc such as `node <<'NODE'` that holds
+  `['packages/apps/public']` produced the token `[packages/apps/public]`. That
+  token failed glob compilation and logged `invalid entry pattern` on every
+  run. The scanner now rejects a bracket group that contains `/`. Route
+  segments such as `[id]` and `[...slug]` still pass.
+- **Jest configs with a custom name or a `.integration-spec` suffix now count
+  as test entries.** A project with `jest-integration.config.ts` next to
+  `jest.config.mjs` had every integration test and helper reported as unused.
+  Fallow now reads `jest-*.config.*` and `jest.*.config.*` files. A `testRegex`
+  that is only a literal suffix, such as `\.integration-spec\.ts$`, now maps
+  to `**/*.integration-spec.ts`. A prefixed regex keeps its own suffix and no
+  longer falls back to `*.test`. The patterns of every jest config now add up.
+  Before, one config with its own pattern dropped the default test files of the
+  others. On a large Nx monorepo this removed about 1,450 false unused files.
+- **A `--config` file that a script passes to `jest` is read.** Before, only
+  `vitest` did this. A script config file is now also a used file when the path
+  starts with `./`.
+- **A member that a leaf class calls now reaches the base of a long `extends`
+  chain.** With `Child extends Mid extends Base`, a call to `Base.start` through
+  `new Child().start()` was reported as an unused class member. Fallow moved an
+  access one level for each pass over an unordered map. It now repeats the pass
+  until nothing changes. An access through one child still does not reach a
+  sibling class.
+- **GraphQL Codegen configs with other names or `.cjs` now count.** Fallow reads
+  `codegen*.{ts,js,cjs,mjs}` and uses the `documents` globs of each config as
+  entry points. The codegen run reads those files, so no import reaches them.
+  On a large Nx monorepo this removed about 300 false unused files.
+- **Commands of Nx `run-commands` targets now count as scripts.** A command in a
+  `project.json` target, such as `tsx scripts/seed.ts` or
+  `jest --config ./jest-integration.config.ts`, credited nothing. Fallow now
+  reads the `command` and `commands` of every `nx:run-commands` target, with
+  the `{projectRoot}` and `{workspaceRoot}` tokens and the `configurations`
+  that set their own command. A call to another target of the same project,
+  such as `nx ts-node -- src/run.ts`, uses the command of that target. A target
+  that runs from another directory is skipped, because its relative paths
+  would point at the wrong files.
+
+- **`workspaces.patterns` in the config now adds workspace packages.** The key
+  was documented and parsed, but no code read it. A package outside the globs of
+  `package.json` or `pnpm-workspace.yaml` got no plugin, no entry points, and
+  no dependency check of its own. Fallow now adds these globs to the manifest
+  globs for analysis and for `fallow list --workspaces`. On a large Nx monorepo
+  with 22 undeclared app packages, this removed about 1,900 false unused files.
+  `--workspace` and `--changed-workspaces` also use them in `check`, `dupes`
+  and `health`. `flags`, `security`, `suppressions`, `--group-by package`, and
+  `coverage` still read the manifest globs only.
+
 
 ### Added
 
