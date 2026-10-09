@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `fallow coverage upload-source-maps` no longer loses maps that share a
+  file name. With the default `--strip-path=true`, a `tsc` output tree with
+  more than one `index.js.map` sent each map under the same name, and the
+  cloud kept only the last one. Maps that share a basename are now sent under
+  their path in the build directory, and the command prints which maps it
+  renamed. Thanks @voslartomas for the report (#3298).
+- `fallow coverage upload-source-maps` now warns when the `sources` of a map
+  do not point at files in the repository. A `sourceRoot` such as `"/"` in
+  `tsconfig.json` removes the `src/` segment from each source path, so
+  runtime coverage cannot resolve to source. The warning names the map, the
+  source, and the `sourceRoot`, and runs in `--dry-run` too (#3298).
 - **A class in a CSS Modules global scope is no longer an unused export.**
   CSS Modules do not put a global class in the class map of the module, so
   you cannot import it. Fallow now skips the classes in `:global(.a .b)`,
