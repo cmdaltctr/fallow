@@ -22,8 +22,8 @@ use crate::{
     BoundaryViolationsProgrammaticOutput, CircularDependenciesProgrammaticOutput, DeadCodeFilters,
     DeadCodeOptions, DeadCodeProgrammaticOutput, ProgrammaticError,
     analysis_context::{
-        ProgrammaticAnalysisContext, changed_files_for_run,
-        resolve_programmatic_analysis_context_deferred_workspace, workspace_roots_for_session,
+        ProgrammaticAnalysisContext, changed_files_for_run, resolve_programmatic_analysis_context,
+        workspace_roots_for_session,
     },
     next_steps::{
         audit_changed_applicable, default_workspace_ref_for_workspaces, setup_pointer_applicable,
@@ -65,7 +65,7 @@ pub fn run_dead_code_with_baseline(
     options: &DeadCodeOptions,
     baseline: Option<&Path>,
 ) -> ProgrammaticResult<DeadCodeProgrammaticOutput> {
-    let resolved = resolve_programmatic_analysis_context_deferred_workspace(&options.analysis)?;
+    let resolved = resolve_programmatic_analysis_context(&options.analysis)?;
     run_dead_code_in_context(options, baseline, &resolved)
 }
 
@@ -239,7 +239,7 @@ pub fn run_circular_dependencies(
     options: &DeadCodeOptions,
 ) -> ProgrammaticResult<CircularDependenciesProgrammaticOutput> {
     reject_finding_ids(options)?;
-    let resolved = resolve_programmatic_analysis_context_deferred_workspace(&options.analysis)?;
+    let resolved = resolve_programmatic_analysis_context(&options.analysis)?;
     resolved.install(|| {
         run_dead_code_inner(options, &resolved, keep_circular_dependencies).map(Into::into)
     })
@@ -261,7 +261,7 @@ pub fn run_architecture(
     options: &ArchitectureOptions,
 ) -> ProgrammaticResult<ArchitectureProgrammaticOutput> {
     let dead_code = options.dead_code_options();
-    let resolved = resolve_programmatic_analysis_context_deferred_workspace(&dead_code.analysis)?;
+    let resolved = resolve_programmatic_analysis_context(&dead_code.analysis)?;
     resolved.install(|| {
         let start = Instant::now();
         resolved.ensure_not_cancelled("config load and file discovery")?;
@@ -291,7 +291,7 @@ pub fn run_boundary_violations(
     options: &DeadCodeOptions,
 ) -> ProgrammaticResult<BoundaryViolationsProgrammaticOutput> {
     reject_finding_ids(options)?;
-    let resolved = resolve_programmatic_analysis_context_deferred_workspace(&options.analysis)?;
+    let resolved = resolve_programmatic_analysis_context(&options.analysis)?;
     resolved.install(|| {
         run_dead_code_inner(options, &resolved, keep_boundary_violations).map(Into::into)
     })
@@ -841,6 +841,7 @@ pub(super) fn default_dead_code_options_for_context(
         filters: DeadCodeFilters::default(),
         files: Vec::new(),
         include_entry_exports: false,
+        show_cascade: false,
     }
 }
 
@@ -850,6 +851,9 @@ fn configure_project_for_dead_code(
 ) -> ProjectConfig {
     if options.include_entry_exports {
         project_config.config.include_entry_exports = true;
+    }
+    if options.show_cascade {
+        project_config.config.show_cascade = true;
     }
     activate_explicit_dead_code_opt_ins(&options.filters, &mut project_config.config.rules);
     project_config
@@ -966,6 +970,7 @@ fn dead_code_filters_active(filters: &DeadCodeFilters) -> bool {
 fn apply_dead_code_core_filters(filters: &DeadCodeFilters, results: &mut AnalysisResults) {
     if !filters.unused_files {
         results.unused_files.clear();
+        results.cascade.suppressed_unused_files.clear();
     }
     if !filters.unused_exports {
         results.unused_exports.clear();

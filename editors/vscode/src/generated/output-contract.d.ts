@@ -3122,6 +3122,16 @@ thin_wrappers?: ThinWrapperFinding[]
  */
 duplicate_prop_shapes?: DuplicatePropShapeFinding[]
 /**
+ * Number of `unused_exports`, `unused_types`, `unused_class_members` and
+ * `unused_enum_members` findings that this run did not report because
+ * their file is an unused file. Deleting the file removes them, so they
+ * add no information. `--show-cascade` or the `showCascade` config key
+ * keeps them in the report, and then this count is zero. The count is
+ * taken after the scope and the rules and before a baseline. Serialized
+ * only when not zero, so a run without such findings keeps its JSON.
+ */
+cascade_hidden?: number
+/**
  * Count deltas against the matched baseline, in baseline runs.
  */
 baseline_deltas?: (BaselineDeltas | null)
@@ -13332,6 +13342,13 @@ groups: CheckGroupedEntry[]
  */
 unused_load_data_keys_global_abstain?: boolean
 /**
+ * Number of export and member findings that the run hid because their
+ * file is an unused file. The count covers the whole run, so it is on
+ * the root and not in a group. Serialized only when not zero, like the
+ * flat `CheckOutput` field.
+ */
+cascade_hidden?: number
+/**
  * This run's view of the loaded baseline, present only in baseline runs.
  * Carries the staleness counts, the advisory verdict and `gate_trips`, the
  * same boolean `--fail-on-stale-baseline` exits on, so a CI integration
@@ -13752,6 +13769,16 @@ thin_wrappers?: ThinWrapperFinding[]
  * enables it.
  */
 duplicate_prop_shapes?: DuplicatePropShapeFinding[]
+/**
+ * Number of `unused_exports`, `unused_types`, `unused_class_members` and
+ * `unused_enum_members` findings that this run did not report because
+ * their file is an unused file. Deleting the file removes them, so they
+ * add no information. `--show-cascade` or the `showCascade` config key
+ * keeps them in the report, and then this count is zero. The count is
+ * taken after the scope and the rules and before a baseline. Serialized
+ * only when not zero, so a run without such findings keeps its JSON.
+ */
+cascade_hidden?: number
 }
 /**
  * Envelope emitted by `fallow architecture --group-by ... --format json`.
@@ -13779,6 +13806,13 @@ groups: CheckGroupedEntry[]
  * only when `true`, like the flat `CheckOutput` field.
  */
 unused_load_data_keys_global_abstain?: boolean
+/**
+ * Number of export and member findings that the run hid because their
+ * file is an unused file. The count covers the whole run, so it is on
+ * the root and not in a group. Serialized only when not zero, like the
+ * flat `CheckOutput` field.
+ */
+cascade_hidden?: number
 /**
  * This run's view of the loaded baseline, present only in baseline runs.
  * Carries the staleness counts, the advisory verdict and `gate_trips`, the
@@ -15446,6 +15480,16 @@ thin_wrappers?: ThinWrapperFinding[]
  * enables it.
  */
 duplicate_prop_shapes?: DuplicatePropShapeFinding[]
+/**
+ * Number of `unused_exports`, `unused_types`, `unused_class_members` and
+ * `unused_enum_members` findings that this run did not report because
+ * their file is an unused file. Deleting the file removes them, so they
+ * add no information. `--show-cascade` or the `showCascade` config key
+ * keeps them in the report, and then this count is zero. The count is
+ * taken after the scope and the rules and before a baseline. Serialized
+ * only when not zero, so a run without such findings keeps its JSON.
+ */
+cascade_hidden?: number
 /**
  * Count deltas against the matched baseline, in baseline runs.
  */

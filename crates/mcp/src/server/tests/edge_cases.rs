@@ -35,6 +35,7 @@ fn check_changed_args_with_special_ref() {
         regression_baseline: None,
         save_regression_baseline: None,
         include_entry_exports: None,
+        show_cascade: None,
         no_cache: None,
         threads: None,
     };
@@ -81,6 +82,7 @@ fn check_changed_args_production_false_is_omitted() {
         regression_baseline: None,
         save_regression_baseline: None,
         include_entry_exports: None,
+        show_cascade: None,
         no_cache: None,
         threads: None,
     };
@@ -168,6 +170,27 @@ fn fix_apply_args_production_false_is_omitted() {
     };
     let args = build_fix_apply_args(&params);
     assert!(!args.contains(&"--production".to_string()));
+}
+
+#[test]
+fn fix_args_pass_show_cascade_only_when_true() {
+    for show_cascade in [None, Some(false), Some(true)] {
+        let params = FixParams {
+            show_cascade,
+            ..Default::default()
+        };
+        let expected = show_cascade == Some(true);
+        for args in [
+            build_fix_preview_args(&params),
+            build_fix_apply_args(&params),
+        ] {
+            assert_eq!(
+                args.contains(&"--show-cascade".to_string()),
+                expected,
+                "{show_cascade:?}: {args:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -280,6 +303,7 @@ fn check_changed_args_only_root() {
         regression_baseline: None,
         save_regression_baseline: None,
         include_entry_exports: None,
+        show_cascade: None,
         no_cache: None,
         threads: None,
     };
@@ -545,6 +569,7 @@ fn check_changed_args_baseline_only() {
         regression_baseline: None,
         save_regression_baseline: None,
         include_entry_exports: None,
+        show_cascade: None,
         no_cache: None,
         threads: None,
     };
@@ -570,6 +595,7 @@ fn check_changed_args_save_baseline_only() {
         regression_baseline: None,
         save_regression_baseline: None,
         include_entry_exports: None,
+        show_cascade: None,
         no_cache: None,
         threads: None,
     };
@@ -713,6 +739,7 @@ fn check_changed_args_empty_config_is_dropped() {
         regression_baseline: None,
         save_regression_baseline: None,
         include_entry_exports: None,
+        show_cascade: None,
         no_cache: None,
         threads: None,
     };
@@ -785,6 +812,7 @@ fn check_changed_args_no_cache_true() {
         regression_baseline: None,
         save_regression_baseline: None,
         include_entry_exports: None,
+        show_cascade: None,
         threads: None,
     };
     let args = build_check_changed_args(params);

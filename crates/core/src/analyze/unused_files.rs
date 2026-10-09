@@ -5,6 +5,25 @@ use crate::suppress::{IssueKind, SuppressionContext};
 
 use super::predicates::{is_barrel_with_reachable_sources, is_config_file, is_html_file};
 
+/// The reported unused files only. Tests read this shape.
+#[cfg(test)]
+pub fn find_unused_files(
+    graph: &ModuleGraph,
+    suppressions: &SuppressionContext<'_>,
+) -> Vec<UnusedFile> {
+    find_unused_file_scan(graph, suppressions).files
+}
+
+/// The unused files of one run, with and without inline suppressions.
+pub struct UnusedFileScan {
+    /// The files that the report lists.
+    pub files: Vec<UnusedFile>,
+    /// The unused files whose finding an inline `fallow-ignore-file
+    /// unused-file` comment suppressed. The cascade filter treats them as
+    /// reported, so a suppression comment never adds a finding.
+    pub suppressed: Vec<std::path::PathBuf>,
+}
+
 /// Find files that are not reachable from any entry point.
 ///
 /// TypeScript declaration files (`.d.ts`, `.d.mts`, `.d.cts`) are entry points
@@ -22,11 +41,14 @@ use super::predicates::{is_barrel_with_reachable_sources, is_config_file, is_htm
 /// Barrel files (index.ts that only re-export) are excluded when their re-export
 /// sources are reachable , they serve an organizational purpose even if consumers
 /// import directly from the source files rather than through the barrel.
-pub fn find_unused_files(
+///
+/// The scan also keeps the files that an inline suppression removed from the
+/// report, for the cascade filter.
+pub fn find_unused_file_scan(
     graph: &ModuleGraph,
     suppressions: &SuppressionContext<'_>,
-) -> Vec<UnusedFile> {
-    graph
+) -> UnusedFileScan {
+    let (suppressed, reported): (Vec<_>, Vec<_>) = graph
         .modules
         .iter()
         .filter(|m| !m.is_reachable() && !m.is_entry_point())
@@ -36,11 +58,16 @@ pub fn find_unused_files(
         .filter(|m| !has_reachable_importer(m.file_id, graph))
         .filter(|m| !has_reachable_export_reference(m.file_id, graph))
         .filter(|m| m.path.exists())
-        .filter(|m| !suppressions.is_file_suppressed(m.file_id, IssueKind::UnusedFile))
-        .map(|m| UnusedFile {
-            path: m.path.clone(),
-        })
-        .collect()
+        .partition(|m| suppressions.is_file_suppressed(m.file_id, IssueKind::UnusedFile));
+    UnusedFileScan {
+        files: reported
+            .into_iter()
+            .map(|m| UnusedFile {
+                path: m.path.clone(),
+            })
+            .collect(),
+        suppressed: suppressed.into_iter().map(|m| m.path.clone()).collect(),
+    }
 }
 
 /// Check if any reachable module has an edge to this file.
@@ -340,8 +367,14 @@ mod tests {
         supp_map.insert(FileId(1), supps_slice);
         let suppressions = SuppressionContext::from_map(supp_map);
 
-        let result = find_unused_files(&graph, &suppressions);
-        assert!(result.is_empty(), "suppressed file should not be flagged");
+        let scan = find_unused_file_scan(&graph, &suppressions);
+        assert!(
+            scan.files.is_empty(),
+            "suppressed file should not be flagged"
+        );
+        // The suppressed file stays known to the cascade filter, so the
+        // suppression comment does not make the findings in it visible again.
+        assert_eq!(scan.suppressed, vec![dir.path().join("orphan.ts")]);
     }
 
     #[test]

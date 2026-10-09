@@ -239,6 +239,7 @@ impl IssueFilters {
     fn apply_core_filters(&self, results: &mut fallow_types::results::AnalysisResults) {
         if !self.unused_files {
             results.unused_files.clear();
+            results.cascade.suppressed_unused_files.clear();
         }
         if !self.unused_exports {
             results.unused_exports.clear();
@@ -489,6 +490,8 @@ pub struct CheckOptions<'a> {
     pub finding_ids: Option<&'a fallow_engine::dead_code::FindingIdFilter>,
     /// Report unused exports in entry files instead of auto-marking them as used.
     pub include_entry_exports: bool,
+    /// Keep the export and member findings of unused files (`--show-cascade`).
+    pub show_cascade: bool,
     /// `--fail-on-parse-error`. Applied to the resolved config, which also
     /// carries the `failOnParseError` key, so the config holds the armed state.
     pub fail_on_parse_error: bool,
@@ -745,6 +748,9 @@ fn prepare_check_config(opts: &CheckOptions<'_>) -> Result<ResolvedConfig, ExitC
     if opts.include_entry_exports {
         config.include_entry_exports = true;
     }
+    if opts.show_cascade {
+        config.show_cascade = true;
+    }
     if opts.fail_on_parse_error {
         config.fail_on_parse_error = true;
     }
@@ -928,11 +934,13 @@ fn apply_rules_and_filters(
     config: &ResolvedConfig,
     results: &mut AnalysisResults,
 ) {
+    // The issue-type filter runs first, as in the programmatic runtime, so the
+    // rule pass counts `cascade_hidden` over the same selected kinds there.
+    opts.filters.apply(results);
     rules::apply_rules(results, config);
     if opts.fail_on_issues {
         rules::promote_finding_warns(results);
     }
-    opts.filters.apply(results);
 }
 
 /// The `--file` set of the run, resolved against the root, or `None` when the
@@ -1525,6 +1533,7 @@ pub fn benchmark_dead_code_json(
         scope: None,
         finding_ids: None,
         include_entry_exports: false,
+        show_cascade: false,
         fail_on_parse_error: false,
         summary: false,
         regression_opts: RegressionOpts {
@@ -2027,6 +2036,7 @@ pub fn run_check(opts: &CheckOptions<'_>) -> ExitCode {
         opts.group_by,
         opts.root,
         result.config.codeowners.as_deref(),
+        &result.config.workspace_patterns,
         opts.output,
     ) {
         Ok(r) => r,

@@ -588,6 +588,16 @@
       ]
     },
     {
+      "name": "--show-cascade",
+      "type": "bool",
+      "required": false,
+      "description": "Also report the unused exports, types, class members and enum members of unused files. By default the report hides them, because deleting the file removes them, and counts them in `cascade_hidden`",
+      "possible_values": [
+        "true",
+        "false"
+      ]
+    },
+    {
       "name": "--type-aware",
       "type": "bool",
       "required": false,
@@ -7753,7 +7763,7 @@
     ]
   },
   "plugins": {
-    "count": 133,
+    "count": 134,
     "note": "Built-in framework plugins, auto-activated when their enabler dependency is present; run fallow list --plugins for the set active in a specific project",
     "names": [
       "nextjs",
@@ -7774,6 +7784,7 @@
       "firebase",
       "nestjs",
       "nestjs-trpc",
+      "nest-commander",
       "adonis",
       "docusaurus",
       "gatsby",

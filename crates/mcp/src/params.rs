@@ -143,6 +143,11 @@ pub struct AnalyzeParams {
     /// Report unused exports in entry files instead of auto-marking them as used.
     pub include_entry_exports: Option<bool>,
 
+    /// Keep the unused exports, types, class members and enum members of
+    /// unused files. By default the report hides them and counts them in
+    /// `cascade_hidden`. Passed through to the CLI's `--show-cascade` flag.
+    pub show_cascade: Option<bool>,
+
     /// Disable the incremental parse cache.
     pub no_cache: Option<bool>,
 
@@ -184,6 +189,11 @@ pub struct CombinedParams {
 
     /// Report unused exports in entry files instead of auto-marking them as used.
     pub include_entry_exports: Option<bool>,
+
+    /// Keep the unused exports, types, class members and enum members of
+    /// unused files. By default the report hides them and counts them in
+    /// `cascade_hidden`. Passed through to the CLI's `--show-cascade` flag.
+    pub show_cascade: Option<bool>,
 
     /// Disable the incremental parse cache.
     pub no_cache: Option<bool>,
@@ -368,6 +378,11 @@ pub struct CheckChangedParams {
 
     /// Report unused exports in entry files instead of auto-marking them as used.
     pub include_entry_exports: Option<bool>,
+
+    /// Keep the unused exports, types, class members and enum members of
+    /// unused files. By default the report hides them and counts them in
+    /// `cascade_hidden`. Passed through to the CLI's `--show-cascade` flag.
+    pub show_cascade: Option<bool>,
 
     /// Disable the incremental parse cache.
     pub no_cache: Option<bool>,
@@ -645,6 +660,11 @@ pub struct FixParams {
     /// from pre-commit hooks and CI bots where silently materializing a new
     /// top-level config file would surprise the user.
     pub no_create_config: Option<bool>,
+
+    /// Also fix the unused exports, types, class members and enum members
+    /// of unused files. By default `fix` skips them, as the report hides
+    /// them. Passed through to the CLI's `--show-cascade` flag.
+    pub show_cascade: Option<bool>,
 
     /// Disable the incremental parse cache.
     pub no_cache: Option<bool>,
@@ -1795,6 +1815,11 @@ pub struct AuditParams {
     /// ORs with the config value. Passed through to the CLI's
     /// `--include-entry-exports` flag.
     pub include_entry_exports: Option<bool>,
+
+    /// Keep the unused exports, types, class members and enum members of
+    /// unused files. By default the report hides them and counts them in
+    /// `cascade_hidden`. Passed through to the CLI's `--show-cascade` flag.
+    pub show_cascade: Option<bool>,
 
     /// Runtime coverage input (V8 directory, V8 JSON, or Istanbul coverage
     /// map JSON). When set, audit adds runtime-coverage findings to the same

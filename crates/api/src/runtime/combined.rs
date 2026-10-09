@@ -12,9 +12,7 @@ use rustc_hash::FxHashSet;
 use crate::{
     AnalysisOptions, CombinedOptions, CombinedProgrammaticOutput, ComplexityOptions,
     DeadCodeFilters, DeadCodeOptions, DuplicationOptions, ProgrammaticError,
-    analysis_context::{
-        changed_files_for_run, resolve_programmatic_analysis_context_deferred_workspace,
-    },
+    analysis_context::{changed_files_for_run, resolve_programmatic_analysis_context},
     next_steps::{
         audit_changed_applicable, default_workspace_ref, default_workspace_ref_for_workspaces,
         setup_pointer_applicable, suggestions_enabled,
@@ -66,7 +64,7 @@ pub fn run_combined(options: &CombinedOptions) -> ProgrammaticResult<CombinedPro
     }
 
     let start = Instant::now();
-    let resolved = resolve_programmatic_analysis_context_deferred_workspace(&options.analysis)?;
+    let resolved = resolve_programmatic_analysis_context(&options.analysis)?;
     resolved.install(|| {
         resolved.ensure_not_cancelled("combined analysis")?;
         let production_modes = resolve_effective_production_modes(&resolved, None, None, None)?;
@@ -417,6 +415,7 @@ fn combined_dead_code_options(options: &CombinedOptions, production: bool) -> De
         filters: DeadCodeFilters::default(),
         files: Vec::new(),
         include_entry_exports: options.include_entry_exports,
+        show_cascade: options.show_cascade,
     }
 }
 

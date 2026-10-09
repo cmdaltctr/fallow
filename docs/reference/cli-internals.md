@@ -203,6 +203,50 @@ after every gate set the exit code.
     A change to
     the audit key form must bump `AUDIT_BASE_SNAPSHOT_CACHE_VERSION` in
     `crates/cli/src/audit_cache.rs`.
+- The unused-file cascade filter is
+  `fallow_engine::dead_code::hide_cascade_findings`. It runs inside
+  `apply_rule_severities`, so the CLI, the programmatic API, MCP, the Node
+  bindings and the editor diagnostics hide the same set. `fix` calls it
+  directly, because `fix` runs no rule pass. The filter removes
+  `unused_exports`, `unused_types`, `unused_class_members` and
+  `unused_enum_members` findings only when the report lists their file in
+  `unused_files`. Other finding kinds in an unused file stay.
+  - An inline `fallow-ignore-file unused-file` comment removes the file from
+    the report, and the filter still hides the export and member findings of
+    that file. The detector records such files in
+    `CascadeState::suppressed_unused_files`. A suppression comment therefore
+    never adds a finding (drift invariant I6).
+  - An issue-type selection without unused files, a scope, an
+    `ignoreFindings` pattern or an `off` rule that removes the file from the
+    report hides nothing in that file. The issue-type filters clear
+    `suppressed_unused_files` too. The CLI therefore runs the issue-type
+    filters before the rule pass, as the programmatic runtime does.
+  - With `--changed-since` or `--workspace`, `cascade_hidden` counts only the
+    findings in the scoped files, because the scope runs before the filter.
+  - The removed findings move to `CascadeState::hidden`, and
+    `AnalysisResults::cascade_hidden` counts them.
+  - SARIF writes the count as `cascadeHidden` in the run `properties`
+    (`fallow_output::dead_code_sarif`), and markdown adds one note line
+    (`fallow_api::build_markdown`). Both are absent when the count is zero.
+    CodeClimate, compact, GitHub annotations and grouped markdown do not
+    carry the count.
+  - The grouped envelope copies `cascade_hidden` to its root, as it does
+    with `unused_load_data_keys_global_abstain`. The groups are new result
+    sets, so no group carries the count.
+  - The baseline runs after the filter. A baseline entry for the unused file
+    does not make its findings visible again. A baseline entry that matches a
+    hidden finding counts as matched in `baseline_staleness`, and
+    `baselines prune` keeps it. A baseline saved while findings are hidden
+    does not contain them.
+  - A regression baseline (`--save-regression-baseline`) saved by an older
+    version counts the hidden findings. After the upgrade it has more
+    headroom, so users must save it again.
+  - `fallow_engine::health::shared_parse_data_from_artifacts` restores the
+    hidden findings before the health pipeline reads the dead-code results.
+    The vital signs, the file scores and the score therefore count them in
+    bare `fallow` and in standalone `health` alike.
+  - `--show-cascade`, the `showCascade` config key and the MCP and Node
+    `show_cascade` option turn the filter off.
 - `dead-code --finding-id <id>` (repeatable or comma-separated) reports only
   the requested findings. `fallow_engine::dead_code::FindingIdFilter` owns the
   syntax check and the filter; `FindingIdTrace` owns the evidence. The CLI
@@ -237,7 +281,7 @@ after every gate set the exit code.
   after `extends` without the keys in `NON_DETECTION_CONFIG_KEYS`, plus the
   loaded external plugins and rule packs, all as canonical JSON with sorted
   keys), the settings a surface changes after resolution (production mode,
-  `includeEntryExports`, the effective rules, type-aware mode and requirement,
+  `includeEntryExports`, `showCascade`, the effective rules, type-aware mode and requirement,
   type-aware project list, the file size limit) and the root-relative path and
   normalized content (CRLF to LF, trailing newlines removed) of these files:
   - every `.gitignore` and `.ignore` the walk reaches, and

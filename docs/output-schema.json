@@ -897,6 +897,10 @@
           },
           "description": "React/Preact components that participate in a duplicate-prop-shape group:\nthree or more components across two or more files whose statically-known\nprop NAME set is identical after stripping ubiquitous DOM / passthrough\nnames (a missing shared `Props` type / base component). Wrapped in\n[`DuplicatePropShapeFinding`] so each entry carries a typed `actions`\narray and its sibling roster natively. Health signal: the rule defaults to\n`off` (opt-in), so this is dormant and populated ONLY when the user\nenables it."
         },
+        "cascade_hidden": {
+          "type": "integer",
+          "description": "Number of `unused_exports`, `unused_types`, `unused_class_members` and\n`unused_enum_members` findings that this run did not report because\ntheir file is an unused file. Deleting the file removes them, so they\nadd no information. `--show-cascade` or the `showCascade` config key\nkeeps them in the report, and then this count is zero. The count is\ntaken after the scope and the rules and before a baseline. Serialized\nonly when not zero, so a run without such findings keeps its JSON."
+        },
         "baseline_deltas": {
           "anyOf": [
             {
@@ -1064,6 +1068,10 @@
         "unused_load_data_keys_global_abstain": {
           "type": "boolean",
           "description": "`true` when the `unused-load-data-key` detector abstained for the whole\nproject. The abstain has no file, so it is on the root and not in a\ngroup. An empty `unused_load_data_keys` with this flag set does not\nmean the project is clean: the rule could not run safely. Serialized\nonly when `true`, like the flat `CheckOutput` field."
+        },
+        "cascade_hidden": {
+          "type": "integer",
+          "description": "Number of export and member findings that the run hid because their\nfile is an unused file. The count covers the whole run, so it is on\nthe root and not in a group. Serialized only when not zero, like the\nflat `CheckOutput` field."
         },
         "baseline_staleness": {
           "anyOf": [
@@ -1513,6 +1521,10 @@
             "$ref": "#/definitions/DuplicatePropShapeFinding"
           },
           "description": "React/Preact components that participate in a duplicate-prop-shape group:\nthree or more components across two or more files whose statically-known\nprop NAME set is identical after stripping ubiquitous DOM / passthrough\nnames (a missing shared `Props` type / base component). Wrapped in\n[`DuplicatePropShapeFinding`] so each entry carries a typed `actions`\narray and its sibling roster natively. Health signal: the rule defaults to\n`off` (opt-in), so this is dormant and populated ONLY when the user\nenables it."
+        },
+        "cascade_hidden": {
+          "type": "integer",
+          "description": "Number of `unused_exports`, `unused_types`, `unused_class_members` and\n`unused_enum_members` findings that this run did not report because\ntheir file is an unused file. Deleting the file removes them, so they\nadd no information. `--show-cascade` or the `showCascade` config key\nkeeps them in the report, and then this count is zero. The count is\ntaken after the scope and the rules and before a baseline. Serialized\nonly when not zero, so a run without such findings keeps its JSON."
         }
       },
       "required": [
@@ -7068,6 +7080,10 @@
             "$ref": "#/definitions/DuplicatePropShapeFinding"
           },
           "description": "React/Preact components that participate in a duplicate-prop-shape group:\nthree or more components across two or more files whose statically-known\nprop NAME set is identical after stripping ubiquitous DOM / passthrough\nnames (a missing shared `Props` type / base component). Wrapped in\n[`DuplicatePropShapeFinding`] so each entry carries a typed `actions`\narray and its sibling roster natively. Health signal: the rule defaults to\n`off` (opt-in), so this is dormant and populated ONLY when the user\nenables it."
+        },
+        "cascade_hidden": {
+          "type": "integer",
+          "description": "Number of `unused_exports`, `unused_types`, `unused_class_members` and\n`unused_enum_members` findings that this run did not report because\ntheir file is an unused file. Deleting the file removes them, so they\nadd no information. `--show-cascade` or the `showCascade` config key\nkeeps them in the report, and then this count is zero. The count is\ntaken after the scope and the rules and before a baseline. Serialized\nonly when not zero, so a run without such findings keeps its JSON."
         }
       },
       "required": [
@@ -29876,6 +29892,10 @@
           "type": "boolean",
           "description": "`true` when the `unused-load-data-key` detector abstained for the whole\nproject. The abstain has no file, so it is on the root and not in a\ngroup. An empty `unused_load_data_keys` with this flag set does not\nmean the project is clean: the rule could not run safely. Serialized\nonly when `true`, like the flat `CheckOutput` field."
         },
+        "cascade_hidden": {
+          "type": "integer",
+          "description": "Number of export and member findings that the run hid because their\nfile is an unused file. The count covers the whole run, so it is on\nthe root and not in a group. Serialized only when not zero, like the\nflat `CheckOutput` field."
+        },
         "baseline_staleness": {
           "anyOf": [
             {
@@ -30337,6 +30357,10 @@
             "$ref": "#/definitions/DuplicatePropShapeFinding"
           },
           "description": "React/Preact components that participate in a duplicate-prop-shape group:\nthree or more components across two or more files whose statically-known\nprop NAME set is identical after stripping ubiquitous DOM / passthrough\nnames (a missing shared `Props` type / base component). Wrapped in\n[`DuplicatePropShapeFinding`] so each entry carries a typed `actions`\narray and its sibling roster natively. Health signal: the rule defaults to\n`off` (opt-in), so this is dormant and populated ONLY when the user\nenables it."
+        },
+        "cascade_hidden": {
+          "type": "integer",
+          "description": "Number of `unused_exports`, `unused_types`, `unused_class_members` and\n`unused_enum_members` findings that this run did not report because\ntheir file is an unused file. Deleting the file removes them, so they\nadd no information. `--show-cascade` or the `showCascade` config key\nkeeps them in the report, and then this count is zero. The count is\ntaken after the scope and the rules and before a baseline. Serialized\nonly when not zero, so a run without such findings keeps its JSON."
         },
         "baseline_deltas": {
           "anyOf": [

@@ -22,8 +22,7 @@ use crate::{
     AuditVerdict, ComplexityOptions, DeadCodeFilters, DeadCodeOptions, DuplicationOptions,
     ProgrammaticError,
     analysis_context::{
-        ProgrammaticAnalysisContext, changed_files_for_run,
-        resolve_programmatic_analysis_context_deferred_workspace,
+        ProgrammaticAnalysisContext, changed_files_for_run, resolve_programmatic_analysis_context,
     },
     audit_run::{
         AuditAnalyses, AuditAnalysesView, AuditBackend, AuditRun, AuditRunInput, DeadCodeView,
@@ -420,6 +419,7 @@ fn audit_subanalysis_options(
             filters: DeadCodeFilters::default(),
             files: Vec::new(),
             include_entry_exports: options.include_entry_exports,
+            show_cascade: options.show_cascade,
         },
         duplication: DuplicationOptions {
             analysis: analysis_with_production(analysis, options.production_dupes),
@@ -448,10 +448,8 @@ fn audit_subanalysis_options(
 fn audit_section_context(
     analysis: &AnalysisOptions,
 ) -> ProgrammaticResult<ProgrammaticAnalysisContext> {
-    Ok(
-        resolve_programmatic_analysis_context_deferred_workspace(analysis)?
-            .with_change_scope_owner(ChangeScopeOwner::Caller),
-    )
+    Ok(resolve_programmatic_analysis_context(analysis)?
+        .with_change_scope_owner(ChangeScopeOwner::Caller))
 }
 
 fn run_audit_subanalyses(
