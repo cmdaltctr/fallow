@@ -4,7 +4,8 @@
 //! directory. The gate reads the session directory from the `cwd` field of
 //! the hook input and runs the audit from the audit root of that directory.
 //! Each test runs the rendered script in bash with a stub `fallow` on `PATH`.
-//! The stub writes the directory of the `audit` call to a log file.
+//! The stub adds the directory of each `audit` call to a log file. It returns
+//! a fail verdict in a directory that holds `STUB_FAIL_MARKER`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,8 +17,15 @@ use super::rendered_gate_script;
 
 const STUB_FALLOW: &str = "#!/bin/sh\n\
 if [ \"$1\" = \"--version\" ]; then echo 'fallow 9.0.0'; exit 0; fi\n\
-pwd -P > \"$FALLOW_STUB_LOG\"\n\
-echo '{\"verdict\":\"pass\"}'\n";
+pwd -P >> \"$FALLOW_STUB_LOG\"\n\
+if [ -f .stub-error ]; then echo '{\"error\":true,\"message\":\"stub\"}'; exit 2; fi\n\
+if [ -f .stub-fail ]; then echo '{\"verdict\":\"fail\"}'; else echo '{\"verdict\":\"pass\"}'; fi\n";
+
+/// A file that makes the stub return a fail verdict in its directory.
+const STUB_FAIL_MARKER: &str = ".stub-fail";
+
+/// A file that makes the stub report a runtime error in its directory.
+const STUB_ERROR_MARKER: &str = ".stub-error";
 
 /// Environment variables that point git at a different repository. A git
 /// hook that runs the test suite sets some of them.
@@ -100,8 +108,8 @@ fn init_repo(dir: &Path) {
 
 struct GateRun {
     output: Output,
-    /// The directory of the `audit` call, or `None` when the audit did not run.
-    audit_dir: Option<PathBuf>,
+    /// The directory of each `audit` call, in call order.
+    audit_dirs: Vec<PathBuf>,
 }
 
 /// Runs `script` in bash from `process_dir`, the way a handler starts it.
@@ -164,10 +172,12 @@ fn run_gate_with_debug(
         .write_all(payload.to_string().as_bytes())
         .unwrap();
     let output = child.wait_with_output().expect("wait");
-    let audit_dir = std::fs::read_to_string(&log)
-        .ok()
-        .map(|text| PathBuf::from(text.trim_end()));
-    GateRun { output, audit_dir }
+    let audit_dirs = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(PathBuf::from)
+        .collect();
+    GateRun { output, audit_dirs }
 }
 
 fn commit_payload(cwd: &Path) -> serde_json::Value {
@@ -185,8 +195,8 @@ fn assert_audited_in(run: &GateRun, expected: &Path, case: &str) {
         String::from_utf8_lossy(&run.output.stderr)
     );
     assert_eq!(
-        run.audit_dir.as_deref(),
-        Some(expected),
+        run.audit_dirs,
+        [expected],
         "{case}: wrong audit root; stderr={}",
         String::from_utf8_lossy(&run.output.stderr)
     );
@@ -352,7 +362,10 @@ fn gate_skips_other_commands_before_the_audit_root_work() {
         "fallow-gate: not a git commit/push, skipping audit.\n",
         "a skipped command must write only the skip line"
     );
-    assert_eq!(run.audit_dir, None, "a skipped command must not audit");
+    assert!(
+        run.audit_dirs.is_empty(),
+        "a skipped command must not audit"
+    );
 
     let commit = serde_json::json!({
         "cwd": session,
@@ -520,4 +533,730 @@ fn user_scope_gate_audits_the_git_top_level_of_the_session() {
 
     let run = run_gate(&gate, &home, &home, &commit_payload(&not_a_repo));
     assert_audited_in(&run, &not_a_repo, "session outside a git repository");
+}
+
+fn command_payload(cwd: &Path, command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "cwd": cwd,
+        "tool_input": { "command": command },
+    })
+}
+
+/// A main checkout with the gate and two linked worktrees beside it. The
+/// session works in worktree `a`; the hook process starts in the main
+/// checkout. Worktree `b` has a space in its name. Worktree `c` is a third,
+/// clean tree for the redirection cases.
+struct TwoWorktrees {
+    _tmp: TempDir,
+    root: PathBuf,
+    gate: PathBuf,
+    main: PathBuf,
+    a: PathBuf,
+    b: PathBuf,
+    c: PathBuf,
+}
+
+fn two_worktrees() -> TwoWorktrees {
+    let (tmp, root) = spaced_root();
+    let main = root.join("main");
+    init_repo(&main);
+    let gate = install_gate(&main, ".claude");
+    let a = root.join("wt-a");
+    let b = root.join("wt b");
+    let c = root.join("wt-c");
+    for worktree in [&a, &b, &c] {
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                worktree.to_str().unwrap(),
+            ],
+        );
+    }
+    TwoWorktrees {
+        _tmp: tmp,
+        root,
+        gate,
+        main,
+        a,
+        b,
+        c,
+    }
+}
+
+/// Runs each `(case, command, expected audit roots)` from a session in
+/// worktree `a/src` and checks the audit roots in order.
+fn assert_cases(trees: &TwoWorktrees, cases: &[(&str, String, Vec<&Path>)]) {
+    let session = trees.a.join("src");
+    std::fs::create_dir_all(&session).unwrap();
+    std::fs::create_dir_all(trees.c.join("src")).unwrap();
+    for (case, command, expected) in cases {
+        let run = run_gate(
+            &trees.gate,
+            &trees.main,
+            &trees.root.join("home"),
+            &command_payload(&session, command),
+        );
+        assert_eq!(
+            run.output.status.code(),
+            Some(0),
+            "{case}: the gate must pass on pass verdicts; stderr={}",
+            String::from_utf8_lossy(&run.output.stderr)
+        );
+        assert_eq!(
+            &run.audit_dirs,
+            expected,
+            "{case}: wrong audit roots for {command:?}; stderr={}",
+            String::from_utf8_lossy(&run.output.stderr)
+        );
+    }
+}
+
+/// A git write in the strict grammar (`[cd <dir> &&] git [-C <dir>]...
+/// commit|push ...`) audits only the tree that it targets. A session in
+/// worktree `a` that commits in worktree `b` must not be blocked by findings
+/// in `a`.
+#[test]
+fn gate_audits_only_the_target_of_a_strict_git_write() {
+    if skip_without_tools() {
+        return;
+    }
+    let trees = two_worktrees();
+    let (a, b, c) = (trees.a.as_path(), trees.b.as_path(), trees.c.as_path());
+    let bq = trees.b.display().to_string();
+    let cq = trees.c.display().to_string();
+    let cases: Vec<(&str, String, Vec<&Path>)> = vec![
+        ("plain commit", "git commit -m x".to_owned(), vec![a]),
+        (
+            "-C with a double-quoted path",
+            format!("git -C \"{bq}\" commit -m x"),
+            vec![b],
+        ),
+        (
+            "-C with a single-quoted path",
+            format!("git -C '{bq}' commit -m x"),
+            vec![b],
+        ),
+        (
+            "relative -C",
+            "git -C '../../wt b' commit -m 'a b'".to_owned(),
+            vec![b],
+        ),
+        (
+            "cumulative -C",
+            format!("git -C \"{cq}\" -C '../wt b' commit"),
+            vec![b],
+        ),
+        (
+            "cd and &&",
+            format!("cd \"{bq}\" && git commit -m \"a b\""),
+            vec![b],
+        ),
+        (
+            "relative cd",
+            "cd ../../wt-c && git commit -m x".to_owned(),
+            vec![c],
+        ),
+        (
+            "message on two lines",
+            "git -C ../../wt-c commit -m \"line one\nline two\"".to_owned(),
+            vec![c],
+        ),
+    ];
+    assert_cases(&trees, &cases);
+}
+
+/// Linked worktrees share refs. A strict push from another linked worktree
+/// of the session repository can send the branch or tags of the session, so
+/// it keeps the session audit and adds the target.
+#[test]
+fn gate_keeps_the_session_audit_for_a_push_from_a_linked_worktree() {
+    if skip_without_tools() {
+        return;
+    }
+    let trees = two_worktrees();
+    let (a, b, c) = (trees.a.as_path(), trees.b.as_path(), trees.c.as_path());
+    let main = trees.main.as_path();
+    let cases: Vec<(&str, String, Vec<&Path>)> = vec![
+        (
+            "push from the main checkout",
+            "git -C ../../main push origin feat-a".to_owned(),
+            vec![a, main],
+        ),
+        (
+            "push from a sibling worktree",
+            "git -C '../../wt b' push origin feat-a".to_owned(),
+            vec![a, b],
+        ),
+        (
+            "push tags",
+            "git -C ../../wt-c push --tags".to_owned(),
+            vec![a, c],
+        ),
+        (
+            "cd and push",
+            "cd ../../wt-c && git push origin main".to_owned(),
+            vec![a, c],
+        ),
+    ];
+    assert_cases(&trees, &cases);
+
+    // A clone has its own refs: a push from it audits only the clone.
+    let clone = trees.root.join("clone");
+    git(
+        &trees.root,
+        &[
+            "clone",
+            "-q",
+            trees.main.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+    );
+    let cases: Vec<(&str, String, Vec<&Path>)> = vec![(
+        "push from a clone",
+        "git -C ../../clone push origin main".to_owned(),
+        vec![clone.as_path()],
+    )];
+    assert_cases(&trees, &cases);
+}
+
+/// Every other git write audits the session tree, plus each candidate
+/// directory that the scan finds and that exists. A command that the scan
+/// reads wrong can only add audits, never move the audit to a clean tree.
+#[test]
+fn gate_audits_the_session_tree_for_other_git_writes() {
+    if skip_without_tools() {
+        return;
+    }
+    let trees = two_worktrees();
+    let (a, c) = (trees.a.as_path(), trees.c.as_path());
+    let bq = trees.b.display().to_string();
+    let gone = trees.root.join("gone").display().to_string();
+    let a_file = trees.a.join("README.md");
+    std::fs::write(&a_file, "readme\n").unwrap();
+    let cases: Vec<(&str, String, Vec<&Path>)> = vec![
+        (
+            "missing target",
+            format!("git -C \"{gone}\" commit -m x"),
+            vec![a],
+        ),
+        (
+            "file target",
+            format!("git -C \"{}\" commit -m x", a_file.display()),
+            vec![a],
+        ),
+        (
+            "escaped space",
+            format!("git -C {} commit -m x", bq.replace(' ', "\\ ")),
+            vec![a],
+        ),
+        ("cd and ;", format!("cd \"{bq}\"; git commit -m x"), vec![a]),
+        (
+            "--git-dir and --work-tree",
+            "git --git-dir=../../wt-c/.git --work-tree=../../wt-c commit".to_owned(),
+            vec![a, c],
+        ),
+        (
+            "-C of another git command",
+            "git -C ../../wt-c status && git commit".to_owned(),
+            vec![a],
+        ),
+        (
+            "cd -",
+            "cd ../../wt-c && cd - && git commit".to_owned(),
+            vec![a],
+        ),
+        (
+            "cd ..",
+            "cd ../../wt-c/src; cd ..; git commit".to_owned(),
+            vec![a, c],
+        ),
+        (
+            "pushd and popd",
+            "pushd ../../wt-c; popd; git commit".to_owned(),
+            vec![a],
+        ),
+        (
+            "cd $OLDPWD",
+            "cd \"$OLDPWD\" && git commit".to_owned(),
+            vec![a],
+        ),
+        ("cd ~", "cd ~ && git commit".to_owned(), vec![a]),
+        ("bare cd", "cd && git commit".to_owned(), vec![a]),
+        (
+            "a cd that fails",
+            format!("cd \"{gone}\"; git commit"),
+            vec![a],
+        ),
+    ];
+    assert_cases(&trees, &cases);
+}
+
+/// Shell forms that a simple scan can read wrong still audit the session
+/// tree.
+#[test]
+fn gate_audits_the_session_tree_for_shell_forms() {
+    if skip_without_tools() {
+        return;
+    }
+    let trees = two_worktrees();
+    let (a, c) = (trees.a.as_path(), trees.c.as_path());
+    let cases: Vec<(&str, String, Vec<&Path>)> = vec![
+        (
+            "ANSI-C quoting",
+            "git -C $'../../wt-c' commit".to_owned(),
+            vec![a],
+        ),
+        (
+            "escaped quotes",
+            "git commit -m \"say \\\"hi\\\"\" && git -C ../../wt-c push".to_owned(),
+            vec![a, c],
+        ),
+        (
+            "line continuation",
+            "git \\\n  -C ../../wt-c \\\n  commit -m x".to_owned(),
+            vec![a],
+        ),
+        (
+            "bash -c",
+            "bash -c 'git -C ../../wt-c commit -m x'".to_owned(),
+            vec![a],
+        ),
+        ("sh -c", "sh -c \"git commit -m x\"".to_owned(), vec![a]),
+        ("eval", "eval 'git commit -m x'".to_owned(), vec![a]),
+        ("env", "env git -C ../../wt-c commit".to_owned(), vec![a, c]),
+        ("command", "command git commit".to_owned(), vec![a]),
+        (
+            "-C with a substitution",
+            "git -C \"$(pwd)\" commit".to_owned(),
+            vec![a],
+        ),
+        (
+            "cd ||",
+            "cd ../../wt-c || git commit".to_owned(),
+            vec![a, c],
+        ),
+        (
+            "subshell",
+            "( cd ../../wt-c && git commit ); git push".to_owned(),
+            vec![a, c],
+        ),
+        (
+            "GIT_DIR prefix",
+            "GIT_DIR=../../wt-c/.git git commit".to_owned(),
+            vec![a, c],
+        ),
+        (
+            "GIT_WORK_TREE prefix",
+            "GIT_WORK_TREE=../../wt-c git commit".to_owned(),
+            vec![a, c],
+        ),
+        (
+            "here-document",
+            "git commit -F - <<'EOF'\nit's done\nEOF\ngit -C ../../wt-c push".to_owned(),
+            vec![a, c],
+        ),
+        (
+            "write in a substitution",
+            "echo \"$(git -C ../../wt-c commit -m x)\"".to_owned(),
+            vec![a, c],
+        ),
+        ("backquotes", "echo `git commit`".to_owned(), vec![a]),
+        (
+            "pipeline",
+            "cd ../../wt-c | git commit".to_owned(),
+            vec![a, c],
+        ),
+        ("expanded subcommand", "git $SUB".to_owned(), vec![a]),
+        ("comment", "ls # git push".to_owned(), vec![a]),
+    ];
+    assert_cases(&trees, &cases);
+}
+
+/// Two git writes into two trees audit both trees. A fail verdict in the
+/// second tree blocks the command, also after a runtime error in the first.
+#[test]
+fn gate_blocks_when_one_of_several_audits_fails() {
+    if skip_without_tools() {
+        return;
+    }
+    let trees = two_worktrees();
+    let session = trees.a.join("src");
+    std::fs::create_dir_all(&session).unwrap();
+    let payload = command_payload(&session, "git -C ../../wt-c commit -m x && git push");
+    let home = trees.root.join("home");
+    let expected = [trees.a.as_path(), trees.c.as_path()];
+
+    let run = run_gate(&trees.gate, &trees.main, &home, &payload);
+    assert_eq!(run.output.status.code(), Some(0));
+    assert_eq!(run.audit_dirs, expected);
+
+    std::fs::write(trees.c.join(STUB_FAIL_MARKER), "").unwrap();
+    let run = run_gate(&trees.gate, &trees.main, &home, &payload);
+    assert_eq!(
+        run.output.status.code(),
+        Some(2),
+        "a fail verdict in the second tree must block; stderr={}",
+        String::from_utf8_lossy(&run.output.stderr)
+    );
+    assert_eq!(run.audit_dirs, expected);
+
+    std::fs::write(trees.a.join(STUB_ERROR_MARKER), "").unwrap();
+    let run = run_gate(&trees.gate, &trees.main, &home, &payload);
+    assert_eq!(
+        run.output.status.code(),
+        Some(2),
+        "a runtime error in the first tree must not hide the fail; stderr={}",
+        String::from_utf8_lossy(&run.output.stderr)
+    );
+    assert_eq!(run.audit_dirs, expected);
+}
+
+/// A strict form with an active word is not strict: an expansion in a
+/// double-quoted message, a git config override, or an option that runs a
+/// command or reads a file. The gate then audits the session tree too.
+#[test]
+fn gate_leaves_the_strict_form_for_active_words() {
+    if skip_without_tools() {
+        return;
+    }
+    let trees = two_worktrees();
+    let (a, c) = (trees.a.as_path(), trees.c.as_path());
+    let target = "git -C ../../wt-c";
+    let cases: Vec<(&str, String, Vec<&Path>)> = [
+        ("substitution in a message", "commit -m \"$(git push)\""),
+        ("backquotes in a message", "commit -m \"`git push`\""),
+        ("parameter in a message", "commit -m \"$X\""),
+        ("substitution in an option", "commit -S\"$(git push)\" -m x"),
+        ("commit template", "commit --template=/tmp/t"),
+        ("commit message file", "commit -F /tmp/m"),
+        ("commit reuse message", "commit -c HEAD"),
+        ("push receive-pack", "push --receive-pack=x origin"),
+        ("push exec", "push --exec=x origin"),
+        ("push option", "push -o ci.skip origin"),
+        ("push repo", "push --repo=other"),
+        ("quoted option", "push origin '--receive-pack=x'"),
+        ("separator", "commit -m x -- file"),
+        ("carriage return", "commit -m x\rgit push"),
+    ]
+    .into_iter()
+    .map(|(case, rest)| (case, format!("{target} {rest}"), vec![a, c]))
+    .chain([
+        (
+            "config override",
+            "git -c core.hooksPath=/tmp/h -C ../../wt-c commit -m x".to_owned(),
+            vec![a, c],
+        ),
+        ("glob", "git -C ../../wt-* commit -m x".to_owned(), vec![a]),
+        ("tilde", "git -C ~ commit -m x".to_owned(), vec![a]),
+        (
+            "brace",
+            "git -C {../../wt-c} commit -m x".to_owned(),
+            vec![a],
+        ),
+        (
+            "variable",
+            "git -C \"$HOME\" commit -m x".to_owned(),
+            vec![a],
+        ),
+    ])
+    .collect();
+    assert_cases(&trees, &cases);
+}
+
+/// The strict form resolves its target with physical paths and requires a
+/// git work tree. Tabs separate words as in bash.
+#[test]
+fn gate_resolves_the_strict_target_physically() {
+    if skip_without_tools() {
+        return;
+    }
+    let trees = two_worktrees();
+    let (a, c) = (trees.a.as_path(), trees.c.as_path());
+    std::fs::create_dir_all(trees.root.join("plain")).unwrap();
+    std::os::unix::fs::symlink(&trees.c, trees.root.join("link-c")).unwrap();
+    let cases: Vec<(&str, String, Vec<&Path>)> = vec![
+        (
+            "symlinked target",
+            "git -C ../../link-c commit -m x".to_owned(),
+            vec![c],
+        ),
+        (
+            "tabs",
+            "git\t-C\t../../wt-c\tcommit\t-m\tx".to_owned(),
+            vec![c],
+        ),
+        (
+            "inert options",
+            "git -C ../../wt-c commit --amend --no-edit -m 'a' -m \"b\" -S".to_owned(),
+            vec![c],
+        ),
+        (
+            "push with names",
+            "git -C ../../wt-c push -u --force-with-lease origin HEAD:main".to_owned(),
+            vec![a, c],
+        ),
+        (
+            "not a work tree",
+            "git -C ../../plain commit -m x".to_owned(),
+            vec![a],
+        ),
+    ];
+    assert_cases(&trees, &cases);
+}
+
+/// A strict command into another part of the same work tree must not move
+/// the audit: `git commit` commits the whole index. Only git decides whether
+/// a target is another work tree. Here the install root is below the git
+/// root, with a sibling install, and the hook process starts in the install
+/// root of the session.
+#[test]
+fn gate_keeps_the_session_audit_inside_the_same_work_tree() {
+    if skip_without_tools() {
+        return;
+    }
+    let (_tmp, root) = spaced_root();
+    let repo = root.join("repo");
+    init_repo(&repo);
+    let app = repo.join("packages/app");
+    let gate = install_gate(&app, ".claude");
+    install_gate(&repo.join("packages/other"), ".claude");
+    std::fs::create_dir_all(repo.join("packages/empty/.git")).unwrap();
+    let linked = repo.join("packages/linked");
+    std::fs::create_dir_all(&linked).unwrap();
+    std::fs::write(
+        linked.join(".git"),
+        format!("gitdir: {}\n", repo.join(".git").display()),
+    )
+    .unwrap();
+    let repo_q = repo.display().to_string();
+    let cases = [
+        ("sibling package", "git -C ../other commit -m x".to_owned()),
+        (
+            "cd to the repo root",
+            format!("cd \"{repo_q}\" && git commit -m x"),
+        ),
+        ("-C to the repo root", "git -C ../.. commit -m x".to_owned()),
+        (
+            "empty .git directory",
+            "git -C ../empty commit -m x".to_owned(),
+        ),
+        (
+            "gitfile to the session repo",
+            "git -C ../linked commit -m x".to_owned(),
+        ),
+        ("cd -", "cd - && git commit -m x".to_owned()),
+        ("cd +1", "cd +1 && git commit -m x".to_owned()),
+        (
+            "cd through CDPATH form",
+            "cd packages && git commit -m x".to_owned(),
+        ),
+    ];
+    for (case, command) in cases {
+        let run = run_gate(
+            &gate,
+            &app,
+            &root.join("home"),
+            &command_payload(&app, &command),
+        );
+        assert_audited_in(&run, &app, case);
+    }
+
+    // The same commands without the session audit fail as on main.
+    std::fs::write(app.join(STUB_FAIL_MARKER), "").unwrap();
+    let run = run_gate(
+        &gate,
+        &app,
+        &root.join("home"),
+        &command_payload(&app, "git -C ../other commit -m x"),
+    );
+    assert_eq!(run.output.status.code(), Some(2));
+}
+
+/// `git -C` changes the directory with chdir(), so `link/..` is the parent
+/// of the link target, not the directory that holds the link. A `cd` resolves
+/// `..` logically, so `cd ./link/..` is not strict: the session tree stays in
+/// the audit, and the physical candidate only adds an audit.
+#[test]
+fn gate_resolves_git_c_physically_through_a_symlink() {
+    if skip_without_tools() {
+        return;
+    }
+    let trees = two_worktrees();
+    let session = trees.a.join("src");
+    std::fs::create_dir_all(&session).unwrap();
+    std::fs::create_dir_all(trees.c.join("src")).unwrap();
+    std::os::unix::fs::symlink(trees.c.join("src"), session.join("link")).unwrap();
+    let cases: Vec<(&str, String, Vec<&Path>)> = vec![
+        (
+            "-C link/..",
+            "git -C link/.. commit -m x".to_owned(),
+            vec![trees.c.as_path()],
+        ),
+        (
+            "cd link/..",
+            "cd ./link/.. && git commit -m x".to_owned(),
+            vec![trees.a.as_path(), trees.c.as_path()],
+        ),
+    ];
+    assert_cases(&trees, &cases);
+}
+
+/// The gate script on main before the target support, for the differential
+/// test.
+const MAIN_GATE_SCRIPT: &str = include_str!("setup_hooks/fallow-gate.main.sh");
+
+/// Commands for the differential test, run from a session in `wt-a/src`.
+const DIFFERENTIAL_COMMANDS: &[&str] = &[
+    "git commit -m x",
+    "git -C ../../wt-c commit -m x",
+    "git -C '../../wt b' push origin main",
+    "git -C ../../main push origin feat-a",
+    "git -C '../../wt b' push --tags",
+    "cd ../../wt-c && git push",
+    "git -C .. commit -m x",
+    "git -C ../../main commit -m x",
+    "cd ../../main && git commit -m x",
+    "git -C ../../wt-c -C ../main commit",
+    "git -C link/.. commit -m x",
+    "git -C ../../wt-c commit -m \"$(git push)\"",
+    "git -C ../../wt-c commit -m \"`git push`\"",
+    "git -c core.hooksPath=/tmp/h -C ../../wt-c commit -m x",
+    "git -C ../../wt-c commit -F /tmp/m",
+    "git -C ../../wt-c push --receive-pack=x origin",
+    "git --git-dir=../../wt-c/.git --work-tree=../../wt-c commit",
+    "GIT_DIR=../../wt-c/.git git commit",
+    "git -C ../../wt-c status && git commit",
+    "cd ../../wt-c && cd - && git commit",
+    "cd ../../wt-c/src; cd ..; git commit",
+    "pushd ../../wt-c; popd; git commit",
+    "cd ../../wt-c || git commit",
+    "( cd ../../wt-c && git commit ); git push",
+    "cd ../../wt-c | git commit",
+    "git commit -m x; git -C ../../wt-c push",
+    "git commit -F - <<'EOF'\nit's done\nEOF\ngit -C ../../wt-c push",
+    "echo \"$(git -C ../../wt-c commit -m x)\"",
+    "bash -c 'git -C ../../wt-c commit -m x'",
+    "eval 'git commit -m x'",
+    "env git -C ../../wt-c commit",
+    "git -C $'../../wt-c' commit",
+    "git \\\n  -C ../../wt-c \\\n  commit -m x",
+    "git -C ../../plain commit -m x",
+    "git -C ../../gone commit -m x",
+    "cd +1 && git commit",
+    "git log --oneline",
+    "git status",
+];
+
+/// The output of `git rev-parse <flag>` in a directory.
+fn git_rev_parse(dir: &Path, flag: &str) -> String {
+    let mut cmd = Command::new("git");
+    cmd.args(["rev-parse", "--path-format=absolute", flag])
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    for var in GIT_LOCATION_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd.output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// Whether `dir` is another work tree than `session` for a write: another
+/// git directory (each linked worktree has its own, a gitfile into the
+/// session repository does not), and for a push also another common git
+/// directory, because linked worktrees share refs.
+fn other_tree_for_write(dir: &Path, session: &Path, push: bool) -> bool {
+    let other_git_dir =
+        git_rev_parse(dir, "--absolute-git-dir") != git_rev_parse(session, "--absolute-git-dir");
+    let other_common =
+        git_rev_parse(dir, "--git-common-dir") != git_rev_parse(session, "--git-common-dir");
+    other_git_dir && (!push || other_common)
+}
+
+/// Runs main's gate and the new gate at `gate` over the same commands. The
+/// new gate must audit every root that main audits, unless it audits only a
+/// strict target that git reports in another work tree than the session.
+fn assert_never_less_than_main(
+    gate: &Path,
+    process_dir: &Path,
+    session: &Path,
+    home: &Path,
+    commands: &[&str],
+) {
+    let new_gate = rendered_gate_script();
+    for command in commands {
+        let payload = command_payload(session, command);
+        std::fs::write(gate, MAIN_GATE_SCRIPT).unwrap();
+        let main_run = run_gate(gate, process_dir, home, &payload);
+        std::fs::write(gate, &new_gate).unwrap();
+        let new_run = run_gate(gate, process_dir, home, &payload);
+        let missing: Vec<&PathBuf> = main_run
+            .audit_dirs
+            .iter()
+            .filter(|dir| !new_run.audit_dirs.contains(dir))
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let target_only = new_run.audit_dirs.len() == 1
+            && other_tree_for_write(&new_run.audit_dirs[0], session, command.contains("push"));
+        assert!(
+            target_only,
+            "{command:?}: the new gate skips {missing:?} that main audits; new={:?}",
+            new_run.audit_dirs
+        );
+    }
+}
+
+#[test]
+fn gate_never_audits_less_than_main() {
+    if skip_without_tools() {
+        return;
+    }
+    let trees = two_worktrees();
+    let session = trees.a.join("src");
+    std::fs::create_dir_all(&session).unwrap();
+    std::fs::create_dir_all(trees.c.join("src")).unwrap();
+    std::fs::create_dir_all(trees.root.join("plain")).unwrap();
+    std::os::unix::fs::symlink(trees.c.join("src"), session.join("link")).unwrap();
+    assert_never_less_than_main(
+        &trees.gate,
+        &trees.main,
+        &session,
+        &trees.root.join("home"),
+        DIFFERENTIAL_COMMANDS,
+    );
+}
+
+/// The same comparison with the install root below the git root and the hook
+/// process in the install root of the session.
+#[test]
+fn gate_never_audits_less_than_main_below_the_git_root() {
+    if skip_without_tools() {
+        return;
+    }
+    let (_tmp, root) = spaced_root();
+    let repo = root.join("repo");
+    init_repo(&repo);
+    let app = repo.join("packages/app");
+    let gate = install_gate(&app, ".claude");
+    install_gate(&repo.join("packages/other"), ".claude");
+    std::fs::create_dir_all(app.join("src")).unwrap();
+    let repo_q = repo.display().to_string();
+    let cd_root = format!("cd \"{repo_q}\" && git commit -m x");
+    let mut commands = vec![
+        "git -C ../other commit -m x",
+        "git -C ../.. commit -m x",
+        "git -C .. commit -m x",
+        "cd ../other && git commit -m x",
+        cd_root.as_str(),
+    ];
+    commands.extend_from_slice(DIFFERENTIAL_COMMANDS);
+    assert_never_less_than_main(&gate, &app, &app, &root.join("home"), &commands);
+    // The same with the hook process in the repository root.
+    assert_never_less_than_main(&gate, &repo, &app, &root.join("home"), &commands);
 }
