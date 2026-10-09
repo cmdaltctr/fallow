@@ -7,29 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.33.0] - 2026-10-09
+
 ### Fixed
 
-- `fallow coverage upload-source-maps` no longer loses maps that share a
-  file name. With the default `--strip-path=true`, a `tsc` output tree with
+- **`fallow coverage upload-source-maps` no longer loses maps that share a
+  file name.** With the default `--strip-path=true`, a `tsc` output tree with
   more than one `index.js.map` sent each map under the same name, and the
   cloud kept only the last one. Maps that share a basename are now sent under
   their path in the build directory, and the command prints which maps it
-  renamed. Thanks @voslartomas for the report (#3298).
-- `fallow coverage upload-source-maps` now warns when the `sources` of a map
-  do not point at files in the repository. A `sourceRoot` such as `"/"` in
-  `tsconfig.json` removes the `src/` segment from each source path, so
-  runtime coverage cannot resolve to source. The warning names the map, the
-  source, and the `sourceRoot`, and runs in `--dry-run` too (#3298).
-- **A class in a CSS Modules global scope is no longer an unused export.**
-  CSS Modules do not put a global class in the class map of the module, so
-  you cannot import it. Fallow now skips the classes in `:global(.a .b)`,
-  the classes after a bare `:global` up to `:local` or the next selector,
-  and the classes of rules nested in a global rule. A class in `:local(.a)`
-  stays an export. Also, a rule with a bare `:global` or `:local` no longer
-  hides its local classes in `.module.css` files. This applies to
-  `.module.css`, `.module.scss`, `.module.sass` and `.module.less` files.
-  The parse cache version changes, so the first run after the upgrade parses
-  all files again. Thanks to @peterssonjonas for the report. (#3311)
+  renamed. Thanks [@voslartomas](https://github.com/voslartomas) for the
+  report. (Closes [#3298](https://github.com/fallow-rs/fallow/issues/3298))
+- **`fallow coverage upload-source-maps` now warns when the `sources` of a map
+  do not point at files in the repository.** A `sourceRoot` such as `"/"` in
+  `tsconfig.json` removes the `src/` segment from each source path, so runtime
+  coverage cannot resolve to source. The warning names the map, the source,
+  and the `sourceRoot`, and runs in `--dry-run` too.
+- **A class in a CSS Modules global scope is no longer an unused export.** CSS
+  Modules do not put a global class in the class map of the module, so you
+  cannot import it. Fallow now skips the classes in `:global(.a .b)`, the
+  classes after a bare `:global` up to `:local` or the next selector, and the
+  classes of rules nested in a global rule. A class in `:local(.a)` stays an
+  export. Also, a rule with a bare `:global` or `:local` no longer hides its
+  local classes in `.module.css` files. This applies to `.module.css`,
+  `.module.scss`, `.module.sass` and `.module.less` files. The parse cache
+  version changes, so the first run after the upgrade parses all files again.
+  Thanks [@peterssonjonas](https://github.com/peterssonjonas) for the report.
+  (Closes [#3311](https://github.com/fallow-rs/fallow/issues/3311))
 - **A `/** @jsxImportSource <source> */` pragma now adds a module graph
   edge.** With the automatic JSX runtime, the pragma makes the file import
   `<source>/jsx-runtime`. Fallow did not see this import, so a local JSX
@@ -39,11 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   edge needs JSX in the file, and the pragma must be in a comment before the
   first statement. The extraction cache and the graph cache are invalidated
   once.
-- The copy-paste commands that `fallow agent install` and
-  `fallow baselines prune` print now quote each path for the shell of the
-  platform. A path with `;`, `|`, `&` or similar characters stays one
-  argument and cannot add a command. On Windows, a quoted path keeps single
-  backslashes.
+- **The copy-paste commands that `fallow agent install` and `fallow baselines
+  prune` print now quote each path for the shell of the platform.** A path
+  with `;`, `|`, `&` or similar characters stays one argument and cannot add a
+  command. On Windows, a quoted path keeps single backslashes.
 - **`fallow viz` no longer stops drawing the graph on a narrow stage.** On a
   stage narrower than 200 px, the camera fit gave a negative zoom, and the
   canvas threw an error for each negative ring radius. The fit now keeps a
@@ -52,20 +55,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   worktree.** The hook process can start in a directory that is not the
   session directory. For example, a session in a worktree below the main
   checkout can get a hook process in the main checkout. The gate then audited
-  the main checkout: findings there blocked a clean commit in the worktree, and
-  findings in the worktree did not block. Now the generated `fallow-gate.sh`
-  reads the session directory from the `cwd` field of the hook input. It walks
-  up from there to the nearest directory that holds the gate script and stops
-  at the first `.git` entry, the same rule as the handler. When it finds no
-  script, for example with the user-scope gate in `$HOME`, it keeps the
-  directory of the hook process when that directory is in the git work tree of
-  the session, as before. Else it audits the git top level of the session
-  directory, or the session directory outside git. It never audits `$HOME`.
-  When the hook input has no usable `cwd`, the gate audits the directory of the
-  hook process, as before. Run `fallow hooks install --target agent` again to
-  update an installed gate script. Run it in the checkout where the hook
-  process starts (for a nested worktree, the main checkout), and in each
-  worktree that tracks its own copy.
+  the main checkout: findings there blocked a clean commit in the worktree,
+  and findings in the worktree did not block. Now the generated
+  `fallow-gate.sh` reads the session directory from the `cwd` field of the
+  hook input. It walks up from there to the nearest directory that holds the
+  gate script and stops at the first `.git` entry, the same rule as the
+  handler. When it finds no script, for example with the user-scope gate in
+  `$HOME`, it keeps the directory of the hook process when that directory is
+  in the git work tree of the session, as before. Else it audits the git top
+  level of the session directory, or the session directory outside git. It
+  never audits `$HOME`. When the hook input has no usable `cwd`, the gate
+  audits the directory of the hook process, as before. Run `fallow hooks
+  install --target agent` again to update an installed gate script. Run it in
+  the checkout where the hook process starts (for a nested worktree, the main
+  checkout), and in each worktree that tracks its own copy.
 - **`fallow dupes --baseline` now matches each clone group by its own
   content.** A clone can stop inside a block, so its code does not parse on
   its own. Before, all such groups got the same fingerprint with a `-rN`
@@ -76,7 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `baseline_staleness.format` is `"legacy"`. Run `fallow dupes
   --save-baseline` once to rewrite it. An `ignoredClones` entry with the old
   shared handle no longer hides a group: review the group and copy its new
-  handle. (#3290, reported by @aleksik)
+  handle. Thanks [@aleksik](https://github.com/aleksik) for the report.
+  (Closes [#3290](https://github.com/fallow-rs/fallow/issues/3290))
 - **A warm run no longer reuses the analysis of the previous content of a
   file.** The parse cache, the duplication token cache and the kept modules of
   a long-lived session trusted a file when its modification time, change time
@@ -88,26 +92,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cached content. For a more recent file, the next run reads the file and
   compares the content hash. The parse cache version and the duplication cache
   version change, so the first run after the upgrade parses all files again.
-- `fallow dead-code --trace-dependency` now lists each importing file once.
-  Before, a file appeared one time for each imported name, so
-  `import { a, b } from "pkg"` listed the file twice and doubled
-  `import_count`. `import_count` is now the number of importing files.
-  `type_only_imported_by` now lists only files whose every import of the
-  package is type-only. Before, a file with a type-only import and a value
-  import showed as "(type-only)".
-- `fallow dead-code --summary` now lists the rule-pack "Policy violations"
-  row. The total already counted these findings.
-- The human status line of `fallow dead-code` now counts policy violations,
-  boundary coverage violations and boundary call violations. Boundary
-  violations show as "boundary violation" instead of "violation". Before, a run
-  with only policy violations printed a status line with no count.
-- The `Failed:` line of bare `fallow` now says "1 issue" and "1 clone group"
-  in the singular.
-- The published JSON schema now lists the `similar-code-status` and
-  `similar-code-cache-clear` kinds in the root `FallowOutput` union. Before,
-  a validator that used the schema rejected the valid output of
-  `fallow similar-code status --format json` and
-  `fallow similar-code cache clear --format json`.
+- **`fallow dead-code --trace-dependency` now lists each importing file
+  once.** Before, a file appeared one time for each imported name, so `import
+  { a, b } from "pkg"` listed the file twice and doubled `import_count`.
+  `import_count` is now the number of importing files. `type_only_imported_by`
+  now lists only files whose every import of the package is type-only. Before,
+  a file with a type-only import and a value import showed as "(type-only)".
+- **`fallow dead-code --summary` now lists the rule-pack "Policy violations"
+  row.** The total already counted these findings.
+- **The human status line of `fallow dead-code` now counts policy violations,
+  boundary coverage violations and boundary call violations.** Boundary
+  violations show as "boundary violation" instead of "violation". Before, a
+  run with only policy violations printed a status line with no count.
+- **The `Failed:` line of bare `fallow` now says "1 issue" and "1 clone group"
+  in the singular.**
+- **The published JSON schema now lists the `similar-code-status` and
+  `similar-code-cache-clear` kinds in the root `FallowOutput` union.** Before,
+  a validator that used the schema rejected the valid output of `fallow
+  similar-code status --format json` and `fallow similar-code cache clear
+  --format json`.
 - **A JavaScript array in a CI `run:` block no longer becomes an entry
   pattern.** A heredoc such as `node <<'NODE'` that holds
   `['packages/apps/public']` produced the token `[packages/apps/public]`. That
@@ -117,70 +120,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Jest configs with a custom name or a `.integration-spec` suffix now count
   as test entries.** A project with `jest-integration.config.ts` next to
   `jest.config.mjs` had every integration test and helper reported as unused.
-  Fallow now reads `jest-*.config.*` and `jest.*.config.*` files. A `testRegex`
-  that is only a literal suffix, such as `\.integration-spec\.ts$`, now maps
-  to `**/*.integration-spec.ts`. A prefixed regex keeps its own suffix and no
-  longer falls back to `*.test`. The patterns of every jest config now add up.
-  Before, one config with its own pattern dropped the default test files of the
-  others. On a large Nx monorepo this removed about 1,450 false unused files.
+  Fallow now reads `jest-*.config.*` and `jest.*.config.*` files. A
+  `testRegex` that is only a literal suffix, such as
+  `\.integration-spec\.ts$`, now maps to `**/*.integration-spec.ts`. A
+  prefixed regex keeps its own suffix and no longer falls back to `*.test`.
+  The patterns of every jest config now add up. Before, one config with its
+  own pattern dropped the default test files of the others. On a large Nx
+  monorepo this removed about 1,450 false unused files.
 - **A `--config` file that a script passes to `jest` is read.** Before, only
-  `vitest` did this. A script config file is now also a used file when the path
-  starts with `./`.
+  `vitest` did this. A script config file is now also a used file when the
+  path starts with `./`.
 - **A member that a leaf class calls now reaches the base of a long `extends`
-  chain.** With `Child extends Mid extends Base`, a call to `Base.start` through
-  `new Child().start()` was reported as an unused class member. Fallow moved an
-  access one level for each pass over an unordered map. It now repeats the pass
-  until nothing changes. An access through one child still does not reach a
-  sibling class.
-- **GraphQL Codegen configs with other names or `.cjs` now count.** Fallow reads
-  `codegen*.{ts,js,cjs,mjs}` and uses the `documents` globs of each config as
-  entry points. The codegen run reads those files, so no import reaches them.
-  On a large Nx monorepo this removed about 300 false unused files.
-- **Commands of Nx `run-commands` targets now count as scripts.** A command in a
-  `project.json` target, such as `tsx scripts/seed.ts` or
-  `jest --config ./jest-integration.config.ts`, credited nothing. Fallow now
-  reads the `command` and `commands` of every `nx:run-commands` target, with
-  the `{projectRoot}` and `{workspaceRoot}` tokens and the `configurations`
-  that set their own command. A call to another target of the same project,
-  such as `nx ts-node -- src/run.ts`, uses the command of that target. A target
-  that runs from another directory is skipped, because its relative paths
-  would point at the wrong files.
+  chain.** With `Child extends Mid extends Base`, a call to `Base.start`
+  through `new Child().start()` was reported as an unused class member. Fallow
+  moved an access one level for each pass over an unordered map. It now
+  repeats the pass until nothing changes. An access through one child still
+  does not reach a sibling class.
+- **GraphQL Codegen configs with other names or `.cjs` now count.** Fallow
+  reads `codegen*.{ts,js,cjs,mjs}` and uses the `documents` globs of each
+  config as entry points. The codegen run reads those files, so no import
+  reaches them. On a large Nx monorepo this removed about 300 false unused
+  files.
+- **Commands of Nx `run-commands` targets now count as scripts.** A command in
+  a `project.json` target, such as `tsx scripts/seed.ts` or `jest --config
+  ./jest-integration.config.ts`, credited nothing. Fallow now reads the
+  `command` and `commands` of every `nx:run-commands` target, with the
+  `{projectRoot}` and `{workspaceRoot}` tokens and the `configurations` that
+  set their own command. A call to another target of the same project, such as
+  `nx ts-node -- src/run.ts`, uses the command of that target. A target that
+  runs from another directory is skipped, because its relative paths would
+  point at the wrong files.
 
 - **`workspaces.patterns` in the config now adds workspace packages.** The key
-  was documented and parsed, but no code read it. A package outside the globs of
-  `package.json` or `pnpm-workspace.yaml` got no plugin, no entry points, and
-  no dependency check of its own. Fallow now adds these globs to the manifest
-  globs for analysis and for `fallow list --workspaces`. On a large Nx monorepo
-  with 22 undeclared app packages, this removed about 1,900 false unused files.
-  `--workspace` and `--changed-workspaces` use them in every command that has
-  a loaded config, and so does `--group-by package`. The base checkout of
-  `audit` and `security` links the generated context of these packages, and
-  the `scope-workspaces` next step lists them. The error for an unknown
-  `--workspace` now names `workspaces.patterns`. `fallow init` and
+  was documented and parsed, but no code read it. A package outside the globs
+  of `package.json` or `pnpm-workspace.yaml` got no plugin, no entry points,
+  and no dependency check of its own. Fallow now adds these globs to the
+  manifest globs for analysis and for `fallow list --workspaces`. On a large
+  Nx monorepo with 22 undeclared app packages, this removed about 1,900 false
+  unused files. `--workspace` and `--changed-workspaces` use them in every
+  command that has a loaded config, and so does `--group-by package`. The base
+  checkout of `audit` and `security` links the generated context of these
+  packages, and the `scope-workspaces` next step lists them. The error for an
+  unknown `--workspace` now names `workspaces.patterns`. `fallow init` and
   `coverage setup` still read the manifest globs only.
 - **TypeORM migrations that a `DataSource` config loads by glob now count.**
   Fallow reads the `migrations` globs of `data-source.ts`, `*.datasource.ts`
-  and `ormconfig` files. A conditional template such as
-  `${isJest ? 'src/' : 'dist/'}...` gives the `src/` branch. Entities and
-  subscribers stay out, because their files are not run as a whole. On a large
-  Nx monorepo this removed about 200 false unused files.
+  and `ormconfig` files. A conditional template such as `${isJest ? 'src/' :
+  'dist/'}...` gives the `src/` branch. Entities and subscribers stay out,
+  because their files are not run as a whole. On a large Nx monorepo this
+  removed about 200 false unused files.
 - **A package entry that points to build output now maps to its source.**
-  `dist/define/index.mjs` finds `src/define/index.ts`, and a `.d.ts` type target
-  finds its source file. Fallow reads `vite.config.*.ts` and `rollup.config.*`
-  files, and it also tries the `src/` file when a tsconfig maps the output to no
-  existing file. On a large Nx monorepo this removed about 800 false unused
-  exports.
+  `dist/define/index.mjs` finds `src/define/index.ts`, and a `.d.ts` type
+  target finds its source file. Fallow reads `vite.config.*.ts` and
+  `rollup.config.*` files, and it also tries the `src/` file when a tsconfig
+  maps the output to no existing file. On a large Nx monorepo this removed
+  about 800 false unused exports.
 - **Class members and enum values that a framework reads by reflection now
   count.** An entity class that is passed to `getRepository`,
   `createQueryBuilder` or a TypeORM `find` call (with a TypeORM or MikroORM
   import) is a whole-object use. So is an enum that is passed to
-  `registerEnumType` from `@nestjs/graphql` or `type-graphql`. The `run` method
-  of a `CommandRunner` subclass counts when `nest-commander` is a dependency.
+  `registerEnumType` from `@nestjs/graphql` or `type-graphql`. The `run`
+  method of a `CommandRunner` subclass counts when `nest-commander` is a
+  dependency.
 - **A package that a config names only in a string is no longer unused.**
   Fallow credits the SWC plugins of `@vitejs/plugin-react-swc` and of
   `experimental.swcPlugins` in a Next.js config, the Babel plugins and presets
   in the `babelOptions` of `@wyw-in-js/vite`, and the `collection` of
   `nest-cli.json`.
+
+- **The npm launcher no longer cuts short the output of the binary under
+  Bun.** When Bun ran the `fallow` launcher with stdout on a pipe, the JSON
+  output stopped after approximately 64 to 150 KB, and the exit code was 0.
+  The VS Code extension then failed to parse the JSON. The cause was the first
+  use of `process.stdout` or `process.stderr` in the launcher. Under Bun, this
+  sets the shared pipe to non-blocking mode, and the binary inherits that
+  mode. A large write from the binary then failed. Now the launcher does not
+  use these streams before the binary exits, and it writes the verification
+  warnings directly to the stderr descriptor. Thanks to
+  [@codingthat](https://github.com/codingthat) for the report and the
+  reproduction (Closes
+  [#3276](https://github.com/fallow-rs/fallow/issues/3276)).
+
+- **`fallow audit --gate new-only` compares complexity values with the base.**
+  Before, the gate matched complexity findings by path, function name and
+  exceeded category, and did not compare the values. A function that got worse
+  above the limit stayed inherited and passed. A function that improved from
+  `both` to `cyclomatic` counted as introduced and failed. Now a finding
+  matches its base finding by path and function name. It is introduced when no
+  base finding matches, or when a metric that it exceeds has a higher value
+  than in the base finding. Unchanged and decreased values stay inherited.
+  Line shifts and renamed files keep the match. Same-named findings in one
+  file, for example class methods, now count separately in
+  `complexity_introduced` and `complexity_inherited`. The audit base snapshot
+  cache version changes, so the first audit after the upgrade analyzes the
+  base again. Thanks to [@rodrigouroz](https://github.com/rodrigouroz) for the
+  report and the reproduction. (Closes
+  [#3277](https://github.com/fallow-rs/fallow/issues/3277))
+- **The report on stdout is now complete when the parent process makes the
+  stdout pipe non-blocking.** Bun sets `O_NONBLOCK` on a pipe that it shares
+  with a child process. A large report write then failed with `EAGAIN`, and
+  fallow stopped the output at the size of the pipe buffer and exited with the
+  normal exit code. Now fallow waits until stdout accepts more bytes and
+  writes the remaining part of the report. The `list`, `schema`, `config`,
+  `fix` and text `viz` output use the same writer. A closed reader, for
+  example `fallow | head`, still stops the output without an error. Any other
+  stdout write error now prints a message on stderr and gives exit code 2.
+  Thanks [@codingthat](https://github.com/codingthat) for the report. (Closes
+  [#3276](https://github.com/fallow-rs/fallow/issues/3276))
 
 ### Added
 
@@ -189,37 +235,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `esbuild.jsxImportSource`) makes each test file with JSX import
   `<source>/jsx-dev-runtime`. Fallow now adds this edge for a test file that
   has JSX and no `@jsxImportSource` pragma, when the source is a path. A
-  package source only marks the package as used. The edge applies to the
-  files that `test.include` matches: in the root config when it has no
-  `test.projects`, else in each inline project config. A project inherits
-  the root source only with `extends: true`, and the classic runtime adds no
-  edge. A local JSX runtime
-  no longer shows as unused, and `--impact-closure` on a runtime file now
-  includes these test files. A relative source resolves from the test file
-  first and then from the config directory. A source that does not resolve
-  adds no edge and no unresolved import. The extraction cache and the graph
-  cache are invalidated once.
-- **`fallow hooks install --target git --prune-baselines`** adds a
-  `fallow baselines prune` step before the audit in the pre-commit hook, and
-  stages the baseline files that the prune wrote. The prune reads the working
-  tree and the commit carries the index, so the hook skips the prune when the
+  package source only marks the package as used. The edge applies to the files
+  that `test.include` matches: in the root config when it has no
+  `test.projects`, else in each inline project config. A project inherits the
+  root source only with `extends: true`, and the classic runtime adds no edge.
+  A local JSX runtime no longer shows as unused, and `--impact-closure` on a
+  runtime file now includes these test files. A relative source resolves from
+  the test file first and then from the config directory. A source that does
+  not resolve adds no edge and no unresolved import. The extraction cache and
+  the graph cache are invalidated once.
+- **`fallow hooks install --target git --prune-baselines`** adds a `fallow
+  baselines prune` step before the audit in the pre-commit hook, and stages
+  the baseline files that the prune wrote. The prune reads the working tree
+  and the commit carries the index, so the hook skips the prune when the
   working tree has unstaged or untracked changes, and for a commit with paths
-  (`git commit <path>`). A failed prune never blocks the commit. The hints for Lefthook and for an existing hook include the
-  same step. (#3281)
-- **`fallow baselines prune` removes the baseline entries of fixed
-  findings.** It reads the files that `audit.deadCodeBaseline`,
-  `audit.healthBaseline` and `audit.dupesBaseline` name, runs one
-  whole-project analysis, and removes each entry that `--baseline` no longer
-  matches. It never adds an entry, so a new finding stays visible to the
-  gates. After a prune, `--fail-on-stale-baseline` passes, and the baseline
-  hides the same findings as before. `--check` writes nothing and exits 1 when
-  an entry can be pruned. `--dead-code-baseline`, `--health-baseline` and
-  `--dupes-baseline` override the config paths, and `--coverage` gives the
-  coverage input for CRAP scores. A file with an older key form, or with
-  fields from a newer version, is skipped with the command that saves it
-  again. The stale-baseline warning
-  and gate message now name the prune command. (#3281, requested by
-  @BenMcGit)
+  (`git commit <path>`). A failed prune never blocks the commit. The hints for
+  Lefthook and for an existing hook include the same step.
+- **`fallow baselines prune` removes the baseline entries of fixed findings.**
+  It reads the files that `audit.deadCodeBaseline`, `audit.healthBaseline` and
+  `audit.dupesBaseline` name, runs one whole-project analysis, and removes
+  each entry that `--baseline` no longer matches. It never adds an entry, so a
+  new finding stays visible to the gates. After a prune,
+  `--fail-on-stale-baseline` passes, and the baseline hides the same findings
+  as before. `--check` writes nothing and exits 1 when an entry can be pruned.
+  `--dead-code-baseline`, `--health-baseline` and `--dupes-baseline` override
+  the config paths, and `--coverage` gives the coverage input for CRAP scores.
+  A file with an older key form, or with fields from a newer version, is
+  skipped with the command that saves it again. The stale-baseline warning and
+  gate message now name the prune command. Thanks
+  [@BenMcGit](https://github.com/BenMcGit) for the request. (Closes
+  [#3281](https://github.com/fallow-rs/fallow/issues/3281))
 - **`fallow trace --dependency <package>`** reports how the code uses each
   imported name of a package. It gives file and call counts, sites with line
   and column, one hop through project wrappers such as
@@ -237,8 +282,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without `--quiet`, and also with `--group-by` and `--summary`. With
   `--group-by`, `fallow architecture` shows one "Architecture" heading per
   group.
-- `fallow architecture --format json` writes `kind: "architecture"` with its
-  own `schema_version` (1). With `--group-by`, the kind is
+- **`fallow architecture --format json` writes `kind: "architecture"` with its
+  own `schema_version` (1).** With `--group-by`, the kind is
   `architecture-grouped`. The arrays, finding ids, actions, exit codes, gate
   outcomes and severities are the same as on `fallow dead-code`. `next_steps`
   names `fallow architecture`, and with `--explain`, `_meta.docs` points to
@@ -247,173 +292,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fallow architecture` and `fallow dead-code` read each other's baselines.
   The JSON schema and the generated TypeScript types have the
   `ArchitectureOutput` and `ArchitectureGroupedOutput` envelopes.
-- `fallow report --from` renders a saved `architecture` or
+- **`fallow report --from` renders a saved `architecture` or
   `architecture-grouped` envelope in every format, the same as the direct
-  run. PR comments and reviews of `fallow architecture` have the title
+  run.** PR comments and reviews of `fallow architecture` have the title
   "Fallow architecture report".
-- The MCP server has a `check_architecture` tool, and Code Mode exposes it as
-  `checkArchitecture`. The Node bindings have `detectArchitecture`, and
+- **The MCP server has a `check_architecture` tool, and Code Mode exposes it
+  as `checkArchitecture`.** The Node bindings have `detectArchitecture`, and
   `fallow_api` has `run_architecture`. Each returns the `architecture`
   envelope. `detectCircularDependencies`, `detectBoundaryViolations` and the
   MCP `analyze` tool keep the `dead-code` envelope.
-- Bare `fallow` accepts `architecture` in `--only` and `--skip`.
-  `--only architecture` runs the dead-code analysis and reports only the
-  architecture findings, and its `Failed:` line names `architecture`.
-  `--skip architecture` removes them from the dead-code
-  section. The health score and the `--save-baseline` file do not change.
-- Telemetry records `fallow architecture` runs as the `architecture` workflow.
-- The GitHub Action accepts `command: architecture` and the GitLab template
-  accepts `FALLOW_COMMAND: architecture`. `issue-types` and
+- **Bare `fallow` accepts `architecture` in `--only` and `--skip`.** `--only
+  architecture` runs the dead-code analysis and reports only the architecture
+  findings, and its `Failed:` line names `architecture`. `--skip architecture`
+  removes them from the dead-code section. The health score and the
+  `--save-baseline` file do not change.
+- **Telemetry records `fallow architecture` runs as the `architecture`
+  workflow.**
+- **The GitHub Action accepts `command: architecture` and the GitLab template
+  accepts `FALLOW_COMMAND: architecture`.** `issue-types` and
   `FALLOW_ISSUE_TYPES` take `cycles`, `boundaries` and `policy` for this
   command. Another value stops the job with exit code 2 and an error that
   names the valid values.
 
 ### Deprecated
 
-- The `fallow dead-code` flags `--circular-deps`, `--re-export-cycles`,
+- **The `fallow dead-code` flags `--circular-deps`, `--re-export-cycles`,
   `--package-cycles`, `--boundary-violations` and `--policy-violations` are
-  aliases of `fallow architecture --cycles`, `--boundaries` and `--policy`.
+  aliases of `fallow architecture --cycles`, `--boundaries` and `--policy`.**
   They keep working in v3. `fallow dead-code` keeps reporting these findings
-  until the next major version, and its human output points to
-  `fallow architecture` when it reports one.
-
-- **The npm launcher no longer cuts short the output of the binary under
-  Bun.** When Bun ran the `fallow` launcher with stdout on a pipe, the JSON
-  output stopped after approximately 64 to 150 KB, and the exit code was 0.
-  The VS Code extension then failed to parse the JSON. The cause was the first
-  use of `process.stdout` or `process.stderr` in the launcher. Under Bun, this
-  sets the shared pipe to non-blocking mode, and the binary inherits that
-  mode. A large write from the binary then failed. Now the launcher does not
-  use these streams before the binary exits, and it writes the verification
-  warnings directly to the stderr descriptor. Thanks to
-  [@codingthat](https://github.com/codingthat) for the report and the
-  reproduction (Closes
-  [#3276](https://github.com/fallow-rs/fallow/issues/3276)).
-
-- **`fallow audit --gate new-only` compares complexity values with the base.**
-  Before, the gate matched complexity findings by path, function name and
-  exceeded category, and did not compare the values. A function that got
-  worse above the limit stayed inherited and passed. A function that improved
-  from `both` to `cyclomatic` counted as introduced and failed. Now a finding
-  matches its base finding by path and function name. It is introduced when
-  no base finding matches, or when a metric that it exceeds has a higher
-  value than in the base finding. Unchanged and decreased values stay
-  inherited. Line shifts and renamed files keep the match. Same-named findings
-  in one file, for example class methods, now count separately in
-  `complexity_introduced` and `complexity_inherited`. The audit base snapshot
-  cache version changes, so the first audit after the upgrade analyzes the
-  base again. Thanks to [@rodrigouroz](https://github.com/rodrigouroz) for the
-  report and the reproduction
-  ([#3277](https://github.com/fallow-rs/fallow/issues/3277)).
-- **The report on stdout is now complete when the parent process makes the
-  stdout pipe non-blocking.** Bun sets `O_NONBLOCK` on a pipe that it shares
-  with a child process. A large report write then failed with `EAGAIN`, and
-  fallow stopped the output at the size of the pipe buffer and exited with the
-  normal exit code. Now fallow waits until stdout accepts more bytes and writes
-  the remaining part of the report. The `list`, `schema`, `config`, `fix` and
-  text `viz` output use the same writer. A closed reader, for example
-  `fallow | head`, still stops the output without an error. Any other stdout
-  write error now prints a message on stderr and gives exit code 2. See
-  [#3276](https://github.com/fallow-rs/fallow/issues/3276). Thanks
-  @codingthat for the report.
+  until the next major version, and its human output points to `fallow
+  architecture` when it reports one.
 
 ### Changed
 
-- **The Linux musl binaries are about 4 times faster.** musl's own `malloc`
-  is slow when many threads allocate, and fallow analyzes files in
-  parallel. The musl binaries (the `linux-x64-musl` and `linux-arm64-musl` npm
-  packages and the musl release assets) now use mimalloc. The Node addon
-  keeps the default allocator. On a
-  10-core aarch64 Alpine container, `check`, `dupes` and `health` took 77%
-  less time over 15 fixture cases, with identical output. Peak memory is
-  about a third higher. Glibc, macOS and Windows builds do not change. A
-  `cargo install fallow-cli` on a musl host now needs a C compiler.
-- **`fallow viz` now shows where to start.** The Overview panel opens with
-  the health grade and one card per lens: the number of files, the number
-  of high findings, and the worst file with its reason. The Overview map colors files
-  that have findings in any lens. Folder labels show how many of their
-  files have findings.
-- **Lens lists say what is wrong.** Each lens opens with a short summary and
-  a severity split. Rows are grouped into high, medium, and low. The full
-  file name comes first, and a plain reason follows, for example "File path
-  built from input" instead of `path-traversal`, or "High complexity, no
-  test coverage" instead of a CRAP score.
-  Security lists each file once with all of its candidates.
-- **Findings are no longer hidden on the map.** Folders with no imports to
-  or from other folders now show when the active lens has findings in them,
-  for example unused files. Health colors only files above the review
-  threshold, so high-risk files stand out. Folders without findings fade.
-- **The file panel says what is wrong first.** The Overview tab opens with
-  a list of the lenses that have findings in the file, each with its reason.
-  The Health tab shows maintainability, change risk, and importers, then
-  each function to fix with its branches, lines, test coverage, and next
-  step. The selected file is ringed and named on the treemap.
-- **Clearer graph navigation.** Folder and import-group labels have two
-  lines (name, then size and findings), stay over their cluster, and keep
-  clear of the controls and the legend. Import groups that span folders read
-  as `site/src + 5 more` instead of `(mixed)`. The status line shows the
-  grouping or the path of the file in focus. Disabled controls are hidden.
+- **The Linux musl binaries are about 4 times faster.** musl's own `malloc` is
+  slow when many threads allocate, and fallow analyzes files in parallel. The
+  musl binaries (the `linux-x64-musl` and `linux-arm64-musl` npm packages and
+  the musl release assets) now use mimalloc. The Node addon keeps the default
+  allocator. On a 10-core aarch64 Alpine container, `check`, `dupes` and
+  `health` took 77% less time over 15 fixture cases, with identical output.
+  Peak memory is about a third higher. Glibc, macOS and Windows builds do not
+  change. A `cargo install fallow-cli` on a musl host now needs a C compiler.
+- **`fallow viz` now shows where to start.** The Overview panel opens with the
+  health grade and one card per lens: the number of files, the number of high
+  findings, and the worst file with its reason. The Overview map colors files
+  that have findings in any lens. Folder labels show how many of their files
+  have findings.
+- **Lens lists say what is wrong.** Each lens opens with a short summary and a
+  severity split. Rows are grouped into high, medium, and low. The full file
+  name comes first, and a plain reason follows, for example "File path built
+  from input" instead of `path-traversal`, or "High complexity, no test
+  coverage" instead of a CRAP score. Security lists each file once with all of
+  its candidates.
+- **Findings are no longer hidden on the map.** Folders with no imports to or
+  from other folders now show when the active lens has findings in them, for
+  example unused files. Health colors only files above the review threshold,
+  so high-risk files stand out. Folders without findings fade.
+- **The file panel says what is wrong first.** The Overview tab opens with a
+  list of the lenses that have findings in the file, each with its reason. The
+  Health tab shows maintainability, change risk, and importers, then each
+  function to fix with its branches, lines, test coverage, and next step. The
+  selected file is ringed and named on the treemap.
+- **Clearer graph navigation.** Folder and import-group labels have two lines
+  (name, then size and findings), stay over their cluster, and keep clear of
+  the controls and the legend. Import groups that span folders read as
+  `site/src + 5 more` instead of `(mixed)`. The status line shows the grouping
+  or the path of the file in focus. Disabled controls are hidden.
 - **Imports between folders.** Clicking a line between two folders lists the
   target files in use, then every import, forbidden and cyclic ones first.
 - **Plain tooltips and search legend.** Hover tooltips use the same plain
   reasons as the panel. During a search the legend explains the match and
   importer rings.
-- **`fallow viz` works on narrow screens.** Below 700 px the panel docks
-  under the map as a sheet, so the map stays visible at full width. The
-  legend becomes one line, crowded labels drop, and the file focus view
-  fits both columns.
-- **The map uses the fallow.tools look.** `fallow viz` now follows the
-  design of fallow.tools and fallow.cloud: paper and ink, Barlow type, hairline
+- **`fallow viz` works on narrow screens.** Below 700 px the panel docks under
+  the map as a sheet, so the map stays visible at full width. The legend
+  becomes one line, crowded labels drop, and the file focus view fits both
+  columns.
+- **The map uses the fallow.tools look.** `fallow viz` now follows the design
+  of fallow.tools and fallow.cloud: paper and ink, Barlow type, hairline
   rules, square panels and flat controls. Day paper is the default, and the
   night theme follows the system or the stored choice. The fonts are embedded,
   so the report looks the same offline. The graph uses the census map
-  geometry: folders are octagons and the imports between them run at 0, 45
-  and 90 degrees, and flagged files carry an interchange ring. Hovering an
-  import line picks the line under the pointer, gives it a pale blue halo
-  and fades the others, and lines hidden at the current zoom no longer react.
-  Hovering a file draws its imports the same way, on census routes in ink.
-- **Step through findings.** With a file open, the panel shows its place
-  in the active lens ("3 of 61 in Security") with previous and next
-  buttons, and `j` and `k` do the same.
-- **Small findings stay visible.** High findings, sparse medium findings,
-  and the copies of an open duplicated block get a halo on the graph.
+  geometry: folders are octagons and the imports between them run at 0, 45 and
+  90 degrees, and flagged files carry an interchange ring. Hovering an import
+  line picks the line under the pointer, gives it a pale blue halo and fades
+  the others, and lines hidden at the current zoom no longer react. Hovering a
+  file draws its imports the same way, on census routes in ink.
+- **Step through findings.** With a file open, the panel shows its place in
+  the active lens ("3 of 61 in Security") with previous and next buttons, and
+  `j` and `k` do the same.
+- **Small findings stay visible.** High findings, sparse medium findings, and
+  the copies of an open duplicated block get a halo on the graph.
 - **Architecture lists folders in an import loop.** The panel names the
   folders the map outlines, and says why the loop matters.
 - **Folder labels follow the findings.** Folders with high findings get a
-  label first, labels no longer cover the dots of high findings, and a
-  label that had to move away from its folder points back to it.
-- **Treemap folder headers count findings.** In a finding lens, each
-  folder header shows how many of its files the lens flags.
-- **Counts agree.** The Overview card for Security shows the files and
-  the candidate count of the tab, and the map legend keys each level once.
-  The Architecture tab counts every finding, import cycles included, not
-  only boundary violations. When a card and its tab count the same unit, the
-  card shows its count as a part of the tab count, for example "528 of 6,135
+  label first, labels no longer cover the dots of high findings, and a label
+  that had to move away from its folder points back to it.
+- **Treemap folder headers count findings.** In a finding lens, each folder
+  header shows how many of its files the lens flags.
+- **Counts agree.** The Overview card for Security shows the files and the
+  candidate count of the tab, and the map legend keys each level once. The
+  Architecture tab counts every finding, import cycles included, not only
+  boundary violations. When a card and its tab count the same unit, the card
+  shows its count as a part of the tab count, for example "528 of 6,135
   files".
-- **The map shows its progress while it loads.** On a large project the
-  first graph layout takes many seconds. A loading screen now shows a
-  progress bar and the current step, in place of an empty stage.
-- **The theme choice is kept.** The light or dark choice applies again
-  the next time a report opens.
-- **Back and forward keep the map in step.** A lens change through the
-  browser history opens or closes the strip of unconnected folders, as a
-  tab click does.
+- **The map shows its progress while it loads.** On a large project the first
+  graph layout takes many seconds. A loading screen now shows a progress bar
+  and the current step, in place of an empty stage.
+- **The theme choice is kept.** The light or dark choice applies again the
+  next time a report opens.
+- **Back and forward keep the map in step.** A lens change through the browser
+  history opens or closes the strip of unconnected folders, as a tab click
+  does.
 - **Security candidate cards lead with the risk.** A card shows the plain
   label, severity, the source-to-sink flow, and what to check. The rule id,
   trace, and other evidence move into a collapsed section.
 - **Clearer motion in `fallow viz`.** A treemap drill flies one camera into
-  the folder and back out. A lens switch sweeps the new colors across the
-  map. With reduced motion, movement stops and changes fade.
-- **Findings in an unused file are hidden by default.** An unused export, type,
-  class member or enum member in a file that fallow reports as unused is no
-  longer listed, because deleting the file removes it. The JSON output has the
-  count in `cascade_hidden`. SARIF and markdown, grouped or not, name the count
-  too. Pass
-  `--show-cascade`, set `showCascade` in the config, or use the `show_cascade`
-  parameter of the MCP tools to list them. The health vital signs still count
-  them. When an issue-type filter leaves out `unused-files`, nothing is hidden.
-  A baseline saved before this change still matches. A baseline that you save
-  now does not contain the hidden findings, so save a regression baseline again.
+  the folder and back out. A lens switch sweeps the new colors across the map.
+  With reduced motion, movement stops and changes fade.
+- **Findings in an unused file are hidden by default.** An unused export,
+  type, class member or enum member in a file that fallow reports as unused is
+  no longer listed, because deleting the file removes it. The JSON output has
+  the count in `cascade_hidden`. SARIF and markdown, grouped or not, name the
+  count too. Pass `--show-cascade`, set `showCascade` in the config, or use
+  the `show_cascade` parameter of the MCP tools to list them. The health vital
+  signs still count them. When an issue-type filter leaves out `unused-files`,
+  nothing is hidden. A baseline saved before this change still matches. A
+  baseline that you save now does not contain the hidden findings, so save a
+  regression baseline again.
 
 ## [3.32.0] - 2026-10-06
 
@@ -13553,7 +13558,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[unreleased]: https://github.com/fallow-rs/fallow/compare/v3.32.0...HEAD
+[unreleased]: https://github.com/fallow-rs/fallow/compare/v3.33.0...HEAD
+[3.33.0]: https://github.com/fallow-rs/fallow/compare/v3.32.0...v3.33.0
 [3.32.0]: https://github.com/fallow-rs/fallow/compare/v3.31.0...v3.32.0
 [3.31.0]: https://github.com/fallow-rs/fallow/compare/v3.30.0...v3.31.0
 [3.30.0]: https://github.com/fallow-rs/fallow/compare/v3.29.0...v3.30.0
