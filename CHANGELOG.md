@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.33.1] - 2026-10-09
+
 ### Fixed
 
 - **The GitHub Action and the GitLab template can now baseline health and
@@ -39,10 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thresholds (74 in the baseline)". On bare `fallow` the summary showed every
   accepted function as a health finding above an empty table. Without a
   baseline the summary does not change.
-- `fallow --help` now says that `--baseline` and `--save-baseline` hold the
-  dead-code baseline only on bare `fallow`. When a bare run gets a
-  `fallow health` or `fallow dupes` baseline through `--baseline`, the note
-  now tells you to pass it with `--health-baseline` or `--dupes-baseline`.
+- **`fallow --help` names the baseline flags of the bare run.** On bare
+  `fallow`, `--baseline` and `--save-baseline` hold the dead-code baseline
+  only, and the help now says so. When a bare run gets a `fallow health` or
+  `fallow dupes` baseline through `--baseline`, the note now tells you to pass
+  it with `--health-baseline` or `--dupes-baseline`.
 - **The Vitest JSX import source now follows the Vitest project model.** On
   Vitest 5, an inline `test.projects` entry inherits the JSX import source of
   the declaring config unless it sets `extends: false`. On Vitest 4, it
@@ -13624,6 +13627,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
 [unreleased]: https://github.com/fallow-rs/fallow/compare/v3.33.0...HEAD
+[3.33.1]: https://github.com/fallow-rs/fallow/compare/v3.33.0...v3.33.1
 [3.33.0]: https://github.com/fallow-rs/fallow/compare/v3.32.0...v3.33.0
 [3.32.0]: https://github.com/fallow-rs/fallow/compare/v3.31.0...v3.32.0
 [3.31.0]: https://github.com/fallow-rs/fallow/compare/v3.30.0...v3.31.0
